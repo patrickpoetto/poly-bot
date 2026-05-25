@@ -1,0 +1,107 @@
+[project]
+name = "poly-bot"
+version = "0.1.0"
+description = "Production-grade Polymarket trading bot — discovery engine, strategies, execution"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "Pat" }]
+dependencies = [
+    "httpx[http2]>=0.28.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-dotenv>=1.0.0",
+    "sqlmodel>=0.0.22",
+    "structlog>=24.4.0",
+    "tenacity>=9.0.0",
+    "typer>=0.15.0",
+    "websockets>=14.0",
+    "rich>=13.9.0",
+]
+
+[project.optional-dependencies]
+dashboard = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "python-multipart>=0.0.20",
+]
+postgres = [
+    "psycopg[binary]>=3.2.0",
+    "alembic>=1.14.0",
+]
+production = [
+    "poly-bot[postgres,dashboard]",
+    "prometheus-client>=0.21.0",
+]
+dev = [
+    "pre-commit>=4.0.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.9.0",
+    "mypy>=1.14.0",
+]
+trading = [
+    "py-clob-client>=0.22.0",
+    "web3>=7.0.0",
+]
+
+[project.scripts]
+poly-bot = "poly_bot.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/poly_bot"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/poly_bot" = "poly_bot"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "C4", "UP", "SIM", "RUF", "ASYNC", "S",
+]
+ignore = ["S101", "SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = ["poly_bot.catalog.dashboard", "catalog.dashboard", "poly_bot.metrics"]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+source = ["poly_bot"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 50
+show_missing = true

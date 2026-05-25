@@ -1,0 +1,16 @@
+# Local dev compose — SQLite volume (no Postgres).
+# For production stack see docker/docker-compose.prod.yml
+services:
+  poly-bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    volumes:
+      - poly_bot_data:/app/data
+    restart: unless-stopped
+    command: ["poly-bot", "run"]
+
+volumes:
+  poly_bot_data:
