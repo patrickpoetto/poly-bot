@@ -1,9 +1,9 @@
 # Production stack — split services, healthchecks, restart policies, backup.
 #
-# Usage:
-#   cp .env.example .env   # set POSTGRES_PASSWORD
-#   docker compose -f docker/docker-compose.prod.yml up -d
-#   docker compose -f docker/docker-compose.prod.yml ps
+# Usage (from project root, so `.env` is auto-loaded):
+#   cp .env.example .env   # set POSTGRES_PASSWORD, POLY_BOT_IMAGE
+#   docker compose --env-file .env -f docker/docker-compose.prod.yml up -d
+#   docker compose --env-file .env -f docker/docker-compose.prod.yml ps
 #
 # Services:
 #   postgres        — catalog database (private network only)
@@ -89,7 +89,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 90s
-    mem_limit: 512m
+    mem_limit: 1024m
     cpus: 1.0
 
   catalog-watch:
@@ -108,7 +108,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 90s
-    mem_limit: 512m
+    mem_limit: 1536m
     cpus: 1.0
 
   ws-daemon:
