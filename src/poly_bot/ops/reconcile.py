@@ -12,6 +12,14 @@ def run_reconciliation(session: Session) -> dict[str, int | list[str]]:
     """Return counts of common catalog integrity issues."""
     issues: dict[str, int | list[str]] = {}
 
+    bind = session.get_bind()
+    is_pg = bind is not None and bind.dialect.name == "postgresql"
+    empty_raw_clause = (
+        "raw_payload IS NULL OR raw_payload::text IN ('{}', 'null')"
+        if is_pg
+        else "raw_payload IS NULL OR raw_payload = '{}'"
+    )
+
     issues["markets_total"] = int(session.exec(select(func.count()).select_from(Market)).one())
     issues["markets_null_fee_type"] = int(
         session.exec(
@@ -25,9 +33,7 @@ def run_reconciliation(session: Session) -> dict[str, int | list[str]]:
     )
     issues["markets_empty_raw"] = int(
         session.exec(
-            select(func.count()).select_from(Market).where(
-                text("raw_payload IS NULL OR raw_payload = '{}'")
-            )
+            select(func.count()).select_from(Market).where(text(empty_raw_clause))
         ).one()
     )
     issues["markets_unknown_domain"] = int(

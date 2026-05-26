@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Form, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from sqlalchemy import text
 from sqlmodel import Session
 
 from poly_bot.catalog.events_view import group_expiring_by_event, market_fee_label
@@ -165,21 +167,49 @@ def create_app(settings: Settings) -> FastAPI:
             for r in rows
         ]
 
+    @app.get("/api/health")
+    def api_health(hours: float = Query(default=6.0, ge=1, le=168)) -> dict[str, object]:
+        return _live_snapshot(settings, hours=hours)
+
+    @app.get("/api/reconcile")
+    def api_reconcile() -> dict[str, object]:
+        from poly_bot.persistence.catalog_state import (
+            KEY_LAST_RECONCILE_AT,
+            KEY_LAST_RECONCILE_REPORT,
+            CatalogStateStore,
+        )
+
+        with Session(get_engine(settings)) as session:
+            store = CatalogStateStore(session)
+            last_at = store.get_datetime(KEY_LAST_RECONCILE_AT)
+            report_raw = store.get(KEY_LAST_RECONCILE_REPORT)
+        report: dict[str, object] = {}
+        if report_raw:
+            try:
+                report = json.loads(report_raw)
+            except json.JSONDecodeError:
+                report = {}
+        return {
+            "last_at": last_at.isoformat() if last_at else None,
+            "age_s": int((datetime.now(UTC) - last_at).total_seconds()) if last_at else None,
+            "report": report,
+        }
+
     @app.get("/api/stream")
     async def api_stream(hours: float = Query(default=6.0, ge=1, le=168)) -> StreamingResponse:
-        """SSE stream — expiring count + sample markets every 45s."""
+        """SSE stream — health snapshot + live indicators every 5s."""
 
         async def event_generator() -> object:
             while True:
-                markets = _load_markets(settings, hours=hours)
-                payload = {
-                    "count": len(markets),
-                    "markets": [_market_json(m) for m in markets[:50]],
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
-                await asyncio.sleep(45)
+                snapshot = _live_snapshot(settings, hours=hours)
+                yield f"data: {json.dumps(snapshot)}\n\n"
+                await asyncio.sleep(5)
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     return app
 
@@ -201,6 +231,80 @@ def _update_gauges(settings: Settings, *, hours: float) -> None:
 def _load_markets(settings: Settings, *, hours: float) -> list[ExpiringMarket]:
     with Session(get_engine(settings)) as session:
         return list_expiring_markets(session, hours=hours)
+
+
+def _live_snapshot(settings: Settings, *, hours: float) -> dict[str, object]:
+    """Lightweight stats for the SSE/health endpoints — no full table render."""
+    from poly_bot.persistence.catalog_state import (
+        KEY_LAST_DELTA_SCAN_AT,
+        KEY_LAST_FULL_SCAN_AT,
+        KEY_LAST_RECONCILE_AT,
+        CatalogStateStore,
+    )
+
+    now = datetime.now(UTC)
+    engine = get_engine(settings)
+
+    with engine.connect() as conn:
+        quote_row = conn.execute(text("SELECT MAX(updated_at) FROM token_quotes")).one()
+        markets_active = int(
+            conn.execute(text("SELECT COUNT(*) FROM markets WHERE active = TRUE")).scalar()
+            or 0
+        )
+        fees_with = int(
+            conn.execute(
+                text("SELECT COUNT(*) FROM markets WHERE fees_enabled = TRUE AND active = TRUE")
+            ).scalar()
+            or 0
+        )
+    quote_last = _coerce_dt(quote_row[0] if quote_row else None)
+
+    with Session(engine) as session:
+        expiring = count_expiring_markets(session, hours=hours)
+        markets = _load_markets(settings, hours=hours)
+        events = group_expiring_by_event(markets)
+        fee_in_window = sum(1 for m in markets if m.fees_enabled or m.event_fees_enabled)
+        store = CatalogStateStore(session)
+        last_full = store.get_datetime(KEY_LAST_FULL_SCAN_AT)
+        last_delta = store.get_datetime(KEY_LAST_DELTA_SCAN_AT)
+        last_reconcile = store.get_datetime(KEY_LAST_RECONCILE_AT)
+
+    return {
+        "now": now.isoformat(),
+        "hours": hours,
+        "quote_age_s": _age_s(now, quote_last),
+        "quote_last": quote_last.isoformat() if quote_last else None,
+        "delta_age_s": _age_s(now, last_delta),
+        "full_age_s": _age_s(now, last_full),
+        "reconcile_age_s": _age_s(now, last_reconcile),
+        "counts": {
+            "markets_active": markets_active,
+            "markets_with_fees": fees_with,
+            "expiring_window": expiring,
+            "events_window": len(events),
+            "fees_in_window": fee_in_window,
+        },
+    }
+
+
+def _coerce_dt(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        return None
+
+
+def _age_s(now: datetime, dt: datetime | None) -> int | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return int((now - dt).total_seconds())
 
 
 def _filter_markets(
@@ -252,7 +356,6 @@ def _render_page(
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<meta http-equiv="refresh" content="45"/>
 <title>poly_bot — expiring {hours:.0f}h</title>
 <style>
 :root {{
@@ -372,16 +475,45 @@ tr:hover td {{ background: rgba(61, 139, 253, 0.06); }}
 .q {{ max-width: 280px; }}
 .hidden {{ display: none; }}
 footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
+.live-dot {{
+  display: inline-block;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--muted);
+  margin-right: 0.35rem;
+  vertical-align: 0.05rem;
+  box-shadow: 0 0 0 0 currentColor;
+}}
+.live-dot.ok {{
+  background: var(--green);
+  animation: pulse 1.6s ease-out infinite;
+}}
+.live-dot.warn {{ background: var(--amber); }}
+.live-dot.err {{ background: var(--red); }}
+@keyframes pulse {{
+  0% {{ box-shadow: 0 0 0 0 rgba(61, 214, 140, 0.55); }}
+  70% {{ box-shadow: 0 0 0 6px rgba(61, 214, 140, 0); }}
+  100% {{ box-shadow: 0 0 0 0 rgba(61, 214, 140, 0); }}
+}}
 </style>
 </head>
 <body>
 <header>
   <h1>poly_bot catalog</h1>
-  <div class="sub">Window {hours:.0f}h · auto-refresh 45s · run <code>poly-bot run</code> for live data</div>
+  <div class="sub">
+    Window {hours:.0f}h ·
+    <span class="live-dot" id="live-dot" title="SSE status"></span>
+    <span id="live-status">connecting…</span> ·
+    quotes <span id="quote-age">—</span> ·
+    delta <span id="delta-age">—</span>
+  </div>
   <div class="stats">
-    <div class="stat">Markets <b>{len(markets)}</b></div>
-    <div class="stat">Events <b>{len(events)}</b></div>
-    <div class="stat">With fees <b>{fee_count}</b></div>
+    <div class="stat">Markets <b id="stat-markets">{len(markets)}</b></div>
+    <div class="stat">Events <b id="stat-events">{len(events)}</b></div>
+    <div class="stat">With fees <b id="stat-fees">{fee_count}</b></div>
+    <div class="stat">Active catalog <b id="stat-active">—</b></div>
+    <div class="stat">Updated <b id="stat-updated">—</b></div>
   </div>
   <nav class="tabs">
     <a href="/?{query}" class="{'active' if tab == 'markets' else ''}">Markets</a>
@@ -445,6 +577,59 @@ document.getElementById('markets-table')?.addEventListener('click', (e) => {{
   table.querySelectorAll('th').forEach(h => delete h.dataset.sort);
   th.dataset.sort = asc ? 'asc' : 'desc';
 }});
+
+(() => {{
+  const dot = document.getElementById('live-dot');
+  const status = document.getElementById('live-status');
+  const qAge = document.getElementById('quote-age');
+  const dAge = document.getElementById('delta-age');
+  const sMk = document.getElementById('stat-markets');
+  const sEv = document.getElementById('stat-events');
+  const sFe = document.getElementById('stat-fees');
+  const sAc = document.getElementById('stat-active');
+  const sUp = document.getElementById('stat-updated');
+  if (!dot) return;
+  const HOURS = {hours};
+  function fmtAge(seconds) {{
+    if (seconds === null || seconds === undefined) return '—';
+    if (seconds < 60) return seconds + 's';
+    if (seconds < 3600) return Math.round(seconds / 60) + 'm';
+    return (seconds / 3600).toFixed(1) + 'h';
+  }}
+  function setStatus(cls, label) {{
+    dot.classList.remove('ok', 'warn', 'err');
+    if (cls) dot.classList.add(cls);
+    status.textContent = label;
+  }}
+  function apply(snap) {{
+    qAge.textContent = fmtAge(snap.quote_age_s);
+    dAge.textContent = fmtAge(snap.delta_age_s);
+    sMk.textContent = snap.counts.expiring_window;
+    sEv.textContent = snap.counts.events_window;
+    sFe.textContent = snap.counts.fees_in_window;
+    sAc.textContent = snap.counts.markets_active.toLocaleString();
+    sUp.textContent = new Date(snap.now).toLocaleTimeString();
+    const q = snap.quote_age_s;
+    if (q === null || q === undefined) setStatus('warn', 'no quotes yet');
+    else if (q > 600) setStatus('err', 'stale ' + fmtAge(q));
+    else if (q > 60) setStatus('warn', 'lagging ' + fmtAge(q));
+    else setStatus('ok', 'live');
+  }}
+  let es = null;
+  function connect() {{
+    setStatus(null, 'connecting…');
+    es = new EventSource('/api/stream?hours=' + HOURS);
+    es.onmessage = (e) => {{
+      try {{ apply(JSON.parse(e.data)); }} catch (err) {{}}
+    }};
+    es.onerror = () => {{
+      setStatus('err', 'offline (reconnecting…)');
+      es.close();
+      setTimeout(connect, 3000);
+    }};
+  }}
+  connect();
+}})();
 </script>
 </body>
 </html>"""

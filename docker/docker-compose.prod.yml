@@ -167,6 +167,23 @@ services:
     mem_limit: 256m
     cpus: 0.25
 
+  reconcile:
+    <<: *poly-bot-base
+    command:
+      - "poly-bot"
+      - "ops"
+      - "reconcile-loop"
+      - "--interval"
+      - "${RECONCILE_INTERVAL_SECONDS:-3600}"
+    healthcheck:
+      test: ["CMD", "poly-bot", "ops", "health", "--service", "any", "--max-age", "7200"]
+      interval: 5m
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    mem_limit: 256m
+    cpus: 0.25
+
 volumes:
   pg_data:
   pg_backups:

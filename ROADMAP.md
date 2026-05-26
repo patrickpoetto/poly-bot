@@ -36,11 +36,14 @@ deployed until the five blockers below are all green.
 - [ ] Document in README how to set `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID`.
 - **Why blocker:** without paging you don't know it broke until you look.
 
-### 4. Scheduled reconcile service
-- [ ] `poly-bot ops reconcile` exists but is manual.
-- [ ] Add a `reconcile` service to docker-compose, looping every N hours.
-- [ ] Surface anomalies (null fee_type, empty raw_payload, orphan
-      condition_id) on the dashboard or via alert.
+### 4. Scheduled reconcile service ✅
+- [x] New `poly-bot ops reconcile-loop` command + `reconcile` sidecar
+      in docker-compose, interval via `RECONCILE_INTERVAL_SECONDS`.
+- [x] Each run persists `last_reconcile_at` + the JSON report to
+      `catalog_state`; exposed via `/api/reconcile`.
+- [x] Prometheus gauges `polybot_reconcile_issues{metric=...}` and
+      counter `polybot_reconcile_runs_total{outcome=...}`.
+- [x] Unit tests assert state and counts after one run.
 
 ### 5. Runbook (`docs/RUNBOOK.md`)
 - [ ] Symptoms → diagnosis → fix for each known incident class:
@@ -54,10 +57,16 @@ deployed until the five blockers below are all green.
 
 ## Polish (parallelizable, not blockers)
 
-### A. Dashboard SSE live
-- [ ] Replace HTML auto-refresh with the existing `/api/stream` SSE
-      endpoint on the React/HTMX side.
-- [ ] Add a "live" indicator and per-condition push.
+### A. Dashboard SSE live ✅
+- [x] `<meta http-equiv="refresh">` gone — page renders once.
+- [x] Vanilla JS `EventSource` consumer with auto-reconnect.
+- [x] Live indicator dot (green pulse / amber lag / red stale).
+- [x] Stats counters and quote/delta age tick every 5s via
+      `/api/stream`, fed by new `_live_snapshot` helper.
+- [x] New `/api/health` + `/api/reconcile` JSON endpoints reuse
+      the same snapshot.
+- [ ] Per-condition push of new markets entering the window
+      (table is still server-rendered on initial load).
 
 ### B. GHCR auto-login on the host
 - [ ] Today we run `gh auth token | docker login ghcr.io` by hand.

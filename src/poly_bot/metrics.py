@@ -31,6 +31,16 @@ if _AVAILABLE:
     MARKETS_ACTIVE = Gauge("polybot_markets_active", "Active markets in catalog")
     MARKETS_WITH_FEES = Gauge("polybot_markets_with_fees", "Markets with fees enabled")
     EXPIRING_6H = Gauge("polybot_expiring_6h", "Markets expiring within 6 hours")
+    RECONCILE_ISSUES = Gauge(
+        "polybot_reconcile_issues",
+        "Outstanding data-quality issues per metric",
+        ["metric"],
+    )
+    RECONCILE_RUNS = Counter(
+        "polybot_reconcile_runs_total",
+        "Reconcile loop iterations (outcome: ok or failed)",
+        ["outcome"],
+    )
 
 
 def metrics_enabled() -> bool:
@@ -67,6 +77,19 @@ def set_catalog_gauges(
     MARKETS_ACTIVE.set(active_markets)
     MARKETS_WITH_FEES.set(markets_with_fees)
     EXPIRING_6H.set(expiring_6h)
+
+
+def record_reconcile_issues(issues: dict[str, int]) -> None:
+    if not _AVAILABLE:
+        return
+    for key, value in issues.items():
+        RECONCILE_ISSUES.labels(metric=key).set(value)
+
+
+def record_reconcile_run(success: bool) -> None:
+    if not _AVAILABLE:
+        return
+    RECONCILE_RUNS.labels(outcome="ok" if success else "failed").inc()
 
 
 def render_metrics() -> tuple[bytes, str]:

@@ -19,6 +19,8 @@ KEY_EVENTS_DELTA_WATERMARK = "events_delta_watermark"
 KEY_LAST_FULL_SCAN_AT = "last_full_scan_at"
 KEY_LAST_DELTA_SCAN_AT = "last_delta_scan_at"
 KEY_LAST_SERIES_SCAN_AT = "last_series_scan_at"
+KEY_LAST_RECONCILE_AT = "last_reconcile_at"
+KEY_LAST_RECONCILE_REPORT = "last_reconcile_report"
 
 
 class CatalogStateStore:

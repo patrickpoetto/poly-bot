@@ -531,6 +531,21 @@ def ops_backup_loop(
         typer.echo("\nStopped.")
 
 
+@ops_app.command("reconcile-loop")
+def ops_reconcile_loop(
+    interval: int = typer.Option(3600, "--interval", help="Seconds between checks."),
+) -> None:
+    """Daemon: run reconcile every N seconds; write report to catalog_state + metrics."""
+    settings, log = _bootstrap()
+    from poly_bot.ops.reconcile_scheduler import run_reconcile_loop
+
+    log.info("reconcile_loop_starting", interval=interval)
+    try:
+        asyncio.run(run_reconcile_loop(settings, interval_seconds=interval))
+    except KeyboardInterrupt:
+        typer.echo("\nStopped.")
+
+
 @ops_app.command("health")
 def ops_health(
     service: str = typer.Option(
