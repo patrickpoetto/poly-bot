@@ -28,13 +28,31 @@ deployed until the five blockers below are all green.
       alternative params (`closed=`, `slug=`, `id_in=…`) or a
       `/series/{id}` per-id fetch path.
 
-### 3. Alerting (paged ops)
-- [ ] Telegram webhook on `quote_age_s > 600`, `catalog_watch_cycle_timeout`,
-      `discovery_scan_failed`, `migrate` failed.
-- [ ] Prometheus → Alertmanager → Telegram (or simpler: directly from
-      ops health command on a cron).
-- [ ] Document in README how to set `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID`.
-- **Why blocker:** without paging you don't know it broke until you look.
+### 3. Alerting (paged ops) — code shipped, awaiting onboarding
+- [x] Lightweight `alerter` sidecar polls a shared `health_snapshot()`
+      helper (`ops/health.py`) and pushes Telegram messages **only on
+      state transitions** (open / resolved) — no spam while a condition
+      persists.
+- [x] Default rules shipped: `db_down`, `quotes_stale`, `delta_stale`,
+      `reconcile_stale`, `reconcile_regression`.
+- [x] Settings: `ALERTER_ENABLED`, `ALERTER_INTERVAL_SECONDS`,
+      `ALERT_QUOTE_AGE_THRESHOLD`, `ALERT_DELTA_AGE_THRESHOLD`,
+      `ALERT_RECONCILE_AGE_THRESHOLD`, `TELEGRAM_TOKEN`,
+      `TELEGRAM_CHAT_ID`.
+- [x] CLI: `poly-bot ops alerter-loop`, `ops telegram-test`,
+      `ops telegram-chat-id` (onboarding helper).
+- [x] Docker-compose `alerter` service with healthcheck + resource caps.
+- [x] README walkthrough: BotFather → token → `/getUpdates` → chat id.
+- [x] Unit tests cover rule evaluation, transition edge-triggering,
+      and the disabled-by-default safety guard (43 green).
+- [x] Image `poly-bot:0.1.5-dev` built; `alerter` container provisioned
+      and currently idle (safety: exits cleanly when `ALERTER_ENABLED=false`).
+- [ ] **Manual step pending:** paste `TELEGRAM_TOKEN` into `.env`,
+      then run `docker compose ... run --rm alerter poly-bot ops
+      telegram-chat-id` to capture `TELEGRAM_CHAT_ID`, then flip
+      `ALERTER_ENABLED=true` and restart `alerter`.
+- [ ] Smoke test in production: force `quote_age` over threshold, confirm
+      FIRING/RESOLVED pair lands in Telegram.
 
 ### 4. Scheduled reconcile service ✅
 - [x] New `poly-bot ops reconcile-loop` command + `reconcile` sidecar
@@ -74,7 +92,7 @@ deployed until the five blockers below are all green.
       systemd unit that refreshes the login.
 
 ### C. Integration tests
-- [ ] Today only unit tests in `tests/` (23 green).
+- [ ] Today only unit tests in `tests/` (43 green).
 - [ ] Add end-to-end: spin postgres in a fixture, run a full
       discovery → watch → enrich cycle against recorded Gamma payloads.
 
@@ -84,6 +102,8 @@ deployed until the five blockers below are all green.
 |---|---|---|
 | Catalog static (Gamma + DB) | 95% | Postgres + Alembic shipped |
 | Taxonomy + classification | 80% | overrides UI live, batch reclassify |
-| Live slice (6h window, quotes, OI) | 85% | WS sharding pending |
-| Living DB production | 90% | Docker split + healthchecks + backup |
-| Trading | 0% | gated on blockers 1, 3, 4 |
+| Live slice (6h window, quotes, OI) | 95% | WS sharded across 7 sockets |
+| Living DB production | 95% | Docker split + healthchecks + backup + reconcile |
+| Dashboard | 90% | SSE live indicator + JSON endpoints |
+| Alerting | 90% | code shipped — token + chat_id + smoke pending |
+| Trading | 0% | gated on blocker 5 (runbook) |

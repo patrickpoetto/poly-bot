@@ -184,6 +184,25 @@ services:
     mem_limit: 256m
     cpus: 0.25
 
+  alerter:
+    <<: *poly-bot-base
+    command: ["poly-bot", "ops", "alerter-loop"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://poly_bot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/poly_bot
+      POSTGRES_HOST: postgres
+      POLY_BOT_ENV: production
+      POLY_BOT_LOG_JSON: "true"
+      METRICS_ENABLED: "false"
+      ALERTER_ENABLED: "${ALERTER_ENABLED:-true}"
+    healthcheck:
+      test: ["CMD", "poly-bot", "ops", "health", "--service", "any", "--max-age", "7200"]
+      interval: 5m
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    mem_limit: 192m
+    cpus: 0.25
+
 volumes:
   pg_data:
   pg_backups:

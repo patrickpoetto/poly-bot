@@ -11,12 +11,65 @@ from sqlmodel import Session
 from poly_bot.persistence.catalog_state import (
     KEY_LAST_DELTA_SCAN_AT,
     KEY_LAST_FULL_SCAN_AT,
+    KEY_LAST_RECONCILE_AT,
+    KEY_LAST_RECONCILE_REPORT,
     CatalogStateStore,
 )
 from poly_bot.persistence.db import get_engine
 from poly_bot.settings import Settings
 
 ServiceKind = Literal["any", "discovery", "watch", "ws", "dashboard"]
+
+
+def health_snapshot(settings: Settings) -> dict[str, object]:
+    """Lightweight, side-effect-free snapshot for alerter + dashboard.
+
+    Returns ages (in seconds) of the freshest signal per pipeline, the last
+    reconcile report (best-effort JSON), and basic counters. Never raises —
+    if DB is unreachable, ``db`` is set to the error class name and the
+    rest of the keys are ``None``.
+    """
+
+    snapshot: dict[str, object] = {
+        "db": "ok",
+        "quote_age_s": None,
+        "delta_age_s": None,
+        "full_age_s": None,
+        "reconcile_age_s": None,
+        "reconcile_report": None,
+    }
+
+    engine = get_engine(settings)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1")).one()
+            row = conn.execute(text("SELECT MAX(updated_at) FROM token_quotes")).one()
+        latest_quote = _parse_dt(row[0] if row else None)
+        snapshot["quote_age_s"] = _age_seconds(latest_quote)
+    except Exception as exc:
+        snapshot["db"] = f"down: {exc.__class__.__name__}"
+        return snapshot
+
+    try:
+        with Session(engine) as session:
+            store = CatalogStateStore(session)
+            snapshot["delta_age_s"] = _age_seconds(store.get_datetime(KEY_LAST_DELTA_SCAN_AT))
+            snapshot["full_age_s"] = _age_seconds(store.get_datetime(KEY_LAST_FULL_SCAN_AT))
+            snapshot["reconcile_age_s"] = _age_seconds(
+                store.get_datetime(KEY_LAST_RECONCILE_AT)
+            )
+            report_raw = store.get(KEY_LAST_RECONCILE_REPORT)
+            if report_raw:
+                import json as _json
+
+                try:
+                    snapshot["reconcile_report"] = _json.loads(report_raw)
+                except (ValueError, TypeError):
+                    snapshot["reconcile_report"] = None
+    except Exception as exc:
+        snapshot["db"] = f"down: {exc.__class__.__name__}"
+
+    return snapshot
 
 
 def check_health(

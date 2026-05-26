@@ -546,6 +546,88 @@ def ops_reconcile_loop(
         typer.echo("\nStopped.")
 
 
+@ops_app.command("alerter-loop")
+def ops_alerter_loop() -> None:
+    """Daemon: poll health snapshot and page Telegram on state transitions."""
+    settings, log = _bootstrap()
+    from poly_bot.ops.alerter import run_alerter_loop
+
+    if not settings.alerter_enabled:
+        typer.echo("ALERTER_ENABLED is false — not starting.")
+        raise typer.Exit(code=0)
+    if not (settings.telegram_token and settings.telegram_chat_id):
+        typer.echo("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.", err=True)
+        raise typer.Exit(code=1)
+
+    log.info("alerter_loop_starting", interval=settings.alerter_interval_seconds)
+    try:
+        asyncio.run(run_alerter_loop(settings))
+    except KeyboardInterrupt:
+        typer.echo("\nStopped.")
+
+
+@ops_app.command("telegram-test")
+def ops_telegram_test(
+    message: str = typer.Option(
+        "poly-bot alerter test message",
+        "--message",
+        "-m",
+        help="Text to send.",
+    ),
+) -> None:
+    """Send a one-shot Telegram message using configured token/chat_id."""
+    settings, _log = _bootstrap()
+    if not (settings.telegram_token and settings.telegram_chat_id):
+        typer.echo("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.", err=True)
+        raise typer.Exit(code=1)
+    from poly_bot.notifier.telegram import TelegramClient
+
+    client = TelegramClient(
+        settings.telegram_token.get_secret_value(),
+        chat_id=settings.telegram_chat_id,
+    )
+    ok = asyncio.run(client.send_message(message))
+    typer.echo("delivered" if ok else "FAILED")
+    raise typer.Exit(code=0 if ok else 1)
+
+
+@ops_app.command("telegram-chat-id")
+def ops_telegram_chat_id() -> None:
+    """Print chat ids visible in recent updates — use this once during onboarding.
+
+    First send a message to your bot in the Telegram app, then run this
+    command and copy the printed ``chat.id`` into ``TELEGRAM_CHAT_ID``.
+    """
+    settings, _log = _bootstrap()
+    if not settings.telegram_token:
+        typer.echo("TELEGRAM_TOKEN must be set.", err=True)
+        raise typer.Exit(code=1)
+    from poly_bot.notifier.telegram import TelegramClient
+
+    client = TelegramClient(settings.telegram_token.get_secret_value())
+    updates = asyncio.run(client.get_updates())
+    if not updates:
+        typer.echo(
+            "No updates yet. Open Telegram, send any message to the bot, "
+            "then re-run this command."
+        )
+        raise typer.Exit(code=1)
+    seen: set[str] = set()
+    for upd in updates:
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        cid = chat.get("id")
+        if cid is None or str(cid) in seen:
+            continue
+        seen.add(str(cid))
+        title = chat.get("title") or chat.get("username") or chat.get("first_name") or ""
+        typer.echo(f"chat.id={cid}  type={chat.get('type')}  title={title}")
+    typer.echo(
+        "\nSet TELEGRAM_CHAT_ID to one of the values above (use the negative id "
+        "for groups)."
+    )
+
+
 @ops_app.command("health")
 def ops_health(
     service: str = typer.Option(

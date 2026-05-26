@@ -154,6 +154,34 @@ class Settings(BaseSettings):
         le=65535,
     )
 
+    # Telegram alerter
+    telegram_token: SecretStr | None = Field(
+        default=None,
+        validation_alias="TELEGRAM_TOKEN",
+    )
+    telegram_chat_id: str | None = Field(default=None, validation_alias="TELEGRAM_CHAT_ID")
+    alerter_enabled: bool = Field(default=False, validation_alias="ALERTER_ENABLED")
+    alerter_interval_seconds: int = Field(
+        default=60,
+        validation_alias="ALERTER_INTERVAL_SECONDS",
+        ge=10,
+    )
+    alert_quote_age_threshold: int = Field(
+        default=600,
+        validation_alias="ALERT_QUOTE_AGE_THRESHOLD",
+        ge=30,
+    )
+    alert_delta_age_threshold: int = Field(
+        default=600,
+        validation_alias="ALERT_DELTA_AGE_THRESHOLD",
+        ge=30,
+    )
+    alert_reconcile_age_threshold: int = Field(
+        default=14400,
+        validation_alias="ALERT_RECONCILE_AGE_THRESHOLD",
+        ge=300,
+    )
+
     # Wallet (optional until trading)
     private_key: SecretStr | None = Field(default=None, validation_alias="PRIVATE_KEY")
     wallet_address: str | None = Field(default=None, validation_alias="WALLET_ADDRESS")

@@ -94,11 +94,52 @@ Local dev compose (SQLite volume): `docker compose -f docker/docker-compose.yml 
 | `poly-bot ops migrate` | Alembic (Postgres) or SQLite schema |
 | `poly-bot ops health [--service ...]` | DB ping + activity freshness (exit 0/1) |
 | `poly-bot ops reconcile` | NULL fees, missing tokens, unknown domains |
+| `poly-bot ops reconcile-loop --interval 3600` | Periodic reconcile sidecar |
 | `poly-bot ops backup` | One-shot SQLite copy or `pg_dump` |
 | `poly-bot ops backup-loop --interval 3600 --retention-days 7` | Sidecar daemon |
+| `poly-bot ops alerter-loop` | Telegram paging on quote/delta/reconcile staleness |
+| `poly-bot ops telegram-test [-m "hello"]` | Send a one-shot Telegram message |
+| `poly-bot ops telegram-chat-id` | Discover the chat id from recent updates |
 | `poly-bot catalog reclassify` | Batch classifier refresh |
 | `poly-bot catalog taxonomy-add KIND KEY --domain ...` | Manual override |
 | `poly-bot catalog ws-daemon` | Persistent CLOB WebSocket |
+
+### Telegram alerter setup
+
+The `alerter` sidecar polls the same health snapshot used by the dashboard
+and pages Telegram **only on state transitions** (no spam while a
+condition persists). Setup once:
+
+1. Open Telegram → talk to **@BotFather** → `/newbot` → pick a name +
+   username ending in `bot`. Copy the HTTP API token.
+2. Set `TELEGRAM_TOKEN=…` in `.env` and reload settings
+   (`docker compose ... up -d alerter` after editing).
+3. Send any message to your new bot from Telegram, then run:
+
+   ```bash
+   docker compose --env-file .env -f docker/docker-compose.prod.yml \
+     exec alerter poly-bot ops telegram-chat-id
+   ```
+
+   Copy the `chat.id` it prints into `TELEGRAM_CHAT_ID=…`.
+4. Set `ALERTER_ENABLED=true` and:
+
+   ```bash
+   docker compose --env-file .env -f docker/docker-compose.prod.yml \
+     up -d alerter
+   docker compose --env-file .env -f docker/docker-compose.prod.yml \
+     exec alerter poly-bot ops telegram-test -m "alerter wired up"
+   ```
+
+Rules shipped by default:
+
+| Rule | Fires when |
+|------|------------|
+| `db_down` | Health snapshot can't `SELECT 1` |
+| `quotes_stale` | `quote_age_s > ALERT_QUOTE_AGE_THRESHOLD` (default 600s) |
+| `delta_stale` | `delta_age_s > ALERT_DELTA_AGE_THRESHOLD` (default 600s) |
+| `reconcile_stale` | `reconcile_age_s > ALERT_RECONCILE_AGE_THRESHOLD` (default 4h) |
+| `reconcile_regression` | Any `reconcile.issues[*]` counter grows vs previous run |
 
 ## Fees
 
