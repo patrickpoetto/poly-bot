@@ -109,6 +109,24 @@ class DiscoveryRunner:
         logger.info("series_backfill_complete", markets_updated=n)
         return n
 
+    def count_unknown_event_series(self) -> int:
+        """Number of event.series_id values not yet present in the series table."""
+        from sqlalchemy import text
+
+        with Session(self._engine) as session:
+            row = session.execute(
+                text(
+                    """
+                    SELECT COUNT(DISTINCT e.series_id)
+                    FROM events e
+                    LEFT JOIN series s ON s.id = e.series_id
+                    WHERE e.series_id IS NOT NULL AND e.series_id != ''
+                      AND s.id IS NULL
+                    """
+                )
+            ).first()
+            return int(row[0]) if row and row[0] is not None else 0
+
     async def scan_all(self) -> dict[str, int]:
         """Active markets + closed lookback bootstrap."""
         active_stats = await self.scan_active()

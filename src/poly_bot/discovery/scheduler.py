@@ -72,6 +72,7 @@ class DiscoveryScheduler:
                 session.commit()
 
             await self._maybe_refresh_series(stats)
+            await self._maybe_refresh_series_on_demand(stats)
 
         with Session(self._engine) as session:
             link_stats = CatalogLinker(session).link_all()
@@ -92,9 +93,42 @@ class DiscoveryScheduler:
             if last_series is not None and datetime.now(UTC) - last_series < interval:
                 return
 
-        logger.info("discovery_series_refresh")
+        await self._refresh_series_now(stats, reason="interval")
+
+    async def _maybe_refresh_series_on_demand(self, stats: dict[str, int | str]) -> None:
+        """Trigger a series scan if the delta brought in events with unknown series.
+
+        Gamma has no delta endpoint for series, but new event payloads carry a
+        ``series_id``. Whenever the join yields any orphan, we refresh — bounded
+        by a 30s cool-down (``KEY_LAST_SERIES_SCAN_AT``) so a noisy delta does
+        not hammer the endpoint.
+        """
+        cooldown = timedelta(seconds=30)
+        with Session(self._engine) as session:
+            state = CatalogStateStore(session)
+            last_series = state.get_datetime(KEY_LAST_SERIES_SCAN_AT)
+            if last_series is not None and datetime.now(UTC) - last_series < cooldown:
+                return
+
+        try:
+            orphans = self._runner.count_unknown_event_series()
+        except Exception:
+            logger.exception("series_orphan_count_failed")
+            return
+        if orphans == 0:
+            return
+
+        logger.info("discovery_series_refresh_on_demand", orphans=orphans)
+        await self._refresh_series_now(stats, reason="on_demand", orphans=orphans)
+
+    async def _refresh_series_now(
+        self, stats: dict[str, int | str], *, reason: str, orphans: int | None = None
+    ) -> None:
+        logger.info("discovery_series_refresh", reason=reason, orphans=orphans)
         series_stats = await self._runner.scan_series()
-        stats["series_upserted"] = series_stats.get("series_upserted", 0)
+        stats["series_upserted"] = stats.get(
+            "series_upserted", 0
+        ) + series_stats.get("series_upserted", 0)  # type: ignore[operator]
         with Session(self._engine) as session:
             CatalogStateStore(session).set_datetime(
                 KEY_LAST_SERIES_SCAN_AT,

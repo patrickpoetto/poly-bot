@@ -73,9 +73,9 @@ class Settings(BaseSettings):
         gt=0,
     )
     discovery_series_refresh_interval_minutes: int = Field(
-        default=60,
+        default=10,
         validation_alias="DISCOVERY_SERIES_REFRESH_INTERVAL_MINUTES",
-        ge=5,
+        ge=2,
     )
 
     # Live catalog (expiring window + quotes)
@@ -104,6 +104,18 @@ class Settings(BaseSettings):
         default=120.0,
         validation_alias="CATALOG_WS_REFRESH_SECONDS",
         ge=15.0,
+    )
+    catalog_ws_shard_size: int = Field(
+        default=500,
+        validation_alias="CATALOG_WS_SHARD_SIZE",
+        ge=50,
+        le=2000,
+    )
+    catalog_ws_max_shards: int = Field(
+        default=16,
+        validation_alias="CATALOG_WS_MAX_SHARDS",
+        ge=1,
+        le=64,
     )
     catalog_fetch_open_interest: bool = Field(
         default=True,
