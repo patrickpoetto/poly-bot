@@ -89,7 +89,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 90s
-    mem_limit: 1024m
+    mem_limit: 768m
     cpus: 1.0
 
   catalog-watch:
@@ -108,7 +108,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 90s
-    mem_limit: 1536m
+    mem_limit: 768m
     cpus: 1.0
 
   ws-daemon:
