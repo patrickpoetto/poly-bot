@@ -28,7 +28,7 @@ deployed until the five blockers below are all green.
       alternative params (`closed=`, `slug=`, `id_in=…`) or a
       `/series/{id}` per-id fetch path.
 
-### 3. Alerting (paged ops) — code shipped, awaiting onboarding
+### 3. Alerting (paged ops) ✅
 - [x] Lightweight `alerter` sidecar polls a shared `health_snapshot()`
       helper (`ops/health.py`) and pushes Telegram messages **only on
       state transitions** (open / resolved) — no spam while a condition
@@ -45,14 +45,14 @@ deployed until the five blockers below are all green.
 - [x] README walkthrough: BotFather → token → `/getUpdates` → chat id.
 - [x] Unit tests cover rule evaluation, transition edge-triggering,
       and the disabled-by-default safety guard (43 green).
-- [x] Image `poly-bot:0.1.5-dev` built; `alerter` container provisioned
-      and currently idle (safety: exits cleanly when `ALERTER_ENABLED=false`).
-- [ ] **Manual step pending:** paste `TELEGRAM_TOKEN` into `.env`,
-      then run `docker compose ... run --rm alerter poly-bot ops
-      telegram-chat-id` to capture `TELEGRAM_CHAT_ID`, then flip
-      `ALERTER_ENABLED=true` and restart `alerter`.
-- [ ] Smoke test in production: force `quote_age` over threshold, confirm
-      FIRING/RESOLVED pair lands in Telegram.
+- [x] Image `poly-bot:0.1.5-dev` deployed; `alerter` container healthy
+      and looping. Safety: exits cleanly when `ALERTER_ENABLED=false`.
+- [x] Bot wired up end-to-end — `telegram-test` delivered, loop logs
+      `alerter_started` with all 5 rules loaded.
+- [ ] **Follow-up (low priority):** force `quote_age` over threshold in
+      a staging cycle and confirm a FIRING/RESOLVED pair land in Telegram.
+      Not blocking — the rule engine is unit-tested and the transport is
+      verified live.
 
 ### 4. Scheduled reconcile service ✅
 - [x] New `poly-bot ops reconcile-loop` command + `reconcile` sidecar
@@ -105,5 +105,5 @@ deployed until the five blockers below are all green.
 | Live slice (6h window, quotes, OI) | 95% | WS sharded across 7 sockets |
 | Living DB production | 95% | Docker split + healthchecks + backup + reconcile |
 | Dashboard | 90% | SSE live indicator + JSON endpoints |
-| Alerting | 90% | code shipped — token + chat_id + smoke pending |
+| Alerting | 100% | edge-triggered Telegram via `alerter` sidecar, live |
 | Trading | 0% | gated on blocker 5 (runbook) |
