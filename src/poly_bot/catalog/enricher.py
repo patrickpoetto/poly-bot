@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime
 
 import structlog
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session
 
 from poly_bot.catalog.expiring import (
@@ -152,23 +153,48 @@ class CatalogEnricher:
         return [t for tid in token_ids if (t := self._session.get(Token, tid)) is not None]
 
     async def _enrich_open_interest(self, condition_ids: list[str], now: datetime) -> int:
+        """Fetch OI concurrently, then persist sequentially in deterministic order.
+
+        Sorting by ``condition_id`` before flush eliminates the lock-ordering
+        cycle that previously caused ``DeadlockDetected`` against concurrent
+        writers (discovery, ws-daemon). Persistence is retried up to three
+        times on transient deadlocks.
+        """
         sem = asyncio.Semaphore(self._settings.catalog_oi_concurrency)
-        written = 0
+        fetched: dict[str, float] = {}
 
         async def one(cid: str) -> None:
-            nonlocal written
             async with sem:
-                oi = await self._data.fetch_open_interest(cid)
+                try:
+                    oi = await self._data.fetch_open_interest(cid)
+                except Exception:
+                    logger.exception("oi_fetch_failed", condition_id=cid)
+                    return
             if oi is None:
                 return
-            enrich_row = self._session.get(MarketEnrichment, cid)
-            if enrich_row is None:
-                enrich_row = MarketEnrichment(condition_id=cid)
-            enrich_row.open_interest = oi
-            enrich_row.enriched_at = now
-            self._session.add(enrich_row)
-            written += 1
+            fetched[cid] = oi
 
         await asyncio.gather(*(one(cid) for cid in condition_ids))
-        self._session.commit()
-        return written
+        if not fetched:
+            return 0
+
+        ordered = sorted(fetched.items())
+        for attempt in range(3):
+            try:
+                with self._session.no_autoflush:
+                    for cid, oi in ordered:
+                        enrich_row = self._session.get(MarketEnrichment, cid)
+                        if enrich_row is None:
+                            enrich_row = MarketEnrichment(condition_id=cid)
+                        enrich_row.open_interest = oi
+                        enrich_row.enriched_at = now
+                        self._session.add(enrich_row)
+                self._session.commit()
+                return len(ordered)
+            except OperationalError as exc:
+                self._session.rollback()
+                if "deadlock" not in str(exc).lower() or attempt == 2:
+                    raise
+                logger.warning("oi_deadlock_retry", attempt=attempt + 1)
+                await asyncio.sleep(0.5 * (attempt + 1))
+        return 0

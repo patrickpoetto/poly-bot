@@ -80,9 +80,10 @@ class PersistentWSDaemon:
 
         async with websockets.connect(
             self._url,
-            ping_interval=20,
-            ping_timeout=10,
+            ping_interval=30,
+            ping_timeout=30,
             close_timeout=5,
+            max_size=2**22,
         ) as ws:
             await self._subscribe(ws, token_ids)
             flush_task = asyncio.create_task(self._flush_loop())
@@ -180,25 +181,37 @@ class PersistentWSDaemon:
         snapshot = self._pending
         self._pending = {}
         now = datetime.now(UTC)
+        ordered = sorted(snapshot.items())
+        from sqlalchemy.exc import OperationalError
+
         with Session(self._engine) as session:
-            n = 0
-            for token_id, q in snapshot.items():
-                condition_id = self._token_to_condition.get(token_id)
-                if not condition_id:
-                    continue
-                row = session.get(TokenQuote, token_id) or TokenQuote(
-                    token_id=token_id,
-                    condition_id=condition_id,
-                )
-                row.bid = q.get("bid")
-                row.ask = q.get("ask")
-                row.mid = q.get("mid")
-                row.spread = q.get("spread")
-                row.updated_at = now
-                session.add(row)
-                n += 1
-            session.commit()
-        record_catalog_enrich("ws_quote", n)
+            for attempt in range(3):
+                n = 0
+                try:
+                    with session.no_autoflush:
+                        for token_id, q in ordered:
+                            condition_id = self._token_to_condition.get(token_id)
+                            if not condition_id:
+                                continue
+                            row = session.get(TokenQuote, token_id) or TokenQuote(
+                                token_id=token_id,
+                                condition_id=condition_id,
+                            )
+                            row.bid = q.get("bid")
+                            row.ask = q.get("ask")
+                            row.mid = q.get("mid")
+                            row.spread = q.get("spread")
+                            row.updated_at = now
+                            session.add(row)
+                            n += 1
+                    session.commit()
+                    record_catalog_enrich("ws_quote", n)
+                    return
+                except OperationalError as exc:
+                    session.rollback()
+                    if "deadlock" not in str(exc).lower() or attempt == 2:
+                        raise
+                    logger.warning("ws_flush_deadlock_retry", attempt=attempt + 1)
 
 
 def _load_token_conditions(session: Session) -> dict[str, str]:

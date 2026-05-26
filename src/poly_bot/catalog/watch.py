@@ -57,11 +57,21 @@ class CatalogWatch:
 
     async def run_forever(self, *, hours: float | None = None) -> None:
         interval = self._settings.catalog_enrich_interval_seconds
-        logger.info("catalog_watch_start", interval=interval, hours=hours)
+        cycle_timeout = max(interval * 5, 300.0)
+        logger.info(
+            "catalog_watch_start",
+            interval=interval,
+            hours=hours,
+            cycle_timeout=cycle_timeout,
+        )
         while True:
             try:
-                stats = await self.run_cycle(hours=hours)
+                stats = await asyncio.wait_for(
+                    self.run_cycle(hours=hours), timeout=cycle_timeout
+                )
                 logger.info("catalog_watch_cycle", **stats)
+            except TimeoutError:
+                logger.error("catalog_watch_cycle_timeout", timeout=cycle_timeout)
             except Exception:
                 logger.exception("catalog_watch_cycle_failed")
             await asyncio.sleep(interval)
