@@ -69,29 +69,39 @@ class CatalogLinker:
     # ── series linking by slug ───────────────────────────────────────────────
 
     def _link_series_by_slug(self) -> int:
-        """Stream active markets without series_id; batch UPDATEs grouped by series."""
-        stmt = text(
+        """Paginate active markets without series_id; batch UPDATEs grouped by series."""
+        select_sql = text(
             """
             SELECT condition_id, slug
             FROM markets
             WHERE active = TRUE
               AND (series_id IS NULL OR series_id = '')
+              AND condition_id > :last
+            ORDER BY condition_id
+            LIMIT :lim
             """
-        ).execution_options(stream_results=True, yield_per=_BATCH)
-
+        )
         by_series: dict[str, list[str]] = defaultdict(list)
-        for cid, slug in self._session.execute(stmt):
-            series_slug = _match_series_slug(
-                str(slug or ""),
-                self._series_slugs_sorted,
-                self._series_by_slug,
-            )
-            if not series_slug:
-                continue
-            series_id = self._series_by_slug.get(series_slug)
-            if not series_id:
-                continue
-            by_series[series_id].append(str(cid))
+        last_cid = ""
+        while True:
+            rows = self._session.execute(
+                select_sql, {"last": last_cid, "lim": _BATCH}
+            ).fetchall()
+            if not rows:
+                break
+            for cid, slug in rows:
+                series_slug = _match_series_slug(
+                    str(slug or ""),
+                    self._series_slugs_sorted,
+                    self._series_by_slug,
+                )
+                if not series_slug:
+                    continue
+                series_id = self._series_by_slug.get(series_slug)
+                if not series_id:
+                    continue
+                by_series[series_id].append(str(cid))
+            last_cid = str(rows[-1][0])
 
         updated = 0
         for series_id, cids in by_series.items():
@@ -113,66 +123,143 @@ class CatalogLinker:
     # ── tags sync from events ────────────────────────────────────────────────
 
     def _sync_tags_from_events(self) -> int:
-        """Stream markets ↔ events; bulk insert tags with ON CONFLICT DO NOTHING."""
-        is_pg = self._is_postgres()
-        insert_sql = (
-            "INSERT INTO market_tags (condition_id, tag) VALUES (:cid, :tag) "
-            "ON CONFLICT DO NOTHING"
-            if is_pg
-            else "INSERT OR IGNORE INTO market_tags (condition_id, tag) VALUES (:cid, :tag)"
-        )
+        """Insert (condition_id, tag) pairs from event JSON, bypassing Python memory.
 
-        select_stmt = text(
+        Postgres: single ``INSERT ... SELECT`` using ``jsonb_array_elements``.
+        SQLite: paginated Python fallback (only ``tags_json`` loaded, no raw_payload).
+        """
+        if self._is_postgres():
+            return self._sync_tags_pg()
+        return self._sync_tags_sqlite()
+
+    def _sync_tags_pg(self) -> int:
+        sql = text(
             """
-            SELECT m.condition_id, e.tags_json, e.raw_payload
+            INSERT INTO market_tags (condition_id, tag)
+            SELECT cid, tag FROM (
+                SELECT m.condition_id AS cid,
+                       LOWER(TRIM(BOTH FROM
+                           CASE jsonb_typeof(t)
+                               WHEN 'string' THEN t #>> '{}'
+                               WHEN 'object' THEN COALESCE(t->>'slug', t->>'label')
+                               ELSE NULL
+                           END)) AS tag
+                FROM markets m
+                JOIN events e ON e.id = m.event_id
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    CASE
+                        WHEN e.tags_json IS NOT NULL
+                             AND jsonb_typeof(e.tags_json::jsonb) = 'array'
+                        THEN e.tags_json::jsonb
+                        ELSE '[]'::jsonb
+                    END
+                ) AS t
+                WHERE m.event_id IS NOT NULL AND m.event_id <> ''
+            ) src
+            WHERE tag IS NOT NULL AND tag <> ''
+            ON CONFLICT (condition_id, tag) DO NOTHING
+            """
+        )
+        result = self._session.execute(sql)
+        self._session.commit()
+        return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+    def _sync_tags_sqlite(self) -> int:
+        insert_sql = (
+            "INSERT OR IGNORE INTO market_tags (condition_id, tag) "
+            "VALUES (:cid, :tag)"
+        )
+        select_sql = text(
+            """
+            SELECT m.condition_id, e.tags_json
             FROM markets m
             JOIN events e ON e.id = m.event_id
             WHERE m.event_id IS NOT NULL AND m.event_id != ''
+              AND m.condition_id > :last
+            ORDER BY m.condition_id
+            LIMIT :lim
             """
-        ).execution_options(stream_results=True, yield_per=_BATCH)
-
+        )
         inserted = 0
-        batch: list[dict[str, str]] = []
-        for cid, tags_json, raw_payload in self._session.execute(select_stmt):
-            tags = _normalize_tags(tags_json, raw_payload)
-            for tag in tags:
-                tag_l = tag.lower().strip()
-                if not tag_l:
-                    continue
-                batch.append({"cid": str(cid), "tag": tag_l})
-                if len(batch) >= _BATCH:
-                    inserted += self._flush_inserts(insert_sql, batch)
-                    batch.clear()
-        if batch:
-            inserted += self._flush_inserts(insert_sql, batch)
+        last_cid = ""
+        while True:
+            rows = self._session.execute(
+                select_sql, {"last": last_cid, "lim": _BATCH}
+            ).fetchall()
+            if not rows:
+                break
+            batch: list[dict[str, str]] = []
+            for cid, tags_json in rows:
+                for tag in _parse_json_list(tags_json):
+                    label: str | None = None
+                    if isinstance(tag, str):
+                        label = tag
+                    elif isinstance(tag, dict):
+                        raw = tag.get("slug") or tag.get("label")
+                        label = str(raw) if raw else None
+                    if not label:
+                        continue
+                    label = label.lower().strip()
+                    if not label:
+                        continue
+                    batch.append({"cid": str(cid), "tag": label})
+            if batch:
+                result = self._session.execute(text(insert_sql), batch)
+                inserted += int(result.rowcount or 0)  # type: ignore[attr-defined]
+                self._session.commit()
+            last_cid = str(rows[-1][0])
         return inserted
-
-    def _flush_inserts(self, sql: str, batch: list[dict[str, str]]) -> int:
-        result = self._session.execute(text(sql), batch)
-        self._session.commit()
-        return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
     # ── domain backfill ──────────────────────────────────────────────────────
 
     def _apply_domain_from_events(self) -> int:
-        """Stream unknown-domain markets ↔ events; batch UPDATE grouped by domain."""
-        select_stmt = text(
-            """
-            SELECT m.condition_id, e.tags_json, e.raw_payload
-            FROM markets m
-            JOIN events e ON e.id = m.event_id
-            WHERE (m.domain IS NULL OR m.domain = '' OR m.domain = 'unknown')
-              AND m.event_id IS NOT NULL AND m.event_id != ''
-            """
-        ).execution_options(stream_results=True, yield_per=_BATCH)
+        """Paginate unknown-domain markets; classify from already-materialized market_tags.
 
+        Reads only ``(condition_id, tag)`` rows from ``market_tags`` — no event
+        payloads — so memory stays flat regardless of catalog size.
+        """
+        select_sql = text(
+            """
+            SELECT m.condition_id, COALESCE(
+                (SELECT string_agg(mt.tag, ',') FROM market_tags mt
+                 WHERE mt.condition_id = m.condition_id), ''
+            ) AS tags
+            FROM markets m
+            WHERE (m.domain IS NULL OR m.domain = '' OR m.domain = 'unknown')
+              AND m.condition_id > :last
+            ORDER BY m.condition_id
+            LIMIT :lim
+            """
+        ) if self._is_postgres() else text(
+            """
+            SELECT m.condition_id, COALESCE(
+                (SELECT GROUP_CONCAT(mt.tag, ',') FROM market_tags mt
+                 WHERE mt.condition_id = m.condition_id), ''
+            ) AS tags
+            FROM markets m
+            WHERE (m.domain IS NULL OR m.domain = '' OR m.domain = 'unknown')
+              AND m.condition_id > :last
+            ORDER BY m.condition_id
+            LIMIT :lim
+            """
+        )
         by_domain: dict[str, list[str]] = defaultdict(list)
-        for cid, tags_json, raw_payload in self._session.execute(select_stmt):
-            tags = _normalize_tags(tags_json, raw_payload)
-            domain = classify_domain_from_tags(tags)
-            if domain == "unknown":
-                continue
-            by_domain[domain].append(str(cid))
+        last_cid = ""
+        while True:
+            rows = self._session.execute(
+                select_sql, {"last": last_cid, "lim": _BATCH}
+            ).fetchall()
+            if not rows:
+                break
+            for cid, tags_csv in rows:
+                if not tags_csv:
+                    continue
+                tags = [t for t in str(tags_csv).split(",") if t]
+                domain = classify_domain_from_tags(tags)
+                if domain == "unknown":
+                    continue
+                by_domain[domain].append(str(cid))
+            last_cid = str(rows[-1][0])
 
         updated = 0
         for domain, cids in by_domain.items():

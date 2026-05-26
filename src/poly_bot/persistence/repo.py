@@ -252,17 +252,29 @@ class CatalogRepository:
         self._session.add(row)
 
     def rollup_event_fees(self) -> int:
-        """Aggregate fee fields from markets onto parent events."""
+        """Aggregate fee fields from markets onto parent events.
+
+        Uses dialect-aware aggregation for the boolean ``fees_enabled`` flag:
+        Postgres requires ``bool_or``; SQLite expects integer 0/1.
+        """
         from sqlalchemy import text
 
+        bind = self._session.get_bind()
+        is_pg = bind is not None and bind.dialect.name == "postgresql"
+        fees_enabled_expr = (
+            "COALESCE((SELECT bool_or(m.fees_enabled) "
+            "FROM markets m WHERE m.event_id = events.id), false)"
+            if is_pg
+            else (
+                "COALESCE((SELECT MAX(CASE WHEN m.fees_enabled THEN 1 ELSE 0 END) "
+                "FROM markets m WHERE m.event_id = events.id), 0)"
+            )
+        )
         result = self._session.execute(
             text(
-                """
+                f"""
                 UPDATE events
-                SET fees_enabled = COALESCE((
-                    SELECT MAX(CASE WHEN m.fees_enabled THEN 1 ELSE 0 END)
-                    FROM markets m WHERE m.event_id = events.id
-                ), 0),
+                SET fees_enabled = {fees_enabled_expr},
                 maker_base_fee = (
                     SELECT MIN(m.maker_base_fee) FROM markets m
                     WHERE m.event_id = events.id AND m.maker_base_fee IS NOT NULL
