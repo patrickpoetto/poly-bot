@@ -53,11 +53,12 @@ def default_rules(settings: Settings) -> list[Rule]:
             return False, "no quote data yet"
         return age > quote_max, f"quote_age_s={age} (> {quote_max})"
 
-    def _delta_stale(snap: dict[str, Any], _ctx: AlerterContext) -> tuple[bool, str]:
-        age = snap.get("delta_age_s")
+    def _discovery_stale(snap: dict[str, Any], _ctx: AlerterContext) -> tuple[bool, str]:
+        """Uses heartbeat written at cycle *start*, not delta completion time."""
+        age = snap.get("discovery_activity_age_s")
         if not isinstance(age, int):
-            return False, "no delta scan yet"
-        return age > delta_max, f"delta_age_s={age} (> {delta_max})"
+            return False, "no discovery activity yet"
+        return age > delta_max, f"discovery_activity_age_s={age} (> {delta_max})"
 
     def _reconcile_stale(snap: dict[str, Any], _ctx: AlerterContext) -> tuple[bool, str]:
         age = snap.get("reconcile_age_s")
@@ -96,7 +97,11 @@ def default_rules(settings: Settings) -> list[Rule]:
     return [
         Rule("db_down", "Postgres unreachable", _db_down),
         Rule("quotes_stale", f"No quotes for > {quote_max}s", _quote_stale),
-        Rule("delta_stale", f"No delta scan for > {delta_max}s", _delta_stale),
+        Rule(
+            "discovery_stale",
+            f"No discovery activity for > {delta_max}s",
+            _discovery_stale,
+        ),
         Rule(
             "reconcile_stale",
             f"No reconcile run for > {recon_max}s",

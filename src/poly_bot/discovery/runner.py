@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
 
 import structlog
+from sqlalchemy.exc import OperationalError, PendingRollbackError
 from sqlmodel import Session
 
 from poly_bot.discovery.crawler.gamma import GammaClient
@@ -30,6 +31,16 @@ from poly_bot.settings import Settings
 logger = structlog.get_logger(__name__)
 
 T = TypeVar("T")
+
+_DEADLOCK_RETRIES = 3
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    if isinstance(exc, PendingRollbackError):
+        return True
+    if isinstance(exc, OperationalError):
+        return "deadlock" in str(exc).lower()
+    return False
 
 
 class DiscoveryRunner:
@@ -222,6 +233,26 @@ class DiscoveryRunner:
         run_type: str,
         source: AsyncIterator[dict[str, Any]],
     ) -> dict[str, int]:
+        for attempt in range(_DEADLOCK_RETRIES):
+            try:
+                return await self._scan_markets_once(run_type=run_type, source=source)
+            except (OperationalError, PendingRollbackError) as exc:
+                if not _is_transient_db_error(exc) or attempt == _DEADLOCK_RETRIES - 1:
+                    raise
+                logger.warning(
+                    "scan_markets_deadlock_retry",
+                    run_type=run_type,
+                    attempt=attempt + 1,
+                )
+                await asyncio.sleep(0.5 * (attempt + 1))
+        raise RuntimeError("unreachable")
+
+    async def _scan_markets_once(
+        self,
+        *,
+        run_type: str,
+        source: AsyncIterator[dict[str, Any]],
+    ) -> dict[str, int]:
         markets_upserted = 0
         pages_fetched = 0
         errors = 0
@@ -234,41 +265,45 @@ class DiscoveryRunner:
             overrides = TaxonomyOverrideStore.load(session)
 
             try:
-                async for raw in source:
-                    pages_fetched += 1
-                    try:
-                        condition_id = raw.get("conditionId") or raw.get("condition_id")
-                        if not condition_id:
-                            continue
-                        market, tokens, tags = gamma_market_to_entities(raw, overrides=overrides)
-                        repo.upsert_market(market)
-                        session.flush()
-                        repo.replace_tokens(market.condition_id, tokens)
-                        repo.replace_market_tags(market.condition_id, tags)
-                        enrich = gamma_market_enrichment_fields(raw)
-                        repo.upsert_market_enrichment(
-                            market.condition_id,
-                            volume_24h=enrich.get("volume_24h"),
-                            fee_rate_bps=enrich.get("fee_rate_bps"),
-                            maker_base_fee=enrich.get("maker_base_fee"),
-                            taker_base_fee=enrich.get("taker_base_fee"),
-                            rewards_min_size=enrich.get("rewards_min_size"),
-                            rewards_max_spread=enrich.get("rewards_max_spread"),
-                        )
-                        markets_upserted += 1
-                        if markets_upserted % 500 == 0:
-                            session.commit()
-                            logger.info(
-                                "scan_progress",
-                                run_type=run_type,
-                                markets=markets_upserted,
+                with session.no_autoflush:
+                    async for raw in source:
+                        pages_fetched += 1
+                        try:
+                            condition_id = raw.get("conditionId") or raw.get("condition_id")
+                            if not condition_id:
+                                continue
+                            market, tokens, tags = gamma_market_to_entities(
+                                raw, overrides=overrides
                             )
-                    except Exception:
-                        errors += 1
-                        logger.exception(
-                            "market_upsert_failed",
-                            condition_id=raw.get("conditionId"),
-                        )
+                            repo.upsert_market(market)
+                            session.flush()
+                            repo.replace_tokens(market.condition_id, tokens)
+                            repo.replace_market_tags(market.condition_id, tags)
+                            enrich = gamma_market_enrichment_fields(raw)
+                            repo.upsert_market_enrichment(
+                                market.condition_id,
+                                volume_24h=enrich.get("volume_24h"),
+                                fee_rate_bps=enrich.get("fee_rate_bps"),
+                                maker_base_fee=enrich.get("maker_base_fee"),
+                                taker_base_fee=enrich.get("taker_base_fee"),
+                                rewards_min_size=enrich.get("rewards_min_size"),
+                                rewards_max_spread=enrich.get("rewards_max_spread"),
+                            )
+                            markets_upserted += 1
+                            if markets_upserted % 500 == 0:
+                                session.commit()
+                                logger.info(
+                                    "scan_progress",
+                                    run_type=run_type,
+                                    markets=markets_upserted,
+                                )
+                        except Exception:
+                            errors += 1
+                            session.rollback()
+                            logger.exception(
+                                "market_upsert_failed",
+                                condition_id=raw.get("conditionId"),
+                            )
 
                 session.commit()
                 repo.finish_run(
@@ -310,6 +345,38 @@ class DiscoveryRunner:
         entity_label: str,
         stat_key: str | None = None,
     ) -> dict[str, int]:
+        for attempt in range(_DEADLOCK_RETRIES):
+            try:
+                return await self._scan_records_once(
+                    run_type=run_type,
+                    source=source,
+                    mapper=mapper,
+                    upsert=upsert,
+                    entity_label=entity_label,
+                    stat_key=stat_key,
+                )
+            except (OperationalError, PendingRollbackError) as exc:
+                if not _is_transient_db_error(exc) or attempt == _DEADLOCK_RETRIES - 1:
+                    raise
+                logger.warning(
+                    "scan_records_deadlock_retry",
+                    run_type=run_type,
+                    entity=entity_label,
+                    attempt=attempt + 1,
+                )
+                await asyncio.sleep(0.5 * (attempt + 1))
+        raise RuntimeError("unreachable")
+
+    async def _scan_records_once(
+        self,
+        *,
+        run_type: str,
+        source: AsyncIterator[dict[str, Any]],
+        mapper: Callable[[dict[str, Any]], T | None],
+        upsert: Callable[[CatalogRepository, T], None],
+        entity_label: str,
+        stat_key: str | None = None,
+    ) -> dict[str, int]:
         stat_key = stat_key or f"{entity_label}_upserted"
         upserted = 0
         pages_fetched = 0
@@ -320,28 +387,30 @@ class DiscoveryRunner:
             run = repo.start_run(run_type)
 
             try:
-                async for raw in source:
-                    pages_fetched += 1
-                    try:
-                        entity = mapper(raw)
-                        if entity is None:
-                            continue
-                        upsert(repo, entity)
-                        upserted += 1
-                        if upserted % 500 == 0:
-                            session.commit()
-                            logger.info(
-                                "scan_progress",
-                                run_type=run_type,
-                                entity=entity_label,
-                                count=upserted,
+                with session.no_autoflush:
+                    async for raw in source:
+                        pages_fetched += 1
+                        try:
+                            entity = mapper(raw)
+                            if entity is None:
+                                continue
+                            upsert(repo, entity)
+                            upserted += 1
+                            if upserted % 500 == 0:
+                                session.commit()
+                                logger.info(
+                                    "scan_progress",
+                                    run_type=run_type,
+                                    entity=entity_label,
+                                    count=upserted,
+                                )
+                        except Exception:
+                            errors += 1
+                            session.rollback()
+                            logger.exception(
+                                f"{entity_label}_upsert_failed",
+                                record_id=raw.get("id"),
                             )
-                    except Exception:
-                        errors += 1
-                        logger.exception(
-                            f"{entity_label}_upsert_failed",
-                            record_id=raw.get("id"),
-                        )
 
                 session.commit()
                 if stat_key == "series_upserted":

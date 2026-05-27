@@ -76,15 +76,30 @@ def test_transitions_only_on_state_change() -> None:
     current = {
         "quotes_stale": (False, "ok"),
         "db_down": (True, "still down"),
-        "delta_stale": (True, "delta_age_s=900"),
+        "discovery_stale": (True, "discovery_activity_age_s=900"),
     }
     out = transitions(prev, current)
     out_by_name = {n: kind for n, kind, *_ in out}
     # db_down was already firing → no transition; quotes_stale unchanged.
     assert "db_down" not in out_by_name
     assert "quotes_stale" not in out_by_name
-    # delta_stale is new → open.
-    assert out_by_name["delta_stale"] == "open"
+    # discovery_stale is new → open.
+    assert out_by_name["discovery_stale"] == "open"
+
+
+def test_discovery_stale_uses_heartbeat_not_delta_completion(
+    alerter_settings: Settings,
+) -> None:
+    rules = {r.name: r for r in default_rules(alerter_settings)}
+    ctx = AlerterContext()
+    # Long full scan: delta_age high but heartbeat fresh → no page.
+    snap = {"discovery_activity_age_s": 45, "delta_age_s": 900}
+    firing, _ = rules["discovery_stale"].evaluate(snap, ctx)
+    assert firing is False
+    snap_stuck = {"discovery_activity_age_s": 900, "delta_age_s": 900}
+    firing, detail = rules["discovery_stale"].evaluate(snap_stuck, ctx)
+    assert firing is True
+    assert "900" in detail
 
 
 def test_render_message_open_and_resolved() -> None:

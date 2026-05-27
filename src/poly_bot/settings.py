@@ -52,7 +52,7 @@ class Settings(BaseSettings):
         le=90,
     )
     discovery_full_scan_interval_minutes: int = Field(
-        default=10,
+        default=30,
         validation_alias="DISCOVERY_FULL_SCAN_INTERVAL_MINUTES",
         ge=1,
     )

@@ -13,6 +13,7 @@ from poly_bot.discovery.runner import DiscoveryRunner
 from poly_bot.metrics import record_discovery_cycle
 from poly_bot.persistence.catalog_state import (
     KEY_LAST_DELTA_SCAN_AT,
+    KEY_LAST_DISCOVERY_ACTIVITY_AT,
     KEY_LAST_FULL_SCAN_AT,
     KEY_LAST_SERIES_SCAN_AT,
     CatalogStateStore,
@@ -32,7 +33,17 @@ class DiscoveryScheduler:
     def init_database(self) -> None:
         init_db(self._engine)
 
+    def _touch_discovery_heartbeat(self) -> None:
+        """Record that discovery is alive (full or delta cycle started)."""
+        with Session(self._engine) as session:
+            CatalogStateStore(session).set_datetime(
+                KEY_LAST_DISCOVERY_ACTIVITY_AT,
+                datetime.now(UTC),
+            )
+            session.commit()
+
     async def run_cycle(self, *, force_full: bool = False) -> dict[str, int | str]:
+        self._touch_discovery_heartbeat()
         with Session(self._engine) as session:
             state = CatalogStateStore(session)
             last_full = state.get_datetime(KEY_LAST_FULL_SCAN_AT)

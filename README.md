@@ -137,7 +137,7 @@ Rules shipped by default:
 |------|------------|
 | `db_down` | Health snapshot can't `SELECT 1` |
 | `quotes_stale` | `quote_age_s > ALERT_QUOTE_AGE_THRESHOLD` (default 600s) |
-| `delta_stale` | `delta_age_s > ALERT_DELTA_AGE_THRESHOLD` (default 600s) |
+| `discovery_stale` | `discovery_activity_age_s > ALERT_DELTA_AGE_THRESHOLD` (heartbeat at cycle start) |
 | `reconcile_stale` | `reconcile_age_s > ALERT_RECONCILE_AGE_THRESHOLD` (default 4h) |
 | `reconcile_regression` | Any `reconcile.issues[*]` counter grows vs previous run |
 

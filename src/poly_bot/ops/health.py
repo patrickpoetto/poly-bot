@@ -10,6 +10,7 @@ from sqlmodel import Session
 
 from poly_bot.persistence.catalog_state import (
     KEY_LAST_DELTA_SCAN_AT,
+    KEY_LAST_DISCOVERY_ACTIVITY_AT,
     KEY_LAST_FULL_SCAN_AT,
     KEY_LAST_RECONCILE_AT,
     KEY_LAST_RECONCILE_REPORT,
@@ -35,6 +36,7 @@ def health_snapshot(settings: Settings) -> dict[str, object]:
         "quote_age_s": None,
         "delta_age_s": None,
         "full_age_s": None,
+        "discovery_activity_age_s": None,
         "reconcile_age_s": None,
         "reconcile_report": None,
     }
@@ -55,6 +57,9 @@ def health_snapshot(settings: Settings) -> dict[str, object]:
             store = CatalogStateStore(session)
             snapshot["delta_age_s"] = _age_seconds(store.get_datetime(KEY_LAST_DELTA_SCAN_AT))
             snapshot["full_age_s"] = _age_seconds(store.get_datetime(KEY_LAST_FULL_SCAN_AT))
+            snapshot["discovery_activity_age_s"] = _age_seconds(
+                store.get_datetime(KEY_LAST_DISCOVERY_ACTIVITY_AT)
+            )
             snapshot["reconcile_age_s"] = _age_seconds(
                 store.get_datetime(KEY_LAST_RECONCILE_AT)
             )
@@ -96,12 +101,17 @@ def check_health(
                 ts = state.get_datetime(key)
                 age = _age_seconds(ts)
                 details[key] = age if age is not None else "never"
-                if (
-                    service == "discovery"
-                    and age is not None
-                    and age > max_age_seconds
-                ):
-                    details["reason"] = f"{key} stale ({age}s > {max_age_seconds}s)"
+            activity_age = _age_seconds(
+                state.get_datetime(KEY_LAST_DISCOVERY_ACTIVITY_AT)
+            )
+            details[KEY_LAST_DISCOVERY_ACTIVITY_AT] = (
+                activity_age if activity_age is not None else "never"
+            )
+            if service == "discovery" and activity_age is not None:
+                if activity_age > max_age_seconds:
+                    details["reason"] = (
+                        f"discovery inactive ({activity_age}s > {max_age_seconds}s)"
+                    )
                     return False, details
 
     if service in ("watch", "ws", "any"):
