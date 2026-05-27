@@ -35,7 +35,7 @@ FIRING/RESOLVED pairs every hour during normal full scans).
 | 12 | Per-shard WS healthcheck | [~] | quote_age proxy works today |
 | 13 | GHCR auto-login on host | [~] | manual `gh auth token \| docker login` |
 | 14 | Integration tests (postgres fixture e2e) | [~] | 44 unit tests green |
-| 15 | Dashboard per-market SSE push | [~] | table still static after load |
+| 15 | Dashboard per-market SSE push | [x] | Yes/No/Spread tick every 5s via SSE |
 | 16 | Prometheus + Grafana dashboards | [~] | metrics exported, no boards yet |
 
 ---

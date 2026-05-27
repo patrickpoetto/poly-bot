@@ -5,7 +5,8 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
-from poly_bot.catalog.dashboard import _live_snapshot, create_app
+from poly_bot.catalog.dashboard import _live_snapshot, _quotes_payload, create_app
+from poly_bot.catalog.models import ExpiringMarket
 from poly_bot.persistence.db import get_engine, init_db
 
 
@@ -53,6 +54,45 @@ def test_api_reconcile_endpoint_empty_state(settings) -> None:
     body = resp.json()
     assert body["last_at"] is None
     assert body["report"] == {}
+
+
+def test_live_snapshot_includes_quotes_when_requested(settings) -> None:
+    init_db(get_engine(settings))
+    snap = _live_snapshot(settings, hours=6.0, include_quotes=True)
+    assert "quotes" in snap
+    assert isinstance(snap["quotes"], dict)
+
+
+def test_quotes_payload_keys(settings) -> None:
+    from datetime import UTC, datetime
+
+    m = ExpiringMarket(
+        condition_id="0xabc",
+        slug="s",
+        question="q",
+        domain="crypto",
+        structure="binary",
+        recurrence="one_off",
+        end_ts=datetime.now(UTC),
+        hours_left=2.0,
+        event_id=None,
+        event_title=None,
+        series_slug=None,
+        tags=[],
+        yes_label="Yes",
+        no_label="No",
+        yes_mid=0.55,
+        no_mid=0.45,
+        yes_spread=0.02,
+        no_spread=0.02,
+        open_interest=None,
+        volume_24h=None,
+        rewards_eligible=False,
+        quote_updated_at=None,
+        enriched_at=None,
+    )
+    payload = _quotes_payload([m])
+    assert payload["0xabc"] == {"y": 0.55, "n": 0.45, "s": 0.02}
 
 
 def test_api_reconcile_endpoint_after_run(settings) -> None:

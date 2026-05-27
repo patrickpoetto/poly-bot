@@ -196,12 +196,24 @@ def create_app(settings: Settings) -> FastAPI:
         }
 
     @app.get("/api/stream")
-    async def api_stream(hours: float = Query(default=6.0, ge=1, le=168)) -> StreamingResponse:
-        """SSE stream — health snapshot + live indicators every 5s."""
+    async def api_stream(
+        hours: float = Query(default=6.0, ge=1, le=168),
+        domain: str = Query(default=""),
+        q: str = Query(default=""),
+        fees_only: bool = Query(default=False),
+    ) -> StreamingResponse:
+        """SSE stream — health snapshot + live quote ticks every 5s."""
 
         async def event_generator() -> object:
             while True:
-                snapshot = _live_snapshot(settings, hours=hours)
+                snapshot = _live_snapshot(
+                    settings,
+                    hours=hours,
+                    domain=domain,
+                    q=q,
+                    fees_only=fees_only,
+                    include_quotes=True,
+                )
                 yield f"data: {json.dumps(snapshot)}\n\n"
                 await asyncio.sleep(5)
 
@@ -233,10 +245,20 @@ def _load_markets(settings: Settings, *, hours: float) -> list[ExpiringMarket]:
         return list_expiring_markets(session, hours=hours)
 
 
-def _live_snapshot(settings: Settings, *, hours: float) -> dict[str, object]:
-    """Lightweight stats for the SSE/health endpoints — no full table render."""
+def _live_snapshot(
+    settings: Settings,
+    *,
+    hours: float,
+    domain: str = "",
+    q: str = "",
+    fees_only: bool = False,
+    include_quotes: bool = False,
+    quote_limit: int = 500,
+) -> dict[str, object]:
+    """Stats for SSE/health. Optional ``quotes`` map for visible table rows."""
     from poly_bot.persistence.catalog_state import (
         KEY_LAST_DELTA_SCAN_AT,
+        KEY_LAST_DISCOVERY_ACTIVITY_AT,
         KEY_LAST_FULL_SCAN_AT,
         KEY_LAST_RECONCILE_AT,
         CatalogStateStore,
@@ -261,21 +283,23 @@ def _live_snapshot(settings: Settings, *, hours: float) -> dict[str, object]:
 
     with Session(engine) as session:
         expiring = count_expiring_markets(session, hours=hours)
-        markets = _load_markets(settings, hours=hours)
+        markets = list_expiring_markets(session, hours=hours)
         events = group_expiring_by_event(markets)
         fee_in_window = sum(1 for m in markets if m.fees_enabled or m.event_fees_enabled)
         store = CatalogStateStore(session)
         last_full = store.get_datetime(KEY_LAST_FULL_SCAN_AT)
         last_delta = store.get_datetime(KEY_LAST_DELTA_SCAN_AT)
+        last_discovery = store.get_datetime(KEY_LAST_DISCOVERY_ACTIVITY_AT)
         last_reconcile = store.get_datetime(KEY_LAST_RECONCILE_AT)
 
-    return {
+    snapshot: dict[str, object] = {
         "now": now.isoformat(),
         "hours": hours,
         "quote_age_s": _age_s(now, quote_last),
         "quote_last": quote_last.isoformat() if quote_last else None,
         "delta_age_s": _age_s(now, last_delta),
         "full_age_s": _age_s(now, last_full),
+        "discovery_activity_age_s": _age_s(now, last_discovery),
         "reconcile_age_s": _age_s(now, last_reconcile),
         "counts": {
             "markets_active": markets_active,
@@ -285,6 +309,21 @@ def _live_snapshot(settings: Settings, *, hours: float) -> dict[str, object]:
             "fees_in_window": fee_in_window,
         },
     }
+    if include_quotes:
+        visible = _filter_markets(markets, domain=domain, q=q, fees_only=fees_only)[
+            :quote_limit
+        ]
+        snapshot["quotes"] = _quotes_payload(visible)
+    return snapshot
+
+
+def _quotes_payload(markets: list[ExpiringMarket]) -> dict[str, dict[str, float | None]]:
+    """Compact yes/no/spread ticks keyed by condition_id (SSE payload)."""
+    out: dict[str, dict[str, float | None]] = {}
+    for m in markets:
+        spr = m.yes_spread if m.yes_spread is not None else m.no_spread
+        out[m.condition_id] = {"y": m.yes_mid, "n": m.no_mid, "s": spr}
+    return out
 
 
 def _coerce_dt(value: object) -> datetime | None:
@@ -350,6 +389,14 @@ def _render_page(
     if fees_only:
         params["fees_only"] = "true"
     query = urlencode({k: v for k, v in params.items() if v not in ("", False, None)})
+    stream_qs = urlencode(
+        {
+            "hours": str(hours),
+            "domain": domain,
+            "q": q,
+            **({"fees_only": "true"} if fees_only else {}),
+        }
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -474,6 +521,11 @@ tr:hover td {{ background: rgba(61, 139, 253, 0.06); }}
 .fee-no {{ color: var(--muted); }}
 .q {{ max-width: 280px; }}
 .hidden {{ display: none; }}
+td.tick-flash {{ animation: tickFlash 0.45s ease-out; }}
+@keyframes tickFlash {{
+  from {{ background: rgba(61, 214, 140, 0.22); }}
+  to {{ background: transparent; }}
+}}
 footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
 .live-dot {{
   display: inline-block;
@@ -590,6 +642,34 @@ document.getElementById('markets-table')?.addEventListener('click', (e) => {{
   const sUp = document.getElementById('stat-updated');
   if (!dot) return;
   const HOURS = {hours};
+  const STREAM_QS = {json.dumps(stream_qs)};
+  const rowByCid = new Map();
+  document.querySelectorAll('#markets-table tbody tr[data-cid]').forEach((tr) => {{
+    rowByCid.set(tr.dataset.cid, tr);
+  }});
+  function fmtNum(v, decimals) {{
+    if (v === null || v === undefined) return '—';
+    return Number(v).toFixed(decimals);
+  }}
+  function setCell(td, text, flash) {{
+    if (!td || td.textContent === text) return;
+    td.textContent = text;
+    if (flash) {{
+      td.classList.remove('tick-flash');
+      void td.offsetWidth;
+      td.classList.add('tick-flash');
+    }}
+  }}
+  function applyQuotes(quotes) {{
+    if (!quotes) return;
+    for (const [cid, q] of Object.entries(quotes)) {{
+      const row = rowByCid.get(cid);
+      if (!row) continue;
+      setCell(row.querySelector('[data-col="yes"]'), fmtNum(q.y, 3), true);
+      setCell(row.querySelector('[data-col="no"]'), fmtNum(q.n, 3), true);
+      setCell(row.querySelector('[data-col="spr"]'), fmtNum(q.s, 3), true);
+    }}
+  }}
   function fmtAge(seconds) {{
     if (seconds === null || seconds === undefined) return '—';
     if (seconds < 60) return seconds + 's';
@@ -602,8 +682,9 @@ document.getElementById('markets-table')?.addEventListener('click', (e) => {{
     status.textContent = label;
   }}
   function apply(snap) {{
+    applyQuotes(snap.quotes);
     qAge.textContent = fmtAge(snap.quote_age_s);
-    dAge.textContent = fmtAge(snap.delta_age_s);
+    dAge.textContent = fmtAge(snap.discovery_activity_age_s ?? snap.delta_age_s);
     sMk.textContent = snap.counts.expiring_window;
     sEv.textContent = snap.counts.events_window;
     sFe.textContent = snap.counts.fees_in_window;
@@ -618,7 +699,7 @@ document.getElementById('markets-table')?.addEventListener('click', (e) => {{
   let es = null;
   function connect() {{
     setStatus(null, 'connecting…');
-    es = new EventSource('/api/stream?hours=' + HOURS);
+    es = new EventSource('/api/stream?' + STREAM_QS);
     es.onmessage = (e) => {{
       try {{ apply(JSON.parse(e.data)); }} catch (err) {{}}
     }};
@@ -641,14 +722,15 @@ def _market_row(m: ExpiringMarket) -> str:
     fee_lbl = market_fee_label(m)
     fee_cls = "fee-yes" if m.fees_enabled or m.event_fees_enabled else "fee-no"
     spr = m.yes_spread if m.yes_spread is not None else m.no_spread
+    cid = html.escape(m.condition_id, quote=True)
     return (
-        "<tr>"
+        f'<tr data-cid="{cid}">'
         f'<td>{html.escape(m.end_ts.strftime("%m-%d %H:%M"))}</td>'
         f'<td class="num {left_cls}">{m.hours_left:.1f}h</td>'
         f'<td><span class="tag">{html.escape(m.domain)}</span></td>'
-        f'<td class="num">{_num(m.yes_mid, 3)}</td>'
-        f'<td class="num">{_num(m.no_mid, 3)}</td>'
-        f'<td class="num">{_num(spr, 3)}</td>'
+        f'<td class="num" data-col="yes">{_num(m.yes_mid, 3)}</td>'
+        f'<td class="num" data-col="no">{_num(m.no_mid, 3)}</td>'
+        f'<td class="num" data-col="spr">{_num(spr, 3)}</td>'
         f'<td class="num">{_fmt_vol(m.volume_24h)}</td>'
         f'<td class="num">{_fmt_vol(m.open_interest)}</td>'
         f'<td class="{fee_cls}">{html.escape(fee_lbl)}</td>'
