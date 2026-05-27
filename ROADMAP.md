@@ -1,109 +1,122 @@
 # poly-bot — Roadmap to trading
 
-Living document. Tick boxes as work lands. Trading capital should not be
-deployed until the five blockers below are all green.
+Living document. **Trading capital stays off** until every item in
+[Phase 1 — Definition of Done](#phase-1--definition-of-done-infra) is checked.
 
-## Production blockers (do these before trading)
+Legend: `[x]` done · `[ ]` todo · `[~]` deferred (post–Phase 1, not a gate)
 
-### 1. WebSocket sharding — `catalog/ws_daemon.py` ✅
-- [x] Split a single PersistentWSDaemon into N shards, each holding
-      ≤ `catalog_ws_shard_size` (default 500) assets.
-- [x] Each shard owns its own websocket, backoff, and resubscribe loop;
-      shards write to the same `token_quotes` table.
-- [x] Settings: `CATALOG_WS_SHARD_SIZE`, `CATALOG_WS_MAX_SHARDS`.
-- [x] Coordinator rebalances every `CATALOG_WS_REFRESH_SECONDS`.
-- [ ] Healthcheck per shard (currently any-shard-healthy via quote_age).
+---
 
-### 2. Series delta scan — `discovery/` ✅
-- [x] Default refresh interval lowered to 10 min (was 60).
-- [x] On-demand refresh: whenever delta scan brings in events whose
-      `series_id` is not yet in the series table, trigger a series
-      scan with a 30s cool-down.
-- [x] Helper `DiscoveryRunner.count_unknown_event_series()` powers
-      the trigger and is unit tested.
-- [ ] **Follow-up (low priority):** Gamma `/series` appears to cap at
-      ~50 items per query regardless of `limit`. After this fix the
-      orphan trigger fires correctly but still leaves ~600 event
-      `series_id` values without a row in `series`. Investigate
-      alternative params (`closed=`, `slug=`, `id_in=…`) or a
-      `/series/{id}` per-id fetch path.
+## Phase 1 — Definition of Done (infra)
 
-### 3. Alerting (paged ops) ✅
-- [x] Lightweight `alerter` sidecar polls a shared `health_snapshot()`
-      helper (`ops/health.py`) and pushes Telegram messages **only on
-      state transitions** (open / resolved) — no spam while a condition
-      persists.
-- [x] Default rules shipped: `db_down`, `quotes_stale`, `delta_stale`,
-      `reconcile_stale`, `reconcile_regression`.
-- [x] Settings: `ALERTER_ENABLED`, `ALERTER_INTERVAL_SECONDS`,
-      `ALERT_QUOTE_AGE_THRESHOLD`, `ALERT_DELTA_AGE_THRESHOLD`,
-      `ALERT_RECONCILE_AGE_THRESHOLD`, `TELEGRAM_TOKEN`,
-      `TELEGRAM_CHAT_ID`.
-- [x] CLI: `poly-bot ops alerter-loop`, `ops telegram-test`,
-      `ops telegram-chat-id` (onboarding helper).
-- [x] Docker-compose `alerter` service with healthcheck + resource caps.
-- [x] README walkthrough: BotFather → token → `/getUpdates` → chat id.
-- [x] Unit tests cover rule evaluation, transition edge-triggering,
-      and the disabled-by-default safety guard (43 green).
-- [x] Image `poly-bot:0.1.5-dev` deployed; `alerter` container healthy
-      and looping. Safety: exits cleanly when `ALERTER_ENABLED=false`.
-- [x] Bot wired up end-to-end — `telegram-test` delivered, loop logs
-      `alerter_started` with all 5 rules loaded.
-- [ ] **Follow-up (low priority):** force `quote_age` over threshold in
-      a staging cycle and confirm a FIRING/RESOLVED pair land in Telegram.
-      Not blocking — the rule engine is unit-tested and the transport is
-      verified live.
+Everything needed before writing the trading engine.
 
-### 4. Scheduled reconcile service ✅
-- [x] New `poly-bot ops reconcile-loop` command + `reconcile` sidecar
-      in docker-compose, interval via `RECONCILE_INTERVAL_SECONDS`.
-- [x] Each run persists `last_reconcile_at` + the JSON report to
-      `catalog_state`; exposed via `/api/reconcile`.
-- [x] Prometheus gauges `polybot_reconcile_issues{metric=...}` and
-      counter `polybot_reconcile_runs_total{outcome=...}`.
-- [x] Unit tests assert state and counts after one run.
+### Must ship (gates trading)
 
-### 5. Runbook (`docs/RUNBOOK.md`)
-- [ ] Symptoms → diagnosis → fix for each known incident class:
-  - catalog-watch stuck (deadlock or hung await)
-  - postgres disk pressure
-  - GHCR pull 401
-  - WS reconnect storm
-  - backup volume full
-  - migration failure
-- [ ] One-line restore-from-backup procedure.
+| # | Item | Status | Notes |
+|---|------|--------|-------|
+| 1 | Postgres + Alembic + Docker split stack | [x] | discovery, catalog-watch, ws-daemon, dashboard, backup, reconcile, alerter |
+| 2 | WS sharding (persistent quotes) | [x] | 7 shards @ 500 tokens |
+| 3 | Discovery delta + series on-demand | [x] | 60s delta; series refresh on orphans |
+| 4 | Reconcile sidecar + dashboard SSE | [x] | `/api/reconcile`, live dot |
+| 5 | Telegram alerter (edge-triggered) | [x] | live since 2026-05-27 |
+| 6 | **Fix `delta_stale` false positives** | [ ] | full scan ~12–14 min but threshold 600s → see below |
+| 7 | **Runbook** `docs/RUNBOOK.md` | [ ] | only remaining blocker |
+| 8 | **Discovery full-scan deadlocks** | [ ] | `PendingRollbackError` on `events` during full scan — real, seen in logs |
+| 9 | Pin + roll `0.1.5` image on all services | [ ] | stack still mixed `0.1.4-dev` / digest on some containers |
+| 10 | 24h soak: no spurious Telegram pages | [ ] | after #6–#8 |
 
-## Polish (parallelizable, not blockers)
+### Should ship (quality, not hard gates)
+
+| # | Item | Status |
+|---|------|--------|
+| 11 | Series orphan gap (~600 missing rows) | [~] | Gamma `/series` caps ~50/page |
+| 12 | Per-shard WS healthcheck | [~] | quote_age proxy works today |
+| 13 | GHCR auto-login on host | [~] | manual `gh auth token \| docker login` |
+| 14 | Integration tests (postgres fixture e2e) | [~] | 43 unit tests green |
+| 15 | Dashboard per-market SSE push | [~] | table still static after load |
+| 16 | Prometheus + Grafana dashboards | [~] | metrics exported, no boards yet |
+
+---
+
+## Known issue: `delta_stale` Telegram noise
+
+**What you see:** FIRING at `delta_age_s=606/643`, RESOLVED at `18/33/45` — always
+the same rule, every ~1–2 h.
+
+**Root cause (confirmed in logs):**
+
+1. `last_delta_scan_at` is updated only when a discovery **cycle finishes**.
+2. A **full** catalog scan takes **~12–14 minutes** (113k markets + link).
+3. Full scans run every **10 minutes** (`DISCOVERY_FULL_SCAN_INTERVAL_MINUTES=10`).
+4. Alert threshold is **600 s** → during almost every full scan, age crosses 600
+   before the cycle completes → FIRING → scan ends → RESOLVED.
+
+So the pipeline is working; the **metric name is misleading** during full scans.
+Occasionally a failed full scan (deadlock on `events`) stretches the gap further.
+
+**Fix options (pick one for #6):**
+
+- **A (recommended):** Alerter uses `discovery_fresh = min(delta_age, full_age)` —
+  page only when **both** are stale (discovery truly stuck).
+- **B:** Heartbeat — set `last_delta_scan_at` at **start** of full scan too.
+- **C:** Raise `ALERT_DELTA_AGE_THRESHOLD` to 1800+ (band-aid).
+- **D:** Full scan every 60–120 min; delta stays 60s (architectural best).
+
+---
+
+## Phase 2 — Trading engine (after Phase 1)
+
+Not started. Rough order once infra gate is green:
+
+1. Wallet + CLOB L2 auth (signing, nonces, idempotency)
+2. Order model + risk limits (max notional, max open orders, kill switch)
+3. Strategy interface (signals in → orders out; paper mode first)
+4. Position / PnL tracking + reconciliation vs CLOB
+5. Execution telemetry + alerts (`order_rejected`, `fill_lag`, `drawdown`)
+6. Paper trading soak → small live capital
+
+---
+
+## Completed work (archive)
+
+<details>
+<summary>Blockers 1–5 + polish A (click to expand)</summary>
+
+### 1. WebSocket sharding ✅
+- [x] N shards ≤ `catalog_ws_shard_size`, coordinator rebalance
+- [~] Per-shard healthcheck
+
+### 2. Series delta scan ✅
+- [x] 10 min interval + on-demand orphan refresh (30s cooldown)
+- [~] Gamma `/series` pagination cap (~600 orphans remain)
+
+### 3. Alerting ✅
+- [x] `alerter` sidecar, 5 rules, Telegram onboarding, 7 unit tests
+- [ ] Fix false-positive `delta_stale` (tracked as gate #6 above)
+
+### 4. Scheduled reconcile ✅
+- [x] `reconcile-loop` sidecar, `catalog_state` report, Prometheus, `/api/reconcile`
+
+### 5. Runbook — in progress (gate #7)
 
 ### A. Dashboard SSE live ✅
-- [x] `<meta http-equiv="refresh">` gone — page renders once.
-- [x] Vanilla JS `EventSource` consumer with auto-reconnect.
-- [x] Live indicator dot (green pulse / amber lag / red stale).
-- [x] Stats counters and quote/delta age tick every 5s via
-      `/api/stream`, fed by new `_live_snapshot` helper.
-- [x] New `/api/health` + `/api/reconcile` JSON endpoints reuse
-      the same snapshot.
-- [ ] Per-condition push of new markets entering the window
-      (table is still server-rendered on initial load).
+- [x] EventSource, live dot, `/api/health`, `/api/reconcile`
+- [~] Per-condition table push
 
-### B. GHCR auto-login on the host
-- [ ] Today we run `gh auth token | docker login ghcr.io` by hand.
-- [ ] Either make the package public or write a small launchd /
-      systemd unit that refreshes the login.
+</details>
 
-### C. Integration tests
-- [ ] Today only unit tests in `tests/` (43 green).
-- [ ] Add end-to-end: spin postgres in a fixture, run a full
-      discovery → watch → enrich cycle against recorded Gamma payloads.
+---
 
 ## Status quick reference
 
 | Area | State | Notes |
 |---|---|---|
-| Catalog static (Gamma + DB) | 95% | Postgres + Alembic shipped |
-| Taxonomy + classification | 80% | overrides UI live, batch reclassify |
-| Live slice (6h window, quotes, OI) | 95% | WS sharded across 7 sockets |
-| Living DB production | 95% | Docker split + healthchecks + backup + reconcile |
-| Dashboard | 90% | SSE live indicator + JSON endpoints |
-| Alerting | 100% | edge-triggered Telegram via `alerter` sidecar, live |
-| Trading | 0% | gated on blocker 5 (runbook) |
+| Catalog static (Gamma + DB) | 95% | Postgres + Alembic |
+| Taxonomy + classification | 80% | overrides UI; ~600 series orphans |
+| Live slice (6h, quotes, OI) | 95% | WS sharded |
+| Living DB production | 95% | Docker + backup + reconcile |
+| Dashboard | 90% | SSE live |
+| Alerting | 85% | transport OK; metric tuning pending (#6) |
+| Ops / runbook | 20% | gate #7 |
+| **Trading** | **0%** | **gated on Phase 1 table above** |
