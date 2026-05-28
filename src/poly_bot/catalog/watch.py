@@ -43,7 +43,11 @@ class CatalogWatch:
                 self._settings.catalog_ws_enabled
                 and not self._settings.catalog_ws_persistent
             ):
-                cids = expiring_condition_ids(session, hours=horizon)
+                cids = expiring_condition_ids(
+                    session,
+                    hours=horizon,
+                    sports_in_play_hours=self._settings.catalog_sports_in_play_hours,
+                )
                 tids = token_ids_for_conditions(session, cids)
                 ws = LiveQuoteStream(self._settings, session)
                 ws_seconds = min(
@@ -80,4 +84,8 @@ class CatalogWatch:
         from poly_bot.catalog.expiring import count_expiring_markets
 
         with Session(self._engine) as session:
-            return count_expiring_markets(session, hours=hours)
+            return count_expiring_markets(
+                session,
+                hours=hours,
+                sports_in_play_hours=self._settings.catalog_sports_in_play_hours,
+            )

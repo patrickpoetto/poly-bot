@@ -37,7 +37,11 @@ class CatalogEnricher:
         force: bool = False,
     ) -> dict[str, int]:
         horizon = hours if hours is not None else self._settings.catalog_expiring_hours
-        all_conditions = expiring_condition_ids(self._session, hours=horizon)
+        all_conditions = expiring_condition_ids(
+            self._session,
+            hours=horizon,
+            sports_in_play_hours=self._settings.catalog_sports_in_play_hours,
+        )
         if not all_conditions:
             logger.info("enrich_expiring_empty", hours=horizon)
             return {

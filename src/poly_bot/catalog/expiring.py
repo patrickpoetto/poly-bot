@@ -20,16 +20,23 @@ def _dialect_name(session: Session) -> str:
     return bind.dialect.name
 
 
-def list_expiring_markets(session: Session, *, hours: float) -> list[ExpiringMarket]:
-    """Markets with effective end time in (now, now + hours]."""
+def list_expiring_markets(
+    session: Session,
+    *,
+    hours: float,
+    sports_in_play_hours: float = 4.0,
+) -> list[ExpiringMarket]:
+    """Markets in catalog window: pre-match by end_ts, sports also in-play after kickoff."""
     now = datetime.now(UTC)
     until = now + timedelta(hours=hours)
+    in_play_since = now - timedelta(hours=sports_in_play_hours)
     dialect = _dialect_name(session)
     active = sql_dialect.active_market_filter(dialect)
-    window = sql_dialect.end_ts_in_window(dialect)
-    order_by = sql_dialect.order_by_end_ts(dialect)
+    window = sql_dialect.catalog_window_filter(dialect)
+    kickoff_expr = "COALESCE(m.game_start_ts, e.game_start_ts, m.end_ts, e.end_ts)"
+    order_by = sql_dialect.order_by_end_ts(dialect, end_expr=kickoff_expr)
     quote_ts = sql_dialect.quote_updated_at(dialect)
-    params = sql_dialect.window_params(dialect, now, until)
+    params = sql_dialect.window_params(dialect, now, until, in_play_since=in_play_since)
 
     rows = session.execute(
         text(
@@ -42,6 +49,7 @@ def list_expiring_markets(session: Session, *, hours: float) -> list[ExpiringMar
                 m.structure,
                 m.recurrence,
                 COALESCE(m.end_ts, e.end_ts) AS end_ts,
+                {kickoff_expr} AS kickoff_ts,
                 m.event_id,
                 e.title AS event_title,
                 s.slug AS series_slug,
@@ -85,54 +93,68 @@ def list_expiring_markets(session: Session, *, hours: float) -> list[ExpiringMar
     result: list[ExpiringMarket] = []
     for row in rows:
         end_ts = _parse_dt(row[6])
-        if end_ts is None:
+        kickoff_ts = _parse_dt(row[7])
+        if end_ts is None and kickoff_ts is None:
             continue
-        hours_left = (end_ts - now).total_seconds() / 3600.0
+        domain = str(row[3] or "unknown")
+        reference = kickoff_ts if domain == "sports" and kickoff_ts else end_ts
+        if reference is None:
+            continue
+        hours_left = (reference - now).total_seconds() / 3600.0
+        is_live = domain == "sports" and kickoff_ts is not None and kickoff_ts <= now
         cid = str(row[0])
         result.append(
             ExpiringMarket(
                 condition_id=cid,
                 slug=str(row[1] or ""),
                 question=str(row[2] or ""),
-                domain=str(row[3] or "unknown"),
+                domain=domain,
                 structure=str(row[4] or "unknown"),
                 recurrence=str(row[5] or "one_off"),
-                end_ts=end_ts,
+                end_ts=end_ts or kickoff_ts,
+                game_start_ts=kickoff_ts,
+                is_live=is_live,
                 hours_left=round(hours_left, 2),
-                event_id=str(row[7]) if row[7] else None,
-                event_title=str(row[8]) if row[8] else None,
-                series_slug=str(row[9]) if row[9] else None,
+                event_id=str(row[8]) if row[8] else None,
+                event_title=str(row[9]) if row[9] else None,
+                series_slug=str(row[10]) if row[10] else None,
                 tags=tags_by_market.get(cid, []),
-                yes_label=str(row[11] or "Yes"),
-                no_label=str(row[12] or "No"),
-                yes_mid=_float_or_none(row[13]),
-                no_mid=_float_or_none(row[14]),
-                yes_spread=_float_or_none(row[15]),
-                no_spread=_float_or_none(row[16]),
-                open_interest=_float_or_none(row[17]),
-                volume_24h=_float_or_none(row[18]),
-                fees_enabled=bool(row[19]),
-                fee_type=str(row[20]) if row[20] else None,
-                fee_schedule=_parse_json_dict(row[21]),
-                maker_base_fee=_int_or_none(row[22]),
-                taker_base_fee=_int_or_none(row[23]),
-                event_fees_enabled=bool(row[24]),
-                event_taker_base_fee=_int_or_none(row[27]),
-                rewards_eligible=bool(row[10]),
-                quote_updated_at=_parse_dt(row[28]),
-                enriched_at=_parse_dt(row[29]),
+                yes_label=str(row[12] or "Yes"),
+                no_label=str(row[13] or "No"),
+                yes_mid=_float_or_none(row[14]),
+                no_mid=_float_or_none(row[15]),
+                yes_spread=_float_or_none(row[16]),
+                no_spread=_float_or_none(row[17]),
+                open_interest=_float_or_none(row[18]),
+                volume_24h=_float_or_none(row[19]),
+                fees_enabled=bool(row[20]),
+                fee_type=str(row[21]) if row[21] else None,
+                fee_schedule=_parse_json_dict(row[22]),
+                maker_base_fee=_int_or_none(row[23]),
+                taker_base_fee=_int_or_none(row[24]),
+                event_fees_enabled=bool(row[25]),
+                event_taker_base_fee=_int_or_none(row[28]),
+                rewards_eligible=bool(row[11]),
+                quote_updated_at=_parse_dt(row[29]),
+                enriched_at=_parse_dt(row[30]),
             )
         )
     return result
 
 
-def count_expiring_markets(session: Session, *, hours: float) -> int:
+def count_expiring_markets(
+    session: Session,
+    *,
+    hours: float,
+    sports_in_play_hours: float = 4.0,
+) -> int:
     now = datetime.now(UTC)
     until = now + timedelta(hours=hours)
+    in_play_since = now - timedelta(hours=sports_in_play_hours)
     dialect = _dialect_name(session)
     active = sql_dialect.active_market_filter(dialect)
-    window = sql_dialect.end_ts_in_window(dialect)
-    params = sql_dialect.window_params(dialect, now, until)
+    window = sql_dialect.catalog_window_filter(dialect)
+    params = sql_dialect.window_params(dialect, now, until, in_play_since=in_play_since)
     row = session.execute(
         text(
             f"""
@@ -146,13 +168,19 @@ def count_expiring_markets(session: Session, *, hours: float) -> int:
     return int(row[0])
 
 
-def expiring_condition_ids(session: Session, *, hours: float) -> list[str]:
+def expiring_condition_ids(
+    session: Session,
+    *,
+    hours: float,
+    sports_in_play_hours: float = 4.0,
+) -> list[str]:
     now = datetime.now(UTC)
     until = now + timedelta(hours=hours)
+    in_play_since = now - timedelta(hours=sports_in_play_hours)
     dialect = _dialect_name(session)
     active = sql_dialect.active_market_filter(dialect)
-    window = sql_dialect.end_ts_in_window(dialect)
-    params = sql_dialect.window_params(dialect, now, until)
+    window = sql_dialect.catalog_window_filter(dialect)
+    params = sql_dialect.window_params(dialect, now, until, in_play_since=in_play_since)
     rows = session.execute(
         text(
             f"""

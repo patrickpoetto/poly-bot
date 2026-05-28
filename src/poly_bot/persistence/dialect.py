@@ -15,6 +15,39 @@ def active_market_filter(dialect_name: str) -> str:
     return "m.active IS TRUE AND m.closed IS FALSE"
 
 
+def catalog_window_filter(
+    dialect_name: str,
+    *,
+    end_expr: str = "COALESCE(m.end_ts, e.end_ts)",
+    kickoff_expr: str = "COALESCE(m.game_start_ts, e.game_start_ts, m.end_ts, e.end_ts)",
+) -> str:
+    """Markets in the live catalog window (pre-match end_ts OR sports in-play)."""
+    standard = end_ts_in_window(dialect_name, end_expr=end_expr)
+    if is_sqlite(dialect_name):
+        sports_pre = (
+            f"m.domain = 'sports' AND {kickoff_expr} IS NOT NULL "
+            f"AND datetime({kickoff_expr}) > datetime(:now) "
+            f"AND datetime({kickoff_expr}) <= datetime(:until)"
+        )
+        sports_live = (
+            "m.domain = 'sports' AND m.active = 1 AND m.closed = 0 "
+            f"AND {kickoff_expr} IS NOT NULL "
+            f"AND datetime({kickoff_expr}) <= datetime(:now) "
+            f"AND datetime({kickoff_expr}) > datetime(:in_play_since)"
+        )
+    else:
+        sports_pre = (
+            f"m.domain = 'sports' AND {kickoff_expr} IS NOT NULL "
+            f"AND {kickoff_expr} > :now AND {kickoff_expr} <= :until"
+        )
+        sports_live = (
+            "m.domain = 'sports' AND m.active IS TRUE AND m.closed IS FALSE "
+            f"AND {kickoff_expr} IS NOT NULL "
+            f"AND {kickoff_expr} <= :now AND {kickoff_expr} > :in_play_since"
+        )
+    return f"(({standard}) OR ({sports_pre}) OR ({sports_live}))"
+
+
 def end_ts_in_window(dialect_name: str, *, end_expr: str = "COALESCE(m.end_ts, e.end_ts)") -> str:
     if is_sqlite(dialect_name):
         return (
@@ -53,11 +86,23 @@ def order_by_end_ts(dialect_name: str, *, end_expr: str = "COALESCE(m.end_ts, e.
     return f"{end_expr} ASC"
 
 
-def window_params(dialect_name: str, now: datetime, until: datetime) -> dict[str, object]:
+def window_params(
+    dialect_name: str,
+    now: datetime,
+    until: datetime,
+    *,
+    in_play_since: datetime | None = None,
+) -> dict[str, object]:
+    if in_play_since is None:
+        in_play_since = now
     if is_sqlite(dialect_name):
         fmt = "%Y-%m-%d %H:%M:%S"
-        return {"now": now.strftime(fmt), "until": until.strftime(fmt)}
-    return {"now": now, "until": until}
+        return {
+            "now": now.strftime(fmt),
+            "until": until.strftime(fmt),
+            "in_play_since": in_play_since.strftime(fmt),
+        }
+    return {"now": now, "until": until, "in_play_since": in_play_since}
 
 
 def cutoff_param(dialect_name: str, now: datetime, stale_seconds: float) -> dict[str, object]:

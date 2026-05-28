@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -147,6 +148,15 @@ class DiscoveryScheduler:
             )
             session.commit()
 
+    async def _heartbeat_loop(self) -> None:
+        """Touch activity every 60s so long full scans do not trip discovery_stale."""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                self._touch_discovery_heartbeat()
+            except Exception:
+                logger.exception("discovery_heartbeat_failed")
+
     async def run_forever(self) -> None:
         interval = self._settings.discovery_delta_scan_interval_seconds
         logger.info(
@@ -155,10 +165,16 @@ class DiscoveryScheduler:
             full_minutes=self._settings.discovery_full_scan_interval_minutes,
             series_refresh_minutes=self._settings.discovery_series_refresh_interval_minutes,
         )
-        while True:
-            try:
-                stats = await self.run_cycle()
-                logger.info("discovery_scheduler_cycle", **stats)
-            except Exception:
-                logger.exception("discovery_scheduler_cycle_failed")
-            await asyncio.sleep(interval)
+        heartbeat = asyncio.create_task(self._heartbeat_loop())
+        try:
+            while True:
+                try:
+                    stats = await self.run_cycle()
+                    logger.info("discovery_scheduler_cycle", **stats)
+                except Exception:
+                    logger.exception("discovery_scheduler_cycle_failed")
+                await asyncio.sleep(interval)
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat

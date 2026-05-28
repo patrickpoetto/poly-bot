@@ -90,6 +90,8 @@ def _migrate_schema(engine: Engine) -> None:
             ("events", "fee_schedule", "TEXT"),
             ("market_enrichment", "maker_base_fee", "INTEGER"),
             ("market_enrichment", "taker_base_fee", "INTEGER"),
+            ("markets", "game_start_ts", "TEXT"),
+            ("events", "game_start_ts", "TEXT"),
         ):
             _add_column_if_missing(conn, table, col, typedef)
         SQLModel.metadata.create_all(conn)

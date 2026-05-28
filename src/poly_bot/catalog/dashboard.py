@@ -232,7 +232,11 @@ def _update_gauges(settings: Settings, *, hours: float) -> None:
     runner = DiscoveryRunner(settings)
     stats = runner.stats()
     with Session(get_engine(settings)) as session:
-        expiring = count_expiring_markets(session, hours=hours)
+        expiring = count_expiring_markets(
+            session,
+            hours=hours,
+            sports_in_play_hours=settings.catalog_sports_in_play_hours,
+        )
     set_catalog_gauges(
         active_markets=stats["active_markets"],
         markets_with_fees=stats["markets_with_fees"],
@@ -242,7 +246,11 @@ def _update_gauges(settings: Settings, *, hours: float) -> None:
 
 def _load_markets(settings: Settings, *, hours: float) -> list[ExpiringMarket]:
     with Session(get_engine(settings)) as session:
-        return list_expiring_markets(session, hours=hours)
+        return list_expiring_markets(
+            session,
+            hours=hours,
+            sports_in_play_hours=settings.catalog_sports_in_play_hours,
+        )
 
 
 def _live_snapshot(
@@ -282,8 +290,13 @@ def _live_snapshot(
     quote_last = _coerce_dt(quote_row[0] if quote_row else None)
 
     with Session(engine) as session:
-        expiring = count_expiring_markets(session, hours=hours)
-        markets = list_expiring_markets(session, hours=hours)
+        in_play = settings.catalog_sports_in_play_hours
+        expiring = count_expiring_markets(
+            session, hours=hours, sports_in_play_hours=in_play
+        )
+        markets = list_expiring_markets(
+            session, hours=hours, sports_in_play_hours=in_play
+        )
         events = group_expiring_by_event(markets)
         fee_in_window = sum(1 for m in markets if m.fees_enabled or m.event_fees_enabled)
         store = CatalogStateStore(session)
@@ -588,7 +601,7 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
     <div class="table-wrap">
       <table id="markets-table">
         <thead><tr>
-          <th>Ends (UTC)</th><th>Left</th><th>Domain</th>
+          <th>Kickoff (UTC)</th><th>Status</th><th>Domain</th>
           <th class="num">Yes</th><th class="num">No</th><th class="num">Spr</th>
           <th class="num">Vol 24h</th><th class="num">OI</th><th>Fee @ mid</th>
           <th>Question</th>
@@ -717,16 +730,27 @@ document.getElementById('markets-table')?.addEventListener('click', (e) => {{
 
 
 def _market_row(m: ExpiringMarket) -> str:
-    left_cls = "urgent" if m.hours_left < 1 else ("soon" if m.hours_left < 3 else "")
+    left_cls = "urgent" if m.hours_left < 1 and not m.is_live else ""
+    if m.is_live:
+        left_cls = "soon"
+    elif m.hours_left < 3:
+        left_cls = "soon"
     mid = m.yes_mid if m.yes_mid is not None else m.no_mid
     fee_lbl = market_fee_label(m)
     fee_cls = "fee-yes" if m.fees_enabled or m.event_fees_enabled else "fee-no"
     spr = m.yes_spread if m.yes_spread is not None else m.no_spread
+    kickoff = m.game_start_ts or m.end_ts
+    if m.is_live:
+        status = f'<span class="tag" style="color:var(--green)">LIVE</span> {abs(m.hours_left):.1f}h'
+    elif m.hours_left < 1:
+        status = f'<span class="urgent">{m.hours_left:.1f}h</span>'
+    else:
+        status = f"{m.hours_left:.1f}h"
     cid = html.escape(m.condition_id, quote=True)
     return (
         f'<tr data-cid="{cid}">'
-        f'<td>{html.escape(m.end_ts.strftime("%m-%d %H:%M"))}</td>'
-        f'<td class="num {left_cls}">{m.hours_left:.1f}h</td>'
+        f'<td>{html.escape(kickoff.strftime("%m-%d %H:%M"))}</td>'
+        f'<td class="num {left_cls}">{status}</td>'
         f'<td><span class="tag">{html.escape(m.domain)}</span></td>'
         f'<td class="num" data-col="yes">{_num(m.yes_mid, 3)}</td>'
         f'<td class="num" data-col="no">{_num(m.no_mid, 3)}</td>'

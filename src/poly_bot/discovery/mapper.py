@@ -31,6 +31,18 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def _parse_game_start_ts(raw: dict[str, Any], *, end_ts: datetime | None) -> datetime | None:
+    """Gamma sports: ``gameStartTime`` is kickoff; ``endDate`` often matches it."""
+    kickoff = _parse_iso_datetime(
+        raw.get("gameStartTime")
+        or raw.get("game_start_time")
+        or raw.get("gameStart")
+    )
+    if kickoff is not None:
+        return kickoff
+    return end_ts
+
+
 def gamma_market_to_entities(
     raw: dict[str, Any],
     *,
@@ -53,6 +65,11 @@ def gamma_market_to_entities(
         volume_24h=fee.get("volume_24h"),
         liquidity_usd=fee.get("liquidity_usd"),
         overrides=overrides,
+    )
+    game_start_ts = (
+        _parse_game_start_ts(raw, end_ts=end_ts)
+        if classification["domain"] == "sports"
+        else None
     )
 
     event_id = _extract_event_id(raw)
@@ -79,6 +96,7 @@ def gamma_market_to_entities(
         enable_order_book=bool(raw.get("enableOrderBook", raw.get("enable_order_book", True))),
         start_ts=start_ts,
         end_ts=end_ts,
+        game_start_ts=game_start_ts,
         tick_size=fee.get("tick_size"),
         min_order_size=fee.get("min_order_size"),
         rewards_eligible=bool(fee.get("rewards_eligible")),
@@ -202,17 +220,20 @@ def gamma_event_to_entity(raw: dict[str, Any]) -> Event | None:
         or ""
     )
 
+    ev_start = _parse_iso_datetime(
+        raw.get("startDate") or raw.get("start_date") or raw.get("startTime")
+    )
+    ev_end = _parse_iso_datetime(
+        raw.get("endDate") or raw.get("end_date") or raw.get("endTime")
+    )
     return Event(
         id=event_id,
         slug=str(raw.get("slug") or ""),
         title=str(title),
         series_id=_extract_series_id(raw),
-        start_ts=_parse_iso_datetime(
-            raw.get("startDate") or raw.get("start_date") or raw.get("startTime")
-        ),
-        end_ts=_parse_iso_datetime(
-            raw.get("endDate") or raw.get("end_date") or raw.get("endTime")
-        ),
+        start_ts=ev_start,
+        end_ts=ev_end,
+        game_start_ts=_parse_game_start_ts(raw, end_ts=ev_end),
         active=bool(raw.get("active", True)),
         closed=bool(raw.get("closed", False)),
         tags_json=_extract_tag_slugs(raw),

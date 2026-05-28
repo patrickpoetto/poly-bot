@@ -19,6 +19,7 @@ class Event(SQLModel, table=True):
     series_id: str | None = Field(default=None, index=True)
     start_ts: datetime | None = None
     end_ts: datetime | None = None
+    game_start_ts: datetime | None = Field(default=None, description="Sports kickoff (Gamma gameStartTime)")
     active: bool = Field(default=True, index=True)
     closed: bool = Field(default=False, index=True)
     tags_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
@@ -54,6 +55,7 @@ class Market(SQLModel, table=True):
     __table_args__ = (
         Index("ix_markets_active_closed", "active", "closed"),
         Index("ix_markets_end_ts", "end_ts"),
+        Index("ix_markets_game_start_ts", "game_start_ts"),
     )
 
     condition_id: str = Field(primary_key=True, description="CLOB condition id")
@@ -80,6 +82,10 @@ class Market(SQLModel, table=True):
     enable_order_book: bool = Field(default=True)
     start_ts: datetime | None = None
     end_ts: datetime | None = None
+    game_start_ts: datetime | None = Field(
+        default=None,
+        description="Scheduled game start; for sports in-play window",
+    )
 
     # CLOB trading params + fees (from Gamma discovery; CLOB backfill if missing)
     tick_size: str | None = None

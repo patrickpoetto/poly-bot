@@ -17,6 +17,8 @@ class ExpiringMarket(BaseModel):
     structure: str
     recurrence: str
     end_ts: datetime
+    game_start_ts: datetime | None = None
+    is_live: bool = False
     hours_left: float
     event_id: str | None
     event_title: str | None

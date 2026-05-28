@@ -85,6 +85,12 @@ class Settings(BaseSettings):
         gt=0,
         le=168,
     )
+    catalog_sports_in_play_hours: float = Field(
+        default=4.0,
+        validation_alias="CATALOG_SPORTS_IN_PLAY_HOURS",
+        ge=0.5,
+        le=48,
+    )
     catalog_enrich_interval_seconds: float = Field(
         default=60.0,
         validation_alias="CATALOG_ENRICH_INTERVAL_SECONDS",
