@@ -19,7 +19,7 @@ from poly_bot.weather.aviation_parse import (
     taf_tx_temp_unit,
 )
 from poly_bot.weather.forecast_schema import WeatherMetarObservation
-from poly_bot.weather.market_window import market_day_window_utc
+from poly_bot.weather.market_window import market_day_window_utc, weather_horizon_bounds, weather_reference_date
 from poly_bot.weather.parse import parse_resolution_unit
 from poly_bot.weather.repo import WeatherRepository
 from poly_bot.weather.forecast_engine import (
@@ -43,8 +43,10 @@ class WeatherAviationSync:
         self._client = AviationWeatherClient(base_url=settings.weather_aviation_api_base)
 
     def sync(self) -> dict[str, int]:
-        ref = date.today()
-        max_date = ref + timedelta(days=self._settings.weather_forecast_horizon_days)
+        ref = weather_reference_date()
+        max_date = weather_horizon_bounds(
+            horizon_days=self._settings.weather_forecast_horizon_days
+        )[1]
         pilot_ids = set(self._settings.weather_pilot_station_ids)
 
         stats = {

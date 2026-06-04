@@ -12,6 +12,7 @@ from sqlmodel import Session, col, select
 from poly_bot.settings import Settings
 from poly_bot.weather.repo import WeatherRepository
 from poly_bot.weather.schema import WeatherDailyEvent, WeatherStation, WeatherStationWuSnapshot
+from poly_bot.weather.market_window import weather_horizon_bounds, weather_reference_date
 from poly_bot.weather.wu_client import _WU_HTTP_HEADERS, fetch_station_reading, resolve_wu_api_key
 
 log = structlog.get_logger(__name__)
@@ -22,8 +23,10 @@ class WeatherStationSnapshotSync:
         self._settings = settings
 
     def sync_horizon(self, session: Session) -> dict[str, int]:
-        ref = date.today()
-        max_d = ref + timedelta(days=self._settings.weather_forecast_horizon_days)
+        ref = weather_reference_date()
+        _min_d, max_d = weather_horizon_bounds(
+            horizon_days=self._settings.weather_forecast_horizon_days
+        )
         pairs = session.exec(
             select(WeatherDailyEvent.station_id, WeatherDailyEvent.forecast_date)
             .where(WeatherDailyEvent.forecast_date >= ref)

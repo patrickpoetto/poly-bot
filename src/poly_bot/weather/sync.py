@@ -15,6 +15,7 @@ from poly_bot.persistence.db import get_engine
 from poly_bot.persistence.schema import Token
 from poly_bot.settings import Settings
 from poly_bot.weather.coordinates import lookup_coordinates
+from poly_bot.weather.market_window import weather_reference_date
 from poly_bot.weather.parse import (
     city_key_to_display,
     is_daily_temperature_event_slug,
@@ -50,7 +51,7 @@ class WeatherCatalogSync:
         self._engine = get_engine(settings)
 
     def sync(self, *, reference_date: date | None = None) -> dict[str, int]:
-        ref = reference_date or datetime.now(UTC).date()
+        ref = reference_date or weather_reference_date()
         horizon = self._settings.weather_forecast_horizon_days
         min_date = ref
         max_date = ref + timedelta(days=horizon)

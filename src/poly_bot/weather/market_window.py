@@ -45,9 +45,29 @@ def forecast_window_meta(
     }
 
 
+def weather_reference_date() -> date:
+    """UTC calendar day for horizon, pills, and days-ahead labels."""
+    return datetime.now(UTC).date()
+
+
+def weather_horizon_bounds(*, horizon_days: int) -> tuple[date, date]:
+    ref = weather_reference_date()
+    return ref, ref + timedelta(days=horizon_days)
+
+
+def iter_horizon_dates(*, horizon_days: int) -> list[date]:
+    min_d, max_d = weather_horizon_bounds(horizon_days=horizon_days)
+    days: list[date] = []
+    d = min_d
+    while d <= max_d:
+        days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
 def days_ahead_of_today(forecast_date: date, *, ref: date | None = None) -> int:
-    """Calendar days from ref (default: local today) to the market forecast day."""
-    ref = ref or date.today()
+    """Calendar days from ref (default: UTC today) to the market forecast day."""
+    ref = ref or weather_reference_date()
     return (forecast_date - ref).days
 
 

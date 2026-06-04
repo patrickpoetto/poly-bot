@@ -23,7 +23,13 @@ def test_country_flag_emoji() -> None:
     assert country_flag_emoji("") == ""
 
 
-def test_days_ahead_oggi() -> None:
+def test_weather_horizon_dates() -> None:
+    from poly_bot.weather.market_window import iter_horizon_dates, weather_reference_date
+
+    ref = weather_reference_date()
+    days = iter_horizon_dates(horizon_days=3)
+    assert days[0] == ref
+    assert len(days) == 4
     ref = date(2026, 6, 4)
     assert days_ahead_of_today(date(2026, 6, 4), ref=ref) == 0
     assert format_days_ahead_label(date(2026, 6, 4), ref=ref) == "oggi"

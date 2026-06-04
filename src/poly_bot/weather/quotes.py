@@ -9,12 +9,12 @@ from sqlmodel import Session, col, select
 from poly_bot.exchange.clob_public import ClobPublicClient
 from poly_bot.persistence.schema import Token, TokenQuote
 from poly_bot.settings import Settings
+from poly_bot.weather.market_window import weather_horizon_bounds
 from poly_bot.weather.schema import WeatherBin, WeatherDailyEvent
 
 
 def weather_forecast_date_range(settings: Settings) -> tuple[date, date]:
-    ref = date.today()
-    return ref, ref + timedelta(days=settings.weather_forecast_horizon_days)
+    return weather_horizon_bounds(horizon_days=settings.weather_forecast_horizon_days)
 
 
 def weather_condition_ids(

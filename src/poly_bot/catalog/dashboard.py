@@ -121,6 +121,7 @@ def create_app(settings: Settings) -> FastAPI:
         from datetime import date
 
         from poly_bot.weather.dashboard_views import (
+            default_forecast_day,
             load_city_rows,
             load_day_summaries,
             render_weather_page,
@@ -139,7 +140,8 @@ def create_app(settings: Settings) -> FastAPI:
             if day:
                 selected = date.fromisoformat(day)
             elif summaries:
-                selected = summaries[0].forecast_date
+                picked = default_forecast_day(summaries)
+                selected = picked if picked is not None else min_d
             else:
                 selected = min_d
             rows = load_city_rows(session, forecast_date=selected, city_q=city)
@@ -167,6 +169,7 @@ def create_app(settings: Settings) -> FastAPI:
         from datetime import date
 
         from poly_bot.weather.dashboard_views import (
+            default_forecast_day,
             load_day_summaries,
             load_globe_points,
             render_weather_globe_page,
@@ -179,7 +182,8 @@ def create_app(settings: Settings) -> FastAPI:
             if day:
                 selected = date.fromisoformat(day)
             elif summaries:
-                selected = summaries[0].forecast_date
+                picked = default_forecast_day(summaries)
+                selected = picked if picked is not None else min_d
             else:
                 selected = min_d
             points = load_globe_points(session, forecast_date=selected)
@@ -198,6 +202,7 @@ def create_app(settings: Settings) -> FastAPI:
         from datetime import date
 
         from poly_bot.weather.dashboard_views import (
+            default_forecast_day,
             load_city_rows,
             load_day_summaries,
             weather_horizon,
@@ -210,7 +215,8 @@ def create_app(settings: Settings) -> FastAPI:
             if day:
                 selected = date.fromisoformat(day)
             elif summaries:
-                selected = summaries[0].forecast_date
+                picked = default_forecast_day(summaries)
+                selected = picked if picked is not None else min_d
             else:
                 selected = min_d
             rows = load_city_rows(session, forecast_date=selected)

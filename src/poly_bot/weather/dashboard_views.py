@@ -12,7 +12,12 @@ from sqlmodel import Session, col, select
 
 from poly_bot.persistence.schema import TokenQuote
 from poly_bot.settings import Settings
-from poly_bot.weather.market_window import days_ahead_of_today, format_days_ahead_label
+from poly_bot.weather.market_window import (
+    days_ahead_of_today,
+    format_days_ahead_label,
+    weather_horizon_bounds,
+    weather_reference_date,
+)
 from poly_bot.weather.repo import WeatherRepository
 from poly_bot.weather.schema import WeatherBin, WeatherCity, WeatherDailyEvent, WeatherStation
 
@@ -44,8 +49,7 @@ class BinTick:
 
 
 def weather_horizon(settings: Settings) -> tuple[date, date]:
-    ref = date.today()
-    return ref, ref + timedelta(days=settings.weather_forecast_horizon_days)
+    return weather_horizon_bounds(horizon_days=settings.weather_forecast_horizon_days)
 
 
 def load_day_summaries(session: Session, settings: Settings) -> list[WeatherDaySummary]:
@@ -59,17 +63,40 @@ def load_day_summaries(session: Session, settings: Settings) -> list[WeatherDayS
         .where(WeatherDailyEvent.forecast_date >= min_d)
         .where(WeatherDailyEvent.forecast_date <= max_d)
         .group_by(WeatherDailyEvent.forecast_date)
-        .order_by(WeatherDailyEvent.forecast_date)
     ).all()
+    by_date = {r[0]: (int(r[1]), int(r[2] or 0)) for r in rows}
     return [
         WeatherDaySummary(
-            forecast_date=r[0],
-            city_count=int(r[1]),
-            bin_count=int(r[2] or 0),
-            days_ahead=days_ahead_of_today(r[0]),
+            forecast_date=day,
+            city_count=by_date.get(day, (0, 0))[0],
+            bin_count=by_date.get(day, (0, 0))[1],
+            days_ahead=days_ahead_of_today(day),
         )
-        for r in rows
+        for day in _horizon_dates(min_d, max_d)
     ]
+
+
+def _horizon_dates(min_d: date, max_d: date) -> list[date]:
+    out: list[date] = []
+    d = min_d
+    while d <= max_d:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def default_forecast_day(summaries: list[WeatherDaySummary]) -> date | None:
+    """Prefer today UTC, else first day with synced cities."""
+    if not summaries:
+        return None
+    ref = weather_reference_date()
+    for s in summaries:
+        if s.forecast_date == ref and s.city_count > 0:
+            return s.forecast_date
+    for s in summaries:
+        if s.city_count > 0:
+            return s.forecast_date
+    return summaries[0].forecast_date
 
 
 def days_ahead_label_for(forecast_date: date) -> str:
@@ -292,9 +319,11 @@ def render_weather_page(
     ) or f'<option value="{selected_day.isoformat()}" selected>{selected_day}</option>'
 
     day_pills = "".join(
-        f'<a class="day-pill{" active" if s.forecast_date == selected_day else ""}" '
-        f'href="/weather?{urlencode({"day": s.forecast_date.isoformat(), "city": city_q})}">'
-        f"{s.forecast_date.strftime('%d %b')} ({days_ahead_label_for(s.forecast_date)})"
+        f'<a class="day-pill{" active" if s.forecast_date == selected_day else ""}{" empty" if s.city_count == 0 else ""}" '
+        f'href="/weather?{urlencode({"day": s.forecast_date.isoformat(), "city": city_q})}" '
+        f'title="{s.city_count} città">'
+        f"{s.forecast_date.strftime('%d %b')} ({days_ahead_label_for(s.forecast_date)}"
+        f'{"" if s.city_count else ", vuoto"})'
         f"</a>"
         for s in summaries
     ) or f'<span class="day-pill active">{selected_day.isoformat()}</span>'
@@ -319,7 +348,7 @@ def render_weather_page(
 <body>
 <header>
   <h1>Weather scan</h1>
-  <div class="sub">Stazione di risoluzione (link Wunderground del mercato) · oggi {date.today().strftime('%d/%m/%Y')} · aggiornamento ogni {poll_seconds // 60} min</div>
+  <div class="sub">Stazione di risoluzione · oggi UTC {weather_reference_date().strftime('%d/%m/%Y')} · aggiornamento ogni {poll_seconds // 60} min</div>
   <div class="day-pills">{day_pills}</div>
   <div class="health-bar" id="health-bar">
     <span class="health-item" id="health-wu"><span class="dot"></span> WU station</span>
@@ -340,6 +369,10 @@ def render_weather_page(
 <main>
   {empty_msg}
   <div class="card-grid" id="card-grid"></div>
+  <p class="sub empty-day-hint" id="empty-day-hint" style="display:none">
+    Nessun mercato per questo giorno — aggiorna catalogo:
+    <code>poly-bot weather markets-sync</code> poi <code>poly-bot weather sync</code>
+  </p>
   <footer>Horizon {min_d} … {max_d} ·
     <a class="link-muted" href="/weather/board?day={selected_day.isoformat()}">Board</a> ·
     <a class="link-muted" href="/weather/globe?day={selected_day.isoformat()}">Globe</a> ·
@@ -435,8 +468,17 @@ function cardHtml(c) {{
 
 function renderPayload(data) {{
   const grid = document.getElementById('card-grid');
+  const hint = document.getElementById('empty-day-hint');
   if (!data || !data.cards) {{
-    grid.innerHTML = '<p class="muted">Nessun mercato per questo giorno.</p>';
+    grid.innerHTML = '';
+    if (hint) hint.style.display = 'block';
+    return;
+  }}
+  if (hint) hint.style.display = data.cards.length ? 'none' : 'block';
+  if (!data.cards.length) {{
+    grid.innerHTML = '';
+    document.getElementById('stat-cities').textContent = '0';
+    applyHealth(data.health || {{}});
     return;
   }}
   grid.innerHTML = data.cards.map(cardHtml).join('');
@@ -1082,6 +1124,7 @@ nav.tabs a.active { color: var(--text); border-color: var(--border); background:
 }
 .day-pill:hover { color: var(--text); border-color: var(--accent); }
 .day-pill.active { color: var(--text); border-color: var(--accent); background: #1a2a42; }
+.day-pill.empty { opacity: 0.55; border-style: dashed; }
 .stats { display: flex; gap: 0.75rem; margin-top: 0.75rem; flex-wrap: wrap; }
 .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   padding: 0.45rem 0.75rem; font-size: 0.8rem; }
