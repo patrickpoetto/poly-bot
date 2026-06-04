@@ -23,6 +23,15 @@ from poly_bot.weather.market_window import (
 )
 
 
+def _utc_dt(dt: datetime | None) -> datetime | None:
+    """Normalize DB timestamps for comparison with datetime.now(UTC)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
 def _quote_health(session: Session, rows: list[WeatherCityRow]) -> dict[str, object]:
     token_ids = [
         tid
@@ -42,7 +51,7 @@ def _quote_health(session: Session, rows: list[WeatherCityRow]) -> dict[str, obj
     newest: datetime | None = None
     stale_count = 0
     for q in quotes:
-        ts = q.updated_at
+        ts = _utc_dt(q.updated_at)
         if ts and (newest is None or ts > newest):
             newest = ts
         if ts and (now - ts).total_seconds() > 600:
@@ -71,8 +80,11 @@ def _wu_health(session: Session, rows: list[WeatherCityRow], forecast_date: date
     err = sum(1 for s in snaps if s.status == "error")
     partial = sum(1 for s in snaps if s.status == "partial")
     missing = len(station_ids) - len(snaps)
-    newest = max((s.fetched_at for s in snaps if s.fetched_at), default=None)
-    global_last = latest_wu_sync_time(session)
+    newest = max(
+        (_utc_dt(s.fetched_at) for s in snaps if s.fetched_at),
+        default=None,
+    )
+    global_last = _utc_dt(latest_wu_sync_time(session))
     stale_s = (now - newest).total_seconds() if newest else None
     return {
         "last_at": (newest or global_last).isoformat() if (newest or global_last) else None,
