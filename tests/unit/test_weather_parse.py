@@ -2,7 +2,11 @@
 
 from datetime import date
 
-from poly_bot.weather.market_window import days_ahead_of_today, format_days_ahead_label
+from poly_bot.weather.market_window import (
+    country_flag_emoji,
+    days_ahead_of_today,
+    format_days_ahead_label,
+)
 from poly_bot.weather.parse import (
     infer_event_slug_from_market_slug,
     parse_bin_from_market,
@@ -11,6 +15,12 @@ from poly_bot.weather.parse import (
     parse_station_name_from_description,
     parse_wunderground_url,
 )
+
+
+def test_country_flag_emoji() -> None:
+    assert country_flag_emoji("gb") == "🇬🇧"
+    assert country_flag_emoji("US") == "🇺🇸"
+    assert country_flag_emoji("") == ""
 
 
 def test_days_ahead_oggi() -> None:

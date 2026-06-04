@@ -409,7 +409,7 @@ function cardHtml(c) {{
   const model = c.model_tmax_c != null ? `<span class="model-tag">${{c.model_tmax_c}}°C model</span>` : '';
   return `<article class="market-card" data-event="${{esc(c.event_id)}}">
     <div class="card-top">
-      <h2><a href="${{esc(c.detail_url)}}">${{esc(c.display_name)}}</a></h2>
+      <h2><a href="${{esc(c.detail_url)}}">${{c.flag ? c.flag + ' ' : ''}}${{esc(c.display_name)}}</a></h2>
       <span class="days-tag">${{esc(c.days_ahead_label || c.days_ahead)}}</span>
     </div>
     <div class="card-station muted">

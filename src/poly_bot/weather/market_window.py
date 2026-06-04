@@ -51,6 +51,14 @@ def days_ahead_of_today(forecast_date: date, *, ref: date | None = None) -> int:
     return (forecast_date - ref).days
 
 
+def country_flag_emoji(country_code: str) -> str:
+    """ISO 3166-1 alpha-2 (e.g. gb, us) → regional-indicator flag emoji."""
+    code = country_code.strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return ""
+    return "".join(chr(ord(ch) + 127397) for ch in code)
+
+
 def format_days_ahead_label(forecast_date: date, *, ref: date | None = None) -> str:
     """Short Italian label for day pills and cards."""
     d = days_ahead_of_today(forecast_date, ref=ref)

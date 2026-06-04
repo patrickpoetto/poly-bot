@@ -15,7 +15,11 @@ from poly_bot.weather.quotes import refresh_event_quotes_from_clob
 from poly_bot.weather.schema import WeatherStationWuSnapshot
 from poly_bot.weather.station_sync import latest_wu_sync_time
 from poly_bot.weather.temperature import format_temp_pair
-from poly_bot.weather.market_window import days_ahead_of_today, format_days_ahead_label
+from poly_bot.weather.market_window import (
+    country_flag_emoji,
+    days_ahead_of_today,
+    format_days_ahead_label,
+)
 
 
 def _quote_health(session: Session, rows: list[WeatherCityRow]) -> dict[str, object]:
@@ -194,6 +198,8 @@ def build_weather_cards_payload(
                 "event_id": ev.id,
                 "city_key": ev.city_key,
                 "display_name": (row.city.display_name if row.city else ev.city_key),
+                "country_code": (st.country_code if st else "") or "",
+                "flag": country_flag_emoji(st.country_code if st else ""),
                 "forecast_date": forecast_date.isoformat(),
                 "days_ahead": days_ahead_of_today(forecast_date),
                 "days_ahead_label": format_days_ahead_label(forecast_date),
