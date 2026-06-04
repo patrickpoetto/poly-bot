@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from datetime import UTC, date, datetime, timedelta
 
 import httpx
+import structlog
 from sqlmodel import Session, col, select
 
 from poly_bot.settings import Settings
 from poly_bot.weather.repo import WeatherRepository
 from poly_bot.weather.schema import WeatherDailyEvent, WeatherStation, WeatherStationWuSnapshot
-from poly_bot.weather.wu_client import fetch_station_reading
+from poly_bot.weather.wu_client import _WU_HTTP_HEADERS, fetch_station_reading, resolve_wu_api_key
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 
 class WeatherStationSnapshotSync:
@@ -56,9 +56,14 @@ class WeatherStationSnapshotSync:
         stats = {"stations": len(pairs), "ok": 0, "error": 0, "partial": 0}
 
         async with httpx.AsyncClient(
-            headers={"User-Agent": "poly-bot/1.0"},
+            headers=_WU_HTTP_HEADERS,
             follow_redirects=True,
         ) as client:
+            try:
+                api_key = await resolve_wu_api_key(client, self._settings, cache=key_cache)
+            except Exception as exc:
+                log.error("wu_api_key_resolve_failed", error=str(exc))
+                raise
 
             async def one(station_id: str, forecast_date: date) -> None:
                 station = repo.get_station(station_id)
@@ -70,6 +75,7 @@ class WeatherStationSnapshotSync:
                         self._settings,
                         station,
                         forecast_date=forecast_date,
+                        api_key=api_key,
                         client=client,
                         key_cache=key_cache,
                     )

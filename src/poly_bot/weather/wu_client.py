@@ -2,23 +2,46 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import httpx
+import structlog
 
 from poly_bot.settings import Settings
 from poly_bot.weather.market_window import market_day_window_utc
 from poly_bot.weather.temperature import api_value_to_celsius, local_hour_label, round_c_for_resolution
 from poly_bot.weather.schema import WeatherStation
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
-_WU_API_KEY_RE = re.compile(r'"apiKey"\s*:\s*"([a-f0-9]{32})"', re.I)
+_WU_API_KEY_PATTERNS = (
+    re.compile(r'"apiKey"\s*:\s*"([a-f0-9]{32})"', re.I),
+    re.compile(r"apiKey=([a-f0-9]{32})", re.I),
+    re.compile(r"'apiKey'\s*:\s*'([a-f0-9]{32})'", re.I),
+)
+_WU_KEY_PAGE_URLS = (
+    "https://www.wunderground.com/",
+    "https://www.wunderground.com/history",
+)
+_WU_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml",
+}
 _TWC_BASE = "https://api.weather.com"
+
+
+def _extract_api_key_from_html(html: str) -> str | None:
+    for pattern in _WU_API_KEY_PATTERNS:
+        m = pattern.search(html)
+        if m:
+            return m.group(1)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,15 +88,24 @@ async def resolve_wu_api_key(
         return settings.weather_wu_api_key.get_secret_value()
     if "key" in cache:
         return cache["key"]
-    url = "https://www.wunderground.com/"
-    r = await client.get(url, timeout=settings.weather_wu_request_timeout_seconds)
-    r.raise_for_status()
-    m = _WU_API_KEY_RE.search(r.text)
-    if not m:
-        msg = "Could not extract api.weather.com key from wunderground.com"
-        raise RuntimeError(msg)
-    cache["key"] = m.group(1)
-    return cache["key"]
+    timeout = settings.weather_wu_request_timeout_seconds
+    last_err = ""
+    for url in _WU_KEY_PAGE_URLS:
+        try:
+            r = await client.get(url, timeout=timeout, headers=_WU_HTTP_HEADERS)
+            r.raise_for_status()
+            key = _extract_api_key_from_html(r.text)
+            if key:
+                cache["key"] = key
+                return key
+            last_err = f"no apiKey in {url} ({len(r.text)} bytes)"
+        except httpx.HTTPError as exc:
+            last_err = f"{url}: {exc}"
+    msg = (
+        "Could not extract api.weather.com key from wunderground.com "
+        f"({last_err}). Set WEATHER_WU_API_KEY in .env."
+    )
+    raise RuntimeError(msg)
 
 
 def _date_from_local_iso(iso_local: str) -> date | None:
@@ -320,7 +352,7 @@ async def fetch_station_reading(
         if client is not None:
             return await _run(client)
         async with httpx.AsyncClient(
-            headers={"User-Agent": "poly-bot/1.0"},
+            headers=_WU_HTTP_HEADERS,
             follow_redirects=True,
         ) as hc:
             return await _run(hc)
