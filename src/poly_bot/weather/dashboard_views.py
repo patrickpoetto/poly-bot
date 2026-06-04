@@ -12,6 +12,7 @@ from sqlmodel import Session, col, select
 
 from poly_bot.persistence.schema import TokenQuote
 from poly_bot.settings import Settings
+from poly_bot.weather.market_window import days_ahead_of_today, format_days_ahead_label
 from poly_bot.weather.repo import WeatherRepository
 from poly_bot.weather.schema import WeatherBin, WeatherCity, WeatherDailyEvent, WeatherStation
 
@@ -54,7 +55,6 @@ def load_day_summaries(session: Session, settings: Settings) -> list[WeatherDayS
             WeatherDailyEvent.forecast_date,
             func.count(WeatherDailyEvent.id),
             func.sum(WeatherDailyEvent.bin_count),
-            func.min(WeatherDailyEvent.days_ahead),
         )
         .where(WeatherDailyEvent.forecast_date >= min_d)
         .where(WeatherDailyEvent.forecast_date <= max_d)
@@ -66,10 +66,14 @@ def load_day_summaries(session: Session, settings: Settings) -> list[WeatherDayS
             forecast_date=r[0],
             city_count=int(r[1]),
             bin_count=int(r[2] or 0),
-            days_ahead=int(r[3] or 0),
+            days_ahead=days_ahead_of_today(r[0]),
         )
         for r in rows
     ]
+
+
+def days_ahead_label_for(forecast_date: date) -> str:
+    return format_days_ahead_label(forecast_date)
 
 
 def load_city_rows(
@@ -132,7 +136,7 @@ def load_globe_points(
                 "timezone": st.timezone,
                 "unit": st.unit,
                 "forecast_date": forecast_date.isoformat(),
-                "days_ahead": ev.days_ahead,
+                "days_ahead": days_ahead_of_today(forecast_date),
                 "bin_count": len(row.bins),
                 "lead_temp": lead_label,
                 "title": ev.title,
@@ -282,7 +286,7 @@ def render_weather_page(
     day_opts = "".join(
         f'<option value="{s.forecast_date.isoformat()}" '
         f'{"selected" if s.forecast_date == selected_day else ""}>'
-        f'{s.forecast_date.isoformat()} (+{s.days_ahead}d, {s.city_count} cities)'
+        f'{s.forecast_date.isoformat()} ({days_ahead_label_for(s.forecast_date)}, {s.city_count} cities)'
         f"</option>"
         for s in summaries
     ) or f'<option value="{selected_day.isoformat()}" selected>{selected_day}</option>'
@@ -290,7 +294,7 @@ def render_weather_page(
     day_pills = "".join(
         f'<a class="day-pill{" active" if s.forecast_date == selected_day else ""}" '
         f'href="/weather?{urlencode({"day": s.forecast_date.isoformat(), "city": city_q})}">'
-        f"{s.forecast_date.strftime('%d %b')} (+{s.days_ahead}d)"
+        f"{s.forecast_date.strftime('%d %b')} ({days_ahead_label_for(s.forecast_date)})"
         f"</a>"
         for s in summaries
     ) or f'<span class="day-pill active">{selected_day.isoformat()}</span>'
@@ -315,7 +319,7 @@ def render_weather_page(
 <body>
 <header>
   <h1>Weather scan</h1>
-  <div class="sub">Stazione di risoluzione (link Wunderground del mercato) · giorno locale · aggiornamento ogni {poll_seconds // 60} min</div>
+  <div class="sub">Stazione di risoluzione (link Wunderground del mercato) · oggi {date.today().strftime('%d/%m/%Y')} · aggiornamento ogni {poll_seconds // 60} min</div>
   <div class="day-pills">{day_pills}</div>
   <div class="health-bar" id="health-bar">
     <span class="health-item" id="health-wu"><span class="dot"></span> WU station</span>
@@ -406,7 +410,7 @@ function cardHtml(c) {{
   return `<article class="market-card" data-event="${{esc(c.event_id)}}">
     <div class="card-top">
       <h2><a href="${{esc(c.detail_url)}}">${{esc(c.display_name)}}</a></h2>
-      <span class="days-tag">+${{c.days_ahead}}d</span>
+      <span class="days-tag">${{esc(c.days_ahead_label || c.days_ahead)}}</span>
     </div>
     <div class="card-station muted">
       ${{esc(st.name || st.icao || st.id)}} ·
@@ -556,7 +560,7 @@ def weather_event_json(row: WeatherCityRow, ticks: dict[str, BinTick]) -> dict[s
         "event_slug": ev.event_slug,
         "city_key": ev.city_key,
         "forecast_date": ev.forecast_date.isoformat(),
-        "days_ahead": ev.days_ahead,
+        "days_ahead": days_ahead_of_today(ev.forecast_date),
         "title": ev.title,
         "resolution_source_url": ev.resolution_source_url,
         "end_ts": ev.end_ts.isoformat() if ev.end_ts else None,
@@ -671,7 +675,7 @@ def _city_table_row(
         f'<td class="num">{model_c}</td>'
         f"<td{edge_cls}>{edge}</td>"
         f'<td class="num">{len(row.bins)}</td>'
-        f'<td class="num">{ev.days_ahead}</td>'
+        f'<td class="num">{format_days_ahead_label(ev.forecast_date)}</td>'
         "</tr>"
     )
 
@@ -818,7 +822,7 @@ def render_weather_globe_page(
     day_opts = "".join(
         f'<option value="{s.forecast_date.isoformat()}" '
         f'{"selected" if s.forecast_date == selected_day else ""}>'
-        f"{s.forecast_date.isoformat()} (+{s.days_ahead}d)"
+        f"{s.forecast_date.isoformat()} ({format_days_ahead_label(s.forecast_date)})"
         f"</option>"
         for s in summaries
     ) or f'<option value="{selected_day.isoformat()}" selected>{selected_day}</option>'

@@ -43,3 +43,21 @@ def forecast_window_meta(
         "window_start_utc": start_utc.isoformat(),
         "window_end_utc": end_utc.isoformat(),
     }
+
+
+def days_ahead_of_today(forecast_date: date, *, ref: date | None = None) -> int:
+    """Calendar days from ref (default: local today) to the market forecast day."""
+    ref = ref or date.today()
+    return (forecast_date - ref).days
+
+
+def format_days_ahead_label(forecast_date: date, *, ref: date | None = None) -> str:
+    """Short Italian label for day pills and cards."""
+    d = days_ahead_of_today(forecast_date, ref=ref)
+    if d == 0:
+        return "oggi"
+    if d == 1:
+        return "domani"
+    if d < 0:
+        return f"{d}g"
+    return f"+{d}g"

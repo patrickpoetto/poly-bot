@@ -2,6 +2,7 @@
 
 from datetime import date
 
+from poly_bot.weather.market_window import days_ahead_of_today, format_days_ahead_label
 from poly_bot.weather.parse import (
     infer_event_slug_from_market_slug,
     parse_bin_from_market,
@@ -10,6 +11,18 @@ from poly_bot.weather.parse import (
     parse_station_name_from_description,
     parse_wunderground_url,
 )
+
+
+def test_days_ahead_oggi() -> None:
+    ref = date(2026, 6, 4)
+    assert days_ahead_of_today(date(2026, 6, 4), ref=ref) == 0
+    assert format_days_ahead_label(date(2026, 6, 4), ref=ref) == "oggi"
+
+
+def test_days_ahead_domani() -> None:
+    ref = date(2026, 6, 4)
+    assert format_days_ahead_label(date(2026, 6, 5), ref=ref) == "domani"
+    assert format_days_ahead_label(date(2026, 6, 6), ref=ref) == "+2g"
 
 
 def test_parse_daily_event_slug() -> None:

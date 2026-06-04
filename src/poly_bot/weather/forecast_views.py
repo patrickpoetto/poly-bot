@@ -17,6 +17,7 @@ from poly_bot.weather.forecast_schema import (
     WeatherTafReport,
     WeatherTradingSignal,
 )
+from poly_bot.weather.market_window import format_days_ahead_label
 from poly_bot.weather.schema import WeatherStation
 
 
@@ -217,7 +218,7 @@ def render_weather_board_page(
     day_opts = "".join(
         f'<option value="{s.forecast_date.isoformat()}" '
         f'{"selected" if s.forecast_date == forecast_date else ""}>'
-        f"{s.forecast_date.isoformat()} (+{s.days_ahead}d)"
+        f"{s.forecast_date.isoformat()} ({format_days_ahead_label(s.forecast_date)})"
         f"</option>"
         for s in summaries
     ) or f'<option value="{forecast_date.isoformat()}" selected>{forecast_date}</option>'
@@ -244,7 +245,7 @@ def render_weather_board_page(
             f"{source_cells}"
             f"<td>{edge}</td>"
             f"<td class='num'>{len(r.bins)}</td>"
-            f"<td class='num'>{r.event.days_ahead}</td>"
+            f"<td class='num'>{format_days_ahead_label(r.event.forecast_date)}</td>"
             "</tr>"
         )
 

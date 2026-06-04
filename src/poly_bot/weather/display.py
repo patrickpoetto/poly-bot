@@ -8,7 +8,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from poly_bot.weather.repo import WeatherRepository
+from poly_bot.weather.market_window import days_ahead_of_today, format_days_ahead_label
 from poly_bot.weather.schema import WeatherBin, WeatherDailyEvent, WeatherStation
 
 
@@ -33,12 +33,12 @@ def print_weather_summary(
     for day in sorted(by_day):
         evs = by_day[day]
         bins = sum(e.bin_count for e in evs)
-        ahead = evs[0].days_ahead if evs else 0
+        ahead = days_ahead_of_today(day)
         table.add_row(
             day.isoformat(),
             str(len(evs)),
             str(bins),
-            str(ahead),
+            format_days_ahead_label(day),
         )
     console.print(table)
     console.print(f"Total cities×days: {len(events)}")
@@ -63,7 +63,7 @@ def print_weather_day_detail(
         bins = repo.bins_for_event(ev.id)
         console.print(
             f"\n[bold]{ev.city_key}[/bold] — {ev.title} "
-            f"(+{ev.days_ahead}d, {len(bins)} bins)"
+            f"({format_days_ahead_label(ev.forecast_date)}, {len(bins)} bins)"
         )
         if station:
             coord = ""

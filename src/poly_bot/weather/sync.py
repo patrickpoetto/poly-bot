@@ -205,6 +205,9 @@ class WeatherCatalogSync:
                 max_date=max_date,
             )
             stats["coords_backfilled"] = self._backfill_station_coordinates(session)
+            stats["days_ahead_refreshed"] = self._refresh_days_ahead(
+                session, ref=ref, min_date=min_date, max_date=max_date
+            )
             session.commit()
 
         logger.info(
@@ -240,6 +243,32 @@ class WeatherCatalogSync:
                 st.timezone = tz
             session.add(st)
             updated += 1
+        return updated
+
+    def _refresh_days_ahead(
+        self,
+        session: Session,
+        *,
+        ref: date,
+        min_date: date,
+        max_date: date,
+    ) -> int:
+        """Keep stored days_ahead aligned with sync reference (UTC calendar day)."""
+        from sqlmodel import select
+
+        from poly_bot.weather.schema import WeatherDailyEvent
+
+        updated = 0
+        for ev in session.exec(
+            select(WeatherDailyEvent)
+            .where(WeatherDailyEvent.forecast_date >= min_date)
+            .where(WeatherDailyEvent.forecast_date <= max_date)
+        ):
+            ahead = (ev.forecast_date - ref).days
+            if ev.days_ahead != ahead:
+                ev.days_ahead = ahead
+                session.add(ev)
+                updated += 1
         return updated
 
     def _load_weather_markets(self, session: Session) -> list[dict[str, Any]]:
