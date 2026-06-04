@@ -2,17 +2,26 @@
 #
 # Usage (from project root, so `.env` is auto-loaded):
 #   cp .env.example .env   # set POSTGRES_PASSWORD, POLY_BOT_IMAGE
-#   docker compose --env-file .env -f docker/docker-compose.prod.yml up -d
-#   docker compose --env-file .env -f docker/docker-compose.prod.yml ps
 #
-# Services:
-#   postgres        — catalog database (private network only)
-#   migrate         — one-shot Alembic upgrade then exits
-#   discovery       — poly-bot discovery serve  (full + delta scans)
-#   catalog-watch   — poly-bot catalog watch    (link + enrich + OI)
-#   ws-daemon       — poly-bot catalog ws-daemon (persistent CLOB WS)
-#   dashboard       — FastAPI UI on :8765 + /metrics
-#   backup          — periodic pg_dump → backup volume
+# Minimal / weather UI (low bandwidth — see docker/STACK.md):
+#   docker compose --env-file .env -f docker/docker-compose.prod.yml up -d
+#   → postgres + dashboard only
+#
+# Add services one at a time:
+#   docker compose ... --profile discovery up -d discovery
+#   docker compose ... --profile heavy up -d catalog-watch
+#   docker compose ... --profile heavy up -d ws-daemon
+#
+# Full stack (heavy on network/RAM):
+#   docker compose ... --profile discovery --profile heavy --profile ops up -d
+#
+# Services (no profile = always on with plain `up -d`):
+#   postgres, migrate, dashboard
+#
+# Profiles:
+#   discovery  — Gamma crawl (high bandwidth if serve)
+#   heavy      — ws-daemon + catalog-watch (highest bandwidth)
+#   ops        — backup, reconcile, alerter
 #
 # Image tag controlled by POLY_BOT_IMAGE (default: poly-bot:latest, built locally).
 
@@ -82,6 +91,7 @@ services:
 
   discovery:
     <<: *poly-bot-base
+    profiles: ["discovery"]
     command: ["poly-bot", "discovery", "serve"]
     healthcheck:
       test: ["CMD", "poly-bot", "ops", "health", "--service", "discovery", "--max-age", "900"]
@@ -94,6 +104,7 @@ services:
 
   catalog-watch:
     <<: *poly-bot-base
+    profiles: ["heavy"]
     command: ["poly-bot", "catalog", "watch"]
     environment:
       DATABASE_URL: postgresql+psycopg://poly_bot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/poly_bot
@@ -113,6 +124,7 @@ services:
 
   ws-daemon:
     <<: *poly-bot-base
+    profiles: ["heavy"]
     command: ["poly-bot", "catalog", "ws-daemon"]
     healthcheck:
       test: ["CMD", "poly-bot", "ops", "health", "--service", "ws", "--max-age", "300"]
@@ -122,6 +134,41 @@ services:
       start_period: 120s
     mem_limit: 384m
     cpus: 0.5
+
+  weather-aviation:
+    <<: *poly-bot-base
+    profiles: ["weather"]
+    command: ["poly-bot", "weather", "aviation-serve"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://poly_bot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/poly_bot
+      WEATHER_AVIATION_SYNC_ENABLED: "true"
+      WEATHER_AVIATION_INTERVAL_SECONDS: "${WEATHER_AVIATION_INTERVAL_SECONDS:-900}"
+    healthcheck:
+      test: ["CMD", "poly-bot", "weather", "aviation-status"]
+      interval: 120s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    mem_limit: 256m
+    cpus: 0.25
+
+  weather-sync:
+    <<: *poly-bot-base
+    profiles: ["weather"]
+    command: ["poly-bot", "weather", "serve"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://poly_bot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/poly_bot
+      WEATHER_MARKET_SYNC_ENABLED: "true"
+      WEATHER_MARKET_SYNC_INTERVAL_SECONDS: "${WEATHER_MARKET_SYNC_INTERVAL_SECONDS:-180}"
+      WEATHER_AVIATION_SYNC_ENABLED: "${WEATHER_AVIATION_SYNC_ENABLED:-true}"
+    healthcheck:
+      test: ["CMD", "poly-bot", "weather", "status"]
+      interval: 120s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    mem_limit: 512m
+    cpus: 0.75
 
   dashboard:
     <<: *poly-bot-base
@@ -151,6 +198,7 @@ services:
 
   backup:
     <<: *poly-bot-base
+    profiles: ["ops"]
     command:
       - "poly-bot"
       - "ops"
@@ -169,6 +217,7 @@ services:
 
   reconcile:
     <<: *poly-bot-base
+    profiles: ["ops"]
     command:
       - "poly-bot"
       - "ops"
@@ -186,6 +235,7 @@ services:
 
   alerter:
     <<: *poly-bot-base
+    profiles: ["ops"]
     command: ["poly-bot", "ops", "alerter-loop"]
     environment:
       DATABASE_URL: postgresql+psycopg://poly_bot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/poly_bot

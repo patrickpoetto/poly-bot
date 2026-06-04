@@ -8,7 +8,7 @@ import structlog
 from sqlmodel import Session
 
 from poly_bot.catalog.enricher import CatalogEnricher
-from poly_bot.catalog.expiring import expiring_condition_ids, token_ids_for_conditions
+from poly_bot.catalog.expiring import subscription_condition_ids, token_ids_for_conditions
 from poly_bot.catalog.linker import CatalogLinker
 from poly_bot.catalog.live_ws import LiveQuoteStream
 from poly_bot.persistence.db import get_engine, init_db
@@ -28,7 +28,7 @@ class CatalogWatch:
         init_db(self._engine)
 
     async def run_cycle(self, *, hours: float | None = None) -> dict[str, int]:
-        horizon = hours if hours is not None else self._settings.catalog_expiring_hours
+        horizon = hours if hours is not None else self._settings.catalog_quote_horizon_hours
         stats: dict[str, int] = {}
 
         with Session(self._engine) as session:
@@ -43,10 +43,10 @@ class CatalogWatch:
                 self._settings.catalog_ws_enabled
                 and not self._settings.catalog_ws_persistent
             ):
-                cids = expiring_condition_ids(
+                cids = subscription_condition_ids(
                     session,
+                    self._settings,
                     hours=horizon,
-                    sports_in_play_hours=self._settings.catalog_sports_in_play_hours,
                 )
                 tids = token_ids_for_conditions(session, cids)
                 ws = LiveQuoteStream(self._settings, session)
@@ -62,10 +62,11 @@ class CatalogWatch:
     async def run_forever(self, *, hours: float | None = None) -> None:
         interval = self._settings.catalog_enrich_interval_seconds
         cycle_timeout = max(interval * 5, 300.0)
+        effective_hours = hours if hours is not None else self._settings.catalog_quote_horizon_hours
         logger.info(
             "catalog_watch_start",
             interval=interval,
-            hours=hours,
+            hours=effective_hours,
             cycle_timeout=cycle_timeout,
         )
         while True:

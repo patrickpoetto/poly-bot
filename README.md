@@ -87,6 +87,35 @@ Local dev compose (SQLite volume): `docker compose -f docker/docker-compose.yml 
 | SSE stream `/api/stream` | ✅ |
 | Prometheus `/metrics` | ✅ (optional) |
 
+## Weather (daily temperature markets)
+
+Catalog, resolution-station forecasts (Wunderground via `api.weather.com`), aviation TAF/METAR, and a card dashboard at `/weather`.
+
+```bash
+# After discovery has temperature events in the DB
+poly-bot weather sync
+poly-bot weather station-sync          # WU temps for market local days
+poly-bot weather aviation-sync         # TAF/METAR + model merge
+
+# Low-bandwidth home stack (see docker/STACK.md)
+docker compose --env-file .env -f docker/docker-compose.weather.yml up -d
+# UI → http://127.0.0.1:8765/weather
+
+# Continuous pipeline (profile weather on prod compose)
+docker compose --env-file .env -f docker/docker-compose.prod.yml --profile weather up -d weather-sync
+```
+
+| Command | Purpose |
+|---------|---------|
+| `poly-bot weather sync` | Build `weather_stations` / events / bins from catalog |
+| `poly-bot weather markets-sync` | Gamma delta filtered to weather slugs only |
+| `poly-bot weather station-sync` | Resolution-link station temps (5 min loop in `weather serve`) |
+| `poly-bot weather aviation-sync` | TAF/METAR + Open-Meteo daily max per station |
+| `poly-bot weather serve` | Loop: markets + catalog + aviation + WU station |
+| `poly-bot weather status` | Events by forecast day |
+
+Postgres: migrations `004`–`006` (catalog, forecasts, WU snapshots). Rebuild the Docker image after pulling so `poly-bot weather` exists in the container.
+
 ## Ops
 
 | Command | Purpose |

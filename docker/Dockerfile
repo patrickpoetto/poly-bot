@@ -13,11 +13,19 @@ WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md alembic.ini ./
 COPY alembic ./alembic
 COPY src ./src
+
+# Dashboard globe view (no CDN required at runtime)
+RUN mkdir -p src/poly_bot/catalog/static/vendor \
+    && curl -fsSL -o src/poly_bot/catalog/static/vendor/globe.gl.min.js \
+         "https://cdn.jsdelivr.net/npm/globe.gl@2.46.1/dist/globe.gl.min.js" \
+    && curl -fsSL -o src/poly_bot/catalog/static/vendor/earth-night.jpg \
+         "https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg"
 
 RUN pip install --no-cache-dir hatchling \
     && pip wheel --no-cache-dir --wheel-dir /wheels ".[production]"

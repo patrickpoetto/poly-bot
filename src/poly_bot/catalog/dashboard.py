@@ -8,10 +8,13 @@ import json
 from datetime import UTC, datetime
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, Form, Query
+from pathlib import Path
+
+from fastapi import FastAPI, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from poly_bot.catalog.events_view import group_expiring_by_event, market_fee_label
 from poly_bot.catalog.expiring import count_expiring_markets, list_expiring_markets
@@ -27,6 +30,10 @@ from poly_bot.settings import Settings
 def create_app(settings: Settings) -> FastAPI:
     init_db(get_engine(settings))
     app = FastAPI(title="poly_bot catalog", version="0.2.0")
+
+    static_dir = Path(__file__).resolve().parent / "static"
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/", response_class=HTMLResponse)
     def index(
@@ -105,6 +112,328 @@ def create_app(settings: Settings) -> FastAPI:
         _update_gauges(settings, hours=settings.catalog_expiring_hours)
         body, content_type = render_metrics()
         return Response(content=body, media_type=content_type)
+
+    @app.get("/weather", response_class=HTMLResponse)
+    def weather_page(
+        day: str = Query(default=""),
+        city: str = Query(default=""),
+    ) -> str:
+        from datetime import date
+
+        from poly_bot.weather.dashboard_views import (
+            load_city_rows,
+            load_day_summaries,
+            render_weather_page,
+            weather_horizon,
+        )
+        from poly_bot.weather.schema import WeatherDailyEvent
+
+        min_d, max_d = weather_horizon(settings)
+        import json as json_mod
+
+        from poly_bot.weather.cards_data import build_weather_cards_payload
+
+        with Session(get_engine(settings)) as session:
+            summaries = load_day_summaries(session, settings)
+            empty = session.exec(select(WeatherDailyEvent).limit(1)).first() is None
+            if day:
+                selected = date.fromisoformat(day)
+            elif summaries:
+                selected = summaries[0].forecast_date
+            else:
+                selected = min_d
+            rows = load_city_rows(session, forecast_date=selected, city_q=city)
+            payload = build_weather_cards_payload(
+                session,
+                settings,
+                forecast_date=selected,
+                city_q=city,
+                refresh_quotes=False,
+            )
+            initial_json = json_mod.dumps(payload)
+        return render_weather_page(
+            settings=settings,
+            summaries=summaries,
+            rows=rows,
+            selected_day=selected,
+            city_q=city,
+            empty_catalog=empty,
+            initial_cards_json=initial_json,
+            poll_seconds=settings.weather_dashboard_poll_seconds,
+        )
+
+    @app.get("/weather/globe", response_class=HTMLResponse)
+    def weather_globe_page(day: str = Query(default="")) -> str:
+        from datetime import date
+
+        from poly_bot.weather.dashboard_views import (
+            load_day_summaries,
+            load_globe_points,
+            render_weather_globe_page,
+            weather_horizon,
+        )
+
+        min_d, _max_d = weather_horizon(settings)
+        with Session(get_engine(settings)) as session:
+            summaries = load_day_summaries(session, settings)
+            if day:
+                selected = date.fromisoformat(day)
+            elif summaries:
+                selected = summaries[0].forecast_date
+            else:
+                selected = min_d
+            points = load_globe_points(session, forecast_date=selected)
+        import json as json_mod
+
+        return render_weather_globe_page(
+            settings=settings,
+            summaries=summaries,
+            selected_day=selected,
+            points_json=json_mod.dumps(points),
+            point_count=len(points),
+        )
+
+    @app.get("/weather/board", response_class=HTMLResponse)
+    def weather_board_page(day: str = Query(default="")) -> str:
+        from datetime import date
+
+        from poly_bot.weather.dashboard_views import (
+            load_city_rows,
+            load_day_summaries,
+            weather_horizon,
+        )
+        from poly_bot.weather.forecast_views import load_board_data, render_weather_board_page
+
+        min_d, _max_d = weather_horizon(settings)
+        with Session(get_engine(settings)) as session:
+            summaries = load_day_summaries(session, settings)
+            if day:
+                selected = date.fromisoformat(day)
+            elif summaries:
+                selected = summaries[0].forecast_date
+            else:
+                selected = min_d
+            rows = load_city_rows(session, forecast_date=selected)
+            source_keys, matrix, signals = load_board_data(
+                session,
+                forecast_date=selected,
+                rows=rows,
+            )
+        return render_weather_board_page(
+            settings=settings,
+            forecast_date=selected,
+            rows=rows,
+            summaries=summaries,
+            source_keys=source_keys,
+            matrix=matrix,
+            signals=signals,
+        )
+
+    @app.get("/weather/aviation", response_class=HTMLResponse)
+    def weather_aviation_page() -> str:
+        from poly_bot.weather.forecast_schema import (
+            WeatherForecastSource,
+            WeatherStationForecastConfig,
+            WeatherTafReport,
+        )
+        from poly_bot.weather.forecast_views import render_weather_aviation_page
+        from poly_bot.weather.schema import WeatherStation
+
+        with Session(get_engine(settings)) as session:
+            stations = list(session.exec(select(WeatherStation)).all())
+            configs = list(session.exec(select(WeatherStationForecastConfig)).all())
+            sources = list(session.exec(select(WeatherForecastSource)).all())
+            tafs = list(session.exec(select(WeatherTafReport)).all())
+        return render_weather_aviation_page(
+            settings=settings,
+            stations=stations,
+            configs=configs,
+            sources=sources,
+            taf_rows=tafs,
+        )
+
+    @app.get("/api/weather/forecasts")
+    def api_weather_forecasts(day: str = Query(...)) -> list[dict[str, object]]:
+        from datetime import date
+
+        from poly_bot.weather.dashboard_views import load_city_rows
+        from poly_bot.weather.forecast_views import load_forecast_context_for_rows
+
+        forecast_date = date.fromisoformat(day)
+        with Session(get_engine(settings)) as session:
+            rows = load_city_rows(session, forecast_date=forecast_date)
+            ctx = load_forecast_context_for_rows(
+                session, rows, forecast_date=forecast_date
+            )
+        out: list[dict[str, object]] = []
+        for row in rows:
+            s = ctx.get(row.event.station_id)
+            out.append(
+                {
+                    "city_key": row.event.city_key,
+                    "station_id": row.event.station_id,
+                    "icao": row.station.icao if row.station else None,
+                    "taf_tmax_c": s.taf_tmax_c if s else None,
+                    "metar_run_c": s.metar_run_c if s else None,
+                    "merged_tmax_c": s.merged_tmax_c if s else None,
+                    "merged_source": s.merged_source if s else "",
+                    "edge_hint": s.edge_hint if s else "",
+                    "taf_coverage": s.taf_coverage if s else "",
+                }
+            )
+        return out
+
+    @app.get("/api/weather/globe")
+    def api_weather_globe(day: str = Query(default="")) -> list[dict[str, object]]:
+        from datetime import date
+
+        from poly_bot.weather.dashboard_views import load_globe_points, weather_horizon
+
+        min_d, _max_d = weather_horizon(settings)
+        forecast_date = date.fromisoformat(day) if day else min_d
+        with Session(get_engine(settings)) as session:
+            return load_globe_points(session, forecast_date=forecast_date)
+
+    @app.get("/weather/event", response_class=HTMLResponse)
+    def weather_event_page(
+        city: str = Query(...),
+        day: str = Query(...),
+    ) -> str:
+        from datetime import date
+
+        from poly_bot.weather.dashboard_views import (
+            load_bin_ticks,
+            load_city_row_by_keys,
+            render_weather_detail_page,
+        )
+
+        forecast_date = date.fromisoformat(day)
+        with Session(get_engine(settings)) as session:
+            row = load_city_row_by_keys(
+                session,
+                forecast_date=forecast_date,
+                city_key=city.strip().lower(),
+            )
+            if row is None:
+                return HTMLResponse(
+                    "<p>Event not found. <a href='/weather'>Back</a></p>",
+                    status_code=404,
+                )
+            ticks = load_bin_ticks(session, row.bins)
+            from poly_bot.weather.forecast_repo import WeatherForecastRepository
+            from poly_bot.weather.forecast_schema import WeatherTradingSignal
+
+            sig = session.get(WeatherTradingSignal, row.event.id)
+            taf = WeatherForecastRepository(session).get_taf(row.event.station_id)
+            taf_raw = taf.raw_taf if taf else ""
+        return render_weather_detail_page(
+            settings=settings,
+            row=row,
+            ticks=ticks,
+            signal=sig,
+            taf_raw=taf_raw,
+        )
+
+    @app.get("/api/weather/cards")
+    def api_weather_cards(
+        day: str = Query(default=""),
+        city: str = Query(default=""),
+        refresh_quotes: bool = Query(default=False),
+    ) -> dict[str, object]:
+        from datetime import date
+
+        from poly_bot.weather.cards_data import build_weather_cards_payload
+        from poly_bot.weather.dashboard_views import weather_horizon
+
+        min_d, _max_d = weather_horizon(settings)
+        forecast_date = date.fromisoformat(day) if day else min_d
+        with Session(get_engine(settings)) as session:
+            return build_weather_cards_payload(
+                session,
+                settings,
+                forecast_date=forecast_date,
+                city_q=city,
+                refresh_quotes=refresh_quotes,
+            )
+
+    @app.get("/api/weather")
+    def api_weather(
+        day: str = Query(default=""),
+    ) -> list[dict[str, object]]:
+        from datetime import date
+
+        from poly_bot.weather.dashboard_views import load_city_rows, weather_horizon
+
+        min_d, _max_d = weather_horizon(settings)
+        forecast_date = date.fromisoformat(day) if day else min_d
+        with Session(get_engine(settings)) as session:
+            rows = load_city_rows(session, forecast_date=forecast_date)
+        return [
+            {
+                "event_id": r.event.id,
+                "city_key": r.event.city_key,
+                "forecast_date": r.event.forecast_date.isoformat(),
+                "title": r.event.title,
+                "bin_count": len(r.bins),
+                "station_icao": r.station.icao if r.station else None,
+                "latitude": r.station.latitude if r.station else None,
+                "longitude": r.station.longitude if r.station else None,
+                "timezone": r.station.timezone if r.station else None,
+            }
+            for r in rows
+        ]
+
+    @app.get("/api/weather/event/{event_id}")
+    def api_weather_event(event_id: str) -> dict[str, object]:
+        from poly_bot.weather.dashboard_views import (
+            load_bin_ticks,
+            load_city_row_by_keys,
+            weather_event_json,
+        )
+        from poly_bot.weather.schema import WeatherDailyEvent
+
+        with Session(get_engine(settings)) as session:
+            ev = session.get(WeatherDailyEvent, event_id)
+            if ev is None:
+                raise HTTPException(status_code=404, detail="not found")
+            row = load_city_row_by_keys(
+                session,
+                forecast_date=ev.forecast_date,
+                city_key=ev.city_key,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="not found")
+            ticks = load_bin_ticks(session, row.bins)
+        return weather_event_json(row, ticks)
+
+    @app.get("/api/weather/stream")
+    async def api_weather_stream(
+        event_id: str = Query(...),
+    ) -> StreamingResponse:
+        """SSE — REST CLOB refresh + DB quotes for one weather event (5s)."""
+
+        async def event_generator() -> object:
+            from poly_bot.weather.dashboard_views import weather_event_live_snapshot
+            from poly_bot.weather.quotes import refresh_event_quotes_from_clob
+
+            while True:
+                payload: dict[str, object]
+                with Session(get_engine(settings)) as session:
+                    try:
+                        await refresh_event_quotes_from_clob(
+                            session, settings, event_id=event_id
+                        )
+                    except Exception:
+                        pass
+                    payload = weather_event_live_snapshot(session, event_id=event_id)
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(5)
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/taxonomy", response_class=HTMLResponse)
     def taxonomy_page(
@@ -583,6 +912,7 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
   <nav class="tabs">
     <a href="/?{query}" class="{'active' if tab == 'markets' else ''}">Markets</a>
     <a href="/events?hours={hours}" class="{'active' if tab == 'events' else ''}">Events & fees</a>
+    <a href="/weather">Weather</a>
     <a href="/taxonomy">Taxonomy</a>
   </nav>
   <form class="filters" method="get" action="/">
@@ -888,6 +1218,8 @@ form.inline {{ display:inline; }}
 <nav class="tabs">
   <a href="/">Markets</a>
   <a href="/events">Events &amp; fees</a>
+  <a href="/weather">Weather</a>
+  <a href="/weather/globe">Globe</a>
   <a href="/taxonomy" class="active">Taxonomy</a>
 </nav>
 

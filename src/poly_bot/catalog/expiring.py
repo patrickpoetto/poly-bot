@@ -11,6 +11,7 @@ from sqlmodel import Session
 
 from poly_bot.catalog.models import ExpiringMarket
 from poly_bot.persistence import dialect as sql_dialect
+from poly_bot.settings import Settings
 
 
 def _dialect_name(session: Session) -> str:
@@ -370,3 +371,28 @@ def _float_or_none(value: object) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def subscription_condition_ids(
+    session: Session,
+    settings: Settings,
+    *,
+    hours: float | None = None,
+) -> list[str]:
+    """Markets to stream/enrich: standard expiring window + weather forecast bins."""
+    from poly_bot.weather.quotes import weather_condition_ids
+
+    horizon = hours if hours is not None else settings.catalog_quote_horizon_hours
+    standard = expiring_condition_ids(
+        session,
+        hours=horizon,
+        sports_in_play_hours=settings.catalog_sports_in_play_hours,
+    )
+    weather = weather_condition_ids(session, settings)
+    seen: set[str] = set(standard)
+    out = list(standard)
+    for cid in weather:
+        if cid not in seen:
+            out.append(cid)
+            seen.add(cid)
+    return out

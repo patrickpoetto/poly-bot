@@ -183,6 +183,54 @@ class DiscoveryRunner:
         merged["clob_tick_enriched"] = clob_n
         return merged
 
+    async def scan_weather_delta(self) -> dict[str, int]:
+        """Incremental scan limited to weather markets/events."""
+        overlap = timedelta(seconds=60)
+
+        with Session(self._engine) as session:
+            state = CatalogStateStore(session)
+            since_markets = state.get_watermark(KEY_MARKETS_DELTA_WATERMARK) - overlap
+            since_events = state.get_watermark(KEY_EVENTS_DELTA_WATERMARK) - overlap
+
+        market_stats = await self._scan_markets(
+            run_type="delta_weather_markets",
+            source=self._iter_weather_markets(
+                self._gamma.iter_active_markets_delta(since_markets)
+            ),
+        )
+        event_stats = await self._scan_records(
+            run_type="delta_weather_events",
+            source=self._iter_weather_events(self._gamma.iter_active_events_delta(since_events)),
+            mapper=gamma_event_to_entity,
+            upsert=lambda repo, entity: repo.upsert_event(entity),
+            entity_label="events",
+        )
+        merged = _merge_stats(market_stats, event_stats)
+        merged["series_backfilled"] = self._backfill_series_from_events()
+
+        with Session(self._engine) as session:
+            CatalogRepository(session).rollup_event_fees()
+            state = CatalogStateStore(session)
+            state.set_watermark_now(KEY_MARKETS_DELTA_WATERMARK)
+            state.set_watermark_now(KEY_EVENTS_DELTA_WATERMARK)
+            session.commit()
+
+        return merged
+
+    async def _iter_weather_markets(
+        self, source: AsyncIterator[dict[str, Any]]
+    ) -> AsyncIterator[dict[str, Any]]:
+        async for item in source:
+            if _is_weather_market(item):
+                yield item
+
+    async def _iter_weather_events(
+        self, source: AsyncIterator[dict[str, Any]]
+    ) -> AsyncIterator[dict[str, Any]]:
+        async for item in source:
+            if _is_weather_event(item):
+                yield item
+
     async def _finalize_scan_watermarks(self, *, session: Session | None = None) -> None:
         if session is not None:
             state = CatalogStateStore(session)
@@ -472,6 +520,21 @@ def _merge_stats(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
     for k, v in b.items():
         merged[k] = merged.get(k, 0) + v
     return merged
+
+
+def _is_weather_market(raw: dict[str, Any]) -> bool:
+    domain = str(raw.get("domain") or "").strip().lower()
+    if domain == "weather":
+        return True
+    slug = str(raw.get("slug") or "").strip().lower()
+    title = str(raw.get("title") or raw.get("question") or "").strip().lower()
+    return slug.startswith("highest-temperature-in-") or "highest temperature" in title
+
+
+def _is_weather_event(raw: dict[str, Any]) -> bool:
+    slug = str(raw.get("slug") or "").strip().lower()
+    title = str(raw.get("title") or "").strip().lower()
+    return slug.startswith("highest-temperature-in-") or "highest temperature" in title
 
 
 def run_scan_sync(settings: Settings, *, bootstrap_closed: bool = True) -> dict[str, int]:

@@ -41,11 +41,18 @@ def get_engine(settings: Settings) -> Engine:
 
 def init_db(engine: Engine) -> None:
     """Ensure schema exists — Alembic on Postgres, create_all on SQLite."""
+    _register_weather_models()
     if engine.dialect.name == "postgresql":
         run_alembic_upgrade(engine)
         return
     SQLModel.metadata.create_all(engine)
     _migrate_schema(engine)
+
+
+def _register_weather_models() -> None:
+    """Register weather tables on SQLModel metadata before create_all / Alembic."""
+    from poly_bot.weather import forecast_schema as _weather_forecast_schema  # noqa: F401
+    from poly_bot.weather import schema as _weather_schema  # noqa: F401
 
 
 def run_alembic_upgrade(engine: Engine) -> None:

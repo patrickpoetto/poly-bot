@@ -1,6 +1,6 @@
 [project]
 name = "poly-bot"
-version = "0.1.0"
+version = "0.2.0"
 description = "Production-grade Polymarket trading bot — discovery engine, strategies, execution"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -55,9 +55,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/poly_bot"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/poly_bot" = "poly_bot"
 
 [tool.ruff]
 target-version = "py313"

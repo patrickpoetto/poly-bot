@@ -12,6 +12,7 @@ _FEE_TYPE_RATES: dict[str, float] = {
     "politics": 0.04,
     "economics": 0.05,
     "culture": 0.05,
+    "weather": 0.05,
     "general_fees": 0.05,
     "mentions": 0.04,
     "tech": 0.04,

@@ -1,0 +1,45 @@
+"""Market-resolution windows for daily weather events."""
+
+from __future__ import annotations
+
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+
+def market_day_window_utc(forecast_date: date, timezone: str) -> tuple[datetime, datetime]:
+    """Canonical market window in UTC for a station local forecast day.
+
+    Polymarket daily temperature markets resolve on the local calendar day
+    [00:00, 24:00) in the station timezone.
+    """
+    try:
+        tz = ZoneInfo(timezone)
+    except Exception:
+        tz = UTC
+    start_local = datetime.combine(forecast_date, time.min, tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(UTC), end_local.astimezone(UTC)
+
+
+def forecast_window_meta(
+    *,
+    station_id: str,
+    forecast_date: date,
+    timezone: str,
+    context: dict | None = None,
+) -> dict[str, str]:
+    """Metadata attached to every per-day forecast row."""
+    windows: dict[tuple[str, date], tuple[datetime, datetime]] = {}
+    if context:
+        raw = context.get("market_windows")
+        if isinstance(raw, dict):
+            windows = raw
+    start_utc, end_utc = windows.get(
+        (station_id, forecast_date), market_day_window_utc(forecast_date, timezone)
+    )
+    return {
+        "forecast_date": forecast_date.isoformat(),
+        "market_timezone": timezone or "UTC",
+        "window_start_utc": start_utc.isoformat(),
+        "window_end_utc": end_utc.isoformat(),
+    }

@@ -94,6 +94,18 @@ class DiscoveryScheduler:
 
         stats["link_total"] = sum(link_stats.values())
         stats["event_fees_rolled"] = fees_rolled
+
+        if self._settings.weather_catalog_sync_enabled:
+            try:
+                from poly_bot.weather.sync import WeatherCatalogSync
+
+                weather_stats = WeatherCatalogSync(self._settings).sync()
+                stats["weather_stations"] = weather_stats.get("stations", 0)
+                stats["weather_daily_events"] = weather_stats.get("daily_events", 0)
+                stats["weather_bins"] = weather_stats.get("bins", 0)
+            except Exception:
+                logger.exception("weather_catalog_sync_failed")
+
         record_discovery_cycle(str(stats.get("cycle", "unknown")), stats)
         return stats
 

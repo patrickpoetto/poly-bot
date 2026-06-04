@@ -20,6 +20,7 @@ from poly_bot.persistence.schema import (  # noqa: F401
     Token,
     TokenQuote,
 )
+from poly_bot.weather import schema as _weather_schema  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

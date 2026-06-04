@@ -22,7 +22,7 @@ from sqlalchemy.exc import OperationalError
 from sqlmodel import Session
 from websockets.asyncio.client import ClientConnection
 
-from poly_bot.catalog.expiring import expiring_condition_ids, token_ids_for_conditions
+from poly_bot.catalog.expiring import subscription_condition_ids, token_ids_for_conditions
 from poly_bot.metrics import record_catalog_enrich
 from poly_bot.persistence.db import get_engine
 from poly_bot.persistence.schema import TokenQuote
@@ -217,7 +217,7 @@ class PersistentWSDaemon:
     ) -> None:
         self._settings = settings
         self._engine = get_engine(settings)
-        self._hours = hours if hours is not None else settings.catalog_expiring_hours
+        self._hours = hours if hours is not None else settings.catalog_quote_horizon_hours
         self._refresh_seconds = (
             refresh_seconds
             if refresh_seconds is not None
@@ -324,10 +324,10 @@ class PersistentWSDaemon:
 
     def _load_subscription_state(self) -> tuple[list[str], dict[str, str]]:
         with Session(self._engine) as session:
-            cids = expiring_condition_ids(
+            cids = subscription_condition_ids(
                 session,
+                self._settings,
                 hours=self._hours,
-                sports_in_play_hours=self._settings.catalog_sports_in_play_hours,
             )
             tids = token_ids_for_conditions(session, cids)
             token_map = _load_token_conditions(session)

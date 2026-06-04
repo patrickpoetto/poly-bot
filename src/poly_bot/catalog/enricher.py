@@ -12,7 +12,7 @@ from sqlmodel import Session
 from poly_bot.catalog.expiring import (
     conditions_needing_oi_refresh,
     conditions_needing_quote_refresh,
-    expiring_condition_ids,
+    subscription_condition_ids,
     token_ids_for_conditions,
 )
 from poly_bot.exchange.clob_public import ClobPublicClient
@@ -36,11 +36,11 @@ class CatalogEnricher:
         hours: float | None = None,
         force: bool = False,
     ) -> dict[str, int]:
-        horizon = hours if hours is not None else self._settings.catalog_expiring_hours
-        all_conditions = expiring_condition_ids(
+        horizon = hours if hours is not None else self._settings.catalog_quote_horizon_hours
+        all_conditions = subscription_condition_ids(
             self._session,
+            self._settings,
             hours=horizon,
-            sports_in_play_hours=self._settings.catalog_sports_in_play_hours,
         )
         if not all_conditions:
             logger.info("enrich_expiring_empty", hours=horizon)

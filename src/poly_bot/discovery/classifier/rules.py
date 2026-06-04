@@ -42,7 +42,32 @@ _DOMAIN_TAG_MAP: dict[str, str] = {
     "science": "science",
     "pop-culture": "culture",
     "entertainment": "culture",
+    "weather": "weather",
+    "climate": "weather",
+    "temperature": "weather",
+    "global-temp": "weather",
+    "precipitation": "weather",
+    "hurricane": "weather",
 }
+
+# Slug / question hints when Gamma tags are missing or generic.
+_WEATHER_TEXT_HINTS: tuple[str, ...] = (
+    "weather",
+    "temperature",
+    "rainfall",
+    "precipitation",
+    "hurricane",
+    "snowfall",
+    "celsius",
+    "fahrenheit",
+    "high-temp",
+    "low-temp",
+    "highest-temperature",
+    "lowest-temperature",
+    "degrees in",
+    "°f",
+    "°c",
+)
 
 
 def _tags_from_payload(raw: dict[str, Any]) -> list[str]:
@@ -70,6 +95,14 @@ def classify_domain_from_tags(tags: list[str]) -> str:
             if key in tag_l:
                 return mapped
     return "unknown"
+
+
+def classify_domain_from_text(*, slug: str, question: str = "") -> str | None:
+    """Fallback when tags do not map — Polymarket weather markets often lack a Weather tag."""
+    blob = f"{slug} {question}".lower()
+    if any(hint in blob for hint in _WEATHER_TEXT_HINTS):
+        return "weather"
+    return None
 
 
 def classify_horizon_from_dates(
@@ -132,6 +165,11 @@ def classify_market(
     """Return classification fields for a Market row."""
     tags = _tags_from_payload(raw)
     domain = classify_domain_from_tags(tags)
+    if domain == "unknown":
+        question = str(raw.get("question") or raw.get("title") or "")
+        text_domain = classify_domain_from_text(slug=slug, question=question)
+        if text_domain is not None:
+            domain = text_domain
 
     structure = "binary"
     outcomes = raw.get("outcomes") or []
@@ -162,6 +200,8 @@ def classify_market(
         resolution_source = "chainlink"
     elif domain == "sports":
         resolution_source = "sports_api"
+    elif domain == "weather":
+        resolution_source = "uma"
     elif domain == "politics":
         resolution_source = "uma"
 

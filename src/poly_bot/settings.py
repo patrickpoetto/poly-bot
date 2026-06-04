@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -152,6 +152,112 @@ class Settings(BaseSettings):
         ge=1024,
         le=65535,
     )
+
+    # Weather trading catalog (stations, daily events, bins)
+    weather_forecast_horizon_days: int = Field(
+        default=3,
+        validation_alias="WEATHER_FORECAST_HORIZON_DAYS",
+        ge=0,
+        le=14,
+        description="Sync today through today+N (0=today only, 3=+3 days)",
+    )
+    weather_catalog_sync_enabled: bool = Field(
+        default=True,
+        validation_alias="WEATHER_CATALOG_SYNC_ENABLED",
+    )
+    weather_market_sync_enabled: bool = Field(
+        default=True,
+        validation_alias="WEATHER_MARKET_SYNC_ENABLED",
+    )
+    weather_market_sync_interval_seconds: int = Field(
+        default=180,
+        validation_alias="WEATHER_MARKET_SYNC_INTERVAL_SECONDS",
+        ge=30,
+        le=3600,
+    )
+    weather_aviation_sync_enabled: bool = Field(
+        default=True,
+        validation_alias="WEATHER_AVIATION_SYNC_ENABLED",
+    )
+    weather_aviation_interval_seconds: int = Field(
+        default=900,
+        validation_alias="WEATHER_AVIATION_INTERVAL_SECONDS",
+        ge=60,
+        le=7200,
+    )
+    weather_aviation_api_base: str = Field(
+        default="https://aviationweather.gov/api/data",
+        validation_alias="WEATHER_AVIATION_API_BASE",
+    )
+    weather_open_meteo_api_base: str = Field(
+        default="https://api.open-meteo.com/v1/forecast",
+        validation_alias="WEATHER_OPEN_METEO_API_BASE",
+    )
+    weather_open_meteo_timeout_seconds: float = Field(
+        default=20.0,
+        validation_alias="WEATHER_OPEN_METEO_TIMEOUT_SECONDS",
+        ge=5.0,
+        le=90.0,
+    )
+    weather_open_meteo_models: str = Field(
+        default="ecmwf_ifs025,gfs_seamless,icon_seamless",
+        validation_alias="WEATHER_OPEN_METEO_MODELS",
+    )
+    weather_metar_retention_days: int = Field(
+        default=14,
+        validation_alias="WEATHER_METAR_RETENTION_DAYS",
+        ge=3,
+        le=90,
+    )
+    weather_pilot_station_ids: list[str] = Field(
+        default_factory=list,
+        validation_alias="WEATHER_PILOT_STATION_IDS",
+        description="Comma-separated station ids or ICAO with trading_enabled=true",
+    )
+    weather_wu_sync_enabled: bool = Field(
+        default=True,
+        validation_alias="WEATHER_WU_SYNC_ENABLED",
+    )
+    weather_wu_sync_interval_seconds: int = Field(
+        default=300,
+        validation_alias="WEATHER_WU_SYNC_INTERVAL_SECONDS",
+        ge=60,
+        le=3600,
+        description="Resolution-station WU poll interval (dashboard + serve loop)",
+    )
+    weather_wu_request_timeout_seconds: float = Field(
+        default=20.0,
+        validation_alias="WEATHER_WU_REQUEST_TIMEOUT_SECONDS",
+        ge=5.0,
+        le=60.0,
+    )
+    weather_wu_concurrency: int = Field(
+        default=4,
+        validation_alias="WEATHER_WU_CONCURRENCY",
+        ge=1,
+        le=16,
+    )
+    weather_wu_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="WEATHER_WU_API_KEY",
+        description="Optional api.weather.com key; else scraped from wunderground.com",
+    )
+    weather_dashboard_poll_seconds: int = Field(
+        default=300,
+        validation_alias="WEATHER_DASHBOARD_POLL_SECONDS",
+        ge=60,
+        le=3600,
+    )
+
+    @field_validator("weather_pilot_station_ids", mode="before")
+    @classmethod
+    def _parse_pilot_stations(cls, v: object) -> list[str]:
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            return [str(x).strip().lower() for x in v if str(x).strip()]
+        return [p.strip().lower() for p in str(v).split(",") if p.strip()]
+
     metrics_enabled: bool = Field(default=False, validation_alias="METRICS_ENABLED")
     metrics_port: int = Field(
         default=9090,
@@ -193,6 +299,12 @@ class Settings(BaseSettings):
     wallet_address: str | None = Field(default=None, validation_alias="WALLET_ADDRESS")
     chain_id: int = Field(default=137, validation_alias="CHAIN_ID")
     rpc_url: str = Field(default="https://polygon-rpc.com", validation_alias="RPC_URL")
+
+    @property
+    def catalog_quote_horizon_hours(self) -> float:
+        """Lookahead for WS + REST enrich (expiring slice + weather forecast days)."""
+        weather_hours = float((self.weather_forecast_horizon_days + 1) * 24)
+        return min(168.0, max(self.catalog_expiring_hours, weather_hours))
 
     @property
     def catalog_db_path(self) -> Path:
