@@ -13,31 +13,36 @@ def print_harvest_table(
     *,
     hot_hours: float,
     min_net_pct: float,
+    order_usd: float,
 ) -> None:
     table = Table(
-        title=f"Harvest targets (HOT ≤{hot_hours:.0f}h · net ≥{min_net_pct * 100:.1f}%)"
+        title=(
+            f"Harvest · HOT ≤{hot_hours:.0f}h · net ≥{min_net_pct * 100:.1f}% · "
+            f"${order_usd:.0f} size"
+        )
     )
+    table.add_column("Ends", justify="right")
     table.add_column("Net%", justify="right")
     table.add_column("Side")
-    table.add_column("Price", justify="right")
-    table.add_column("Window", justify="right")
+    table.add_column("Ask", justify="right")
+    table.add_column("Fill$", justify="right")
+    table.add_column("Est$", justify="right")
     table.add_column("Domain")
-    table.add_column("Live")
-    table.add_column("Question", max_width=48)
+    table.add_column("Question", max_width=40)
 
     for o in opportunities:
-        live = "●" if o.is_live else ""
-        window = f"{o.hours_left:.1f}h"
-        if o.resolution_kind == "in_play" and o.is_live:
-            window = f"L {o.hours_left:.1f}h"
+        ends = f"{o.minutes_left:.0f}m"
+        if o.is_live:
+            ends = f"L{ends}"
         table.add_row(
+            ends,
             f"{o.net_yield_pct * 100:.2f}",
-            f"{o.side.upper()} {o.outcome_label[:12]}",
-            f"{o.price:.3f}",
-            window,
+            f"{o.side.upper()} {o.outcome_label[:10]}",
+            f"{o.ask:.3f}",
+            f"{o.fillable_usd:.0f}",
+            f"{o.est_profit_usd:.2f}",
             o.domain,
-            live,
-            (o.question[:45] + "…") if len(o.question) > 46 else o.question,
+            (o.question[:38] + "…") if len(o.question) > 39 else o.question,
         )
 
     Console().print(table)

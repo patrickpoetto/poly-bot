@@ -11,6 +11,7 @@ from sqlmodel import Session
 from poly_bot.catalog.expiring import list_expiring_markets
 from poly_bot.catalog.models import ExpiringMarket
 from poly_bot.harvest.pricing import buy_yield_pct, passes_harvest_price_band
+from poly_bot.harvest.quotes import SideQuote, refresh_side_quotes, side_quotes_from_db
 from poly_bot.settings import Settings
 
 
@@ -22,11 +23,17 @@ class HarvestOpportunity:
     domain: str
     side: Literal["yes", "no"]
     outcome_label: str
+    token_id: str
+    mid: float | None
+    ask: float
     price: float
     gross_yield_pct: float
     net_yield_pct: float
     fee_per_share: float
+    fillable_usd: float
+    est_profit_usd: float
     hours_left: float
+    minutes_left: float
     hours_to_kickoff: float | None
     window_end_ts: datetime
     resolution_kind: str
@@ -36,24 +43,40 @@ class HarvestOpportunity:
     event_title: str | None
 
 
-def _quote_age_s(m: ExpiringMarket, now: datetime) -> float | None:
-    if m.quote_updated_at is None:
-        return None
-    ts = m.quote_updated_at
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
-    return max(0.0, (now - ts.astimezone(UTC)).total_seconds())
+def _time_ok(
+    m: ExpiringMarket,
+    settings: Settings,
+    *,
+    hot_only: bool,
+    max_minutes_left: float | None,
+) -> bool:
+    if m.hours_left <= 0:
+        return False
+    if hot_only and m.hours_left > settings.catalog_quote_hot_hours:
+        return False
+    cap = max_minutes_left
+    if cap is None and settings.harvest_max_minutes_left > 0:
+        cap = settings.harvest_max_minutes_left
+    if cap is not None and cap > 0:
+        if m.hours_left * 60.0 > cap:
+            return False
+    return True
 
 
 def _evaluate_side(
     m: ExpiringMarket,
     *,
     side: Literal["yes", "no"],
-    price: float,
-    label: str,
+    sq: SideQuote,
     settings: Settings,
-    quote_age_s: float | None,
+    require_liquidity: bool,
 ) -> HarvestOpportunity | None:
+    price = sq.vwap_ask if sq.vwap_ask is not None else sq.ask
+    if price is None:
+        price = sq.mid
+    if price is None:
+        return None
+
     if not passes_harvest_price_band(
         price,
         min_buy_price=settings.harvest_min_buy_price,
@@ -68,33 +91,87 @@ def _evaluate_side(
         fee_schedule=m.fee_schedule,
         domain=m.domain,
         event_fees_enabled=m.event_fees_enabled,
-        event_fee_type=None,
-        event_fee_schedule=None,
     )
     if net < settings.harvest_min_net_yield_pct:
         return None
 
+    fillable = sq.fillable_usd
+    if fillable <= 0 and sq.ask is not None:
+        fillable = settings.harvest_order_usd
+    if require_liquidity and fillable < settings.harvest_min_fill_usd:
+        return None
+
+    order_usd = min(settings.harvest_order_usd, fillable)
+    est_profit = order_usd * net
     window_end = m.window_end_ts or m.end_ts
+    minutes_left = m.hours_left * 60.0
+
     return HarvestOpportunity(
         condition_id=m.condition_id,
         slug=m.slug,
         question=m.question,
         domain=m.domain,
         side=side,
-        outcome_label=label,
+        outcome_label=sq.outcome_label,
+        token_id=sq.token_id,
+        mid=sq.mid,
+        ask=price,
         price=price,
         gross_yield_pct=gross,
         net_yield_pct=net,
         fee_per_share=fee,
+        fillable_usd=fillable,
+        est_profit_usd=est_profit,
         hours_left=m.hours_left,
+        minutes_left=minutes_left,
         hours_to_kickoff=m.hours_to_kickoff,
         window_end_ts=window_end,
         resolution_kind=m.resolution_kind,
         is_live=m.is_live,
-        quote_age_s=quote_age_s,
+        quote_age_s=sq.quote_age_s,
         event_id=m.event_id,
         event_title=m.event_title,
     )
+
+
+def _collect_opportunities(
+    markets: list[ExpiringMarket],
+    side_quotes: dict[str, dict[str, SideQuote]],
+    settings: Settings,
+    *,
+    require_fresh_quotes: bool,
+    require_liquidity: bool,
+) -> list[HarvestOpportunity]:
+    max_age = settings.harvest_quote_max_age_seconds
+    out: list[HarvestOpportunity] = []
+
+    for m in markets:
+        quotes = side_quotes.get(m.condition_id, {})
+        for side in ("yes", "no"):
+            sq = quotes.get(side)
+            if sq is None:
+                continue
+            if require_fresh_quotes and max_age > 0:
+                if sq.quote_age_s is None or sq.quote_age_s > max_age:
+                    continue
+            opp = _evaluate_side(
+                m,
+                side=side,
+                sq=sq,
+                settings=settings,
+                require_liquidity=require_liquidity,
+            )
+            if opp is not None:
+                out.append(opp)
+
+    out.sort(
+        key=lambda o: (
+            o.window_end_ts,
+            -o.net_yield_pct,
+            o.condition_id,
+        )
+    )
+    return out
 
 
 def scan_harvest_opportunities(
@@ -103,48 +180,65 @@ def scan_harvest_opportunities(
     *,
     hours: float | None = None,
     hot_only: bool = True,
+    max_minutes_left: float | None = None,
     require_fresh_quotes: bool = True,
 ) -> list[HarvestOpportunity]:
-    """Markets in window whose Yes or No mid fits the harvest price band."""
+    """Sync scan using DB quotes (ask/mid from token_quotes)."""
     horizon = hours if hours is not None else settings.catalog_expiring_hours
     markets = list_expiring_markets(
         session,
         hours=horizon,
         sports_in_play_hours=settings.catalog_sports_in_play_hours,
     )
-    now = datetime.now(UTC)
-    hot_cutoff = settings.catalog_quote_hot_hours
-    max_quote_age = settings.harvest_quote_max_age_seconds
+    filtered = [
+        m
+        for m in markets
+        if _time_ok(m, settings, hot_only=hot_only, max_minutes_left=max_minutes_left)
+    ]
+    cids = [m.condition_id for m in filtered]
+    quotes = side_quotes_from_db(session, cids)
+    return _collect_opportunities(
+        filtered,
+        quotes,
+        settings,
+        require_fresh_quotes=require_fresh_quotes,
+        require_liquidity=False,
+    )
 
-    out: list[HarvestOpportunity] = []
-    for m in markets:
-        if m.hours_left <= 0:
-            continue
-        if hot_only and m.hours_left > hot_cutoff:
-            continue
 
-        quote_age = _quote_age_s(m, now)
-        if require_fresh_quotes and max_quote_age > 0:
-            if quote_age is None or quote_age > max_quote_age:
-                continue
-
-        sides: list[tuple[Literal["yes", "no"], float | None, str]] = [
-            ("yes", m.yes_mid, m.yes_label),
-            ("no", m.no_mid, m.no_label),
-        ]
-        for side, mid, label in sides:
-            if mid is None:
-                continue
-            opp = _evaluate_side(
-                m,
-                side=side,
-                price=mid,
-                label=label,
-                settings=settings,
-                quote_age_s=quote_age,
-            )
-            if opp is not None:
-                out.append(opp)
-
-    out.sort(key=lambda o: (-o.net_yield_pct, o.hours_left, o.condition_id))
-    return out
+async def scan_harvest_opportunities_live(
+    session: Session,
+    settings: Settings,
+    *,
+    hours: float | None = None,
+    hot_only: bool = True,
+    max_minutes_left: float | None = None,
+    require_fresh_quotes: bool = False,
+) -> list[HarvestOpportunity]:
+    """Live CLOB /book refresh for ask + fillable depth."""
+    horizon = hours if hours is not None else settings.catalog_expiring_hours
+    markets = list_expiring_markets(
+        session,
+        hours=horizon,
+        sports_in_play_hours=settings.catalog_sports_in_play_hours,
+    )
+    filtered = [
+        m
+        for m in markets
+        if _time_ok(m, settings, hot_only=hot_only, max_minutes_left=max_minutes_left)
+    ]
+    cids = [m.condition_id for m in filtered]
+    quotes = await refresh_side_quotes(
+        session,
+        settings,
+        condition_ids=cids,
+        order_usd=settings.harvest_order_usd,
+        max_price=settings.harvest_max_buy_price,
+    )
+    return _collect_opportunities(
+        filtered,
+        quotes,
+        settings,
+        require_fresh_quotes=require_fresh_quotes,
+        require_liquidity=True,
+    )

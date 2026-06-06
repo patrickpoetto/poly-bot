@@ -349,46 +349,113 @@ def harvest_scan(
         "--hot/--all-window",
         help="Only markets within CATALOG_QUOTE_HOT_HOURS of window end.",
     ),
+    minutes: float | None = typer.Option(
+        None,
+        "--minutes",
+        "-m",
+        help="Tighter time cap (overrides HOT hours when set).",
+    ),
     stale_ok: bool = typer.Option(
         False,
         "--stale-quotes",
-        help="Include opportunities even if quote age exceeds harvest limit.",
+        help="Require fresh DB quote age (live scan always uses CLOB).",
+    ),
+    db_only: bool = typer.Option(
+        False,
+        "--db-only",
+        help="Skip live CLOB /book refresh (faster, no depth check).",
+    ),
+    log: bool = typer.Option(
+        False,
+        "--log",
+        help="Append results to data/harvest_paper.jsonl.",
     ),
     limit: int = typer.Option(50, "--limit", "-n"),
 ) -> None:
-    """List Yes/No mids in harvest price band (98–99¢, net yield ≥ target)."""
-    settings, log = _bootstrap()
+    """Near-expiry outcomes with ask in 98–99¢ band and net yield ≥ target."""
+    settings, log_ = _bootstrap()
     from poly_bot.catalog.watch import CatalogWatch
     from poly_bot.harvest.display import print_harvest_table
-    from poly_bot.harvest.scan import scan_harvest_opportunities
+    from poly_bot.harvest.paper import append_paper_log
+    from poly_bot.harvest.scan import (
+        scan_harvest_opportunities,
+        scan_harvest_opportunities_live,
+    )
     from sqlmodel import Session
 
     watch = CatalogWatch(settings)
     watch.init_database()
     with Session(watch._engine) as session:
-        opps = scan_harvest_opportunities(
-            session,
-            settings,
-            hours=hours,
-            hot_only=hot_only,
-            require_fresh_quotes=not stale_ok,
-        )
+        if db_only:
+            opps = scan_harvest_opportunities(
+                session,
+                settings,
+                hours=hours,
+                hot_only=hot_only,
+                max_minutes_left=minutes,
+                require_fresh_quotes=not stale_ok,
+            )
+        else:
+            opps = asyncio.run(
+                scan_harvest_opportunities_live(
+                    session,
+                    settings,
+                    hours=hours,
+                    hot_only=hot_only,
+                    max_minutes_left=minutes,
+                    require_fresh_quotes=not stale_ok,
+                )
+            )
     shown = opps[:limit]
     print_harvest_table(
         shown,
         hot_hours=settings.catalog_quote_hot_hours,
         min_net_pct=settings.harvest_min_net_yield_pct,
+        order_usd=settings.harvest_order_usd,
     )
-    log.info(
+    if log and opps:
+        path = append_paper_log(settings, opps)
+        typer.echo(f"Logged {len(opps)} rows → {path}")
+    log_.info(
         "harvest_scan_done",
         total=len(opps),
         shown=len(shown),
         hot_only=hot_only,
+        live=not db_only,
     )
     typer.echo(
-        f"\n{len(opps)} opportunities"
-        + (f" (showing {len(shown)})" if len(shown) < len(opps) else "")
+        f"\n{len(opps)} opportunities (sorted by window end)"
+        + (f", showing {len(shown)}" if len(shown) < len(opps) else "")
     )
+
+
+@harvest_app.command("paper")
+def harvest_paper(limit: int = typer.Option(20, "--limit", "-n")) -> None:
+    """Show recent harvest scan log lines."""
+    settings, _log = _bootstrap()
+    from poly_bot.harvest.paper import read_paper_log
+    from rich.console import Console
+    from rich.table import Table
+
+    rows = read_paper_log(settings, limit=limit)
+    table = Table(title="Harvest paper log (recent)")
+    table.add_column("When")
+    table.add_column("Net%")
+    table.add_column("Ask")
+    table.add_column("Side")
+    table.add_column("Min")
+    table.add_column("Question", max_width=36)
+    for r in rows:
+        table.add_row(
+            str(r.get("scanned_at", ""))[:19],
+            str(r.get("net_yield_pct", "")),
+            str(r.get("ask", "")),
+            str(r.get("side", "")),
+            str(r.get("minutes_left", "")),
+            str(r.get("question", ""))[:36],
+        )
+    Console().print(table)
+    typer.echo(f"{len(rows)} lines")
 
 
 @app.command("run")

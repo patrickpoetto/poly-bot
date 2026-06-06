@@ -175,7 +175,31 @@ class Settings(BaseSettings):
         default=180.0,
         validation_alias="HARVEST_QUOTE_MAX_AGE_SECONDS",
         ge=0,
-        description="Ignore mids older than this in harvest scan (0 = no age filter)",
+        description="Ignore quotes older than this in harvest scan (0 = no age filter)",
+    )
+    harvest_max_minutes_left: float = Field(
+        default=0.0,
+        validation_alias="HARVEST_MAX_MINUTES_LEFT",
+        ge=0,
+        description="Optional tighter cap than HOT hours (0 = use catalog_quote_hot_hours only)",
+    )
+    harvest_order_usd: float = Field(
+        default=10.0,
+        validation_alias="HARVEST_ORDER_USD",
+        gt=0,
+        le=100_000,
+    )
+    harvest_min_fill_usd: float = Field(
+        default=9.5,
+        validation_alias="HARVEST_MIN_FILL_USD",
+        ge=0,
+        description="Min ask depth (USD) to include in live scan",
+    )
+    harvest_book_concurrency: int = Field(
+        default=20,
+        validation_alias="HARVEST_BOOK_CONCURRENCY",
+        ge=1,
+        le=100,
     )
 
     catalog_dashboard_host: str = Field(

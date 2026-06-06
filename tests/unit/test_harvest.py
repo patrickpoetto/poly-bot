@@ -7,8 +7,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlmodel import Session
 
-from poly_bot.catalog.models import ExpiringMarket
 from poly_bot.discovery.runner import DiscoveryRunner
+from poly_bot.harvest.liquidity import fillable_usd_at_ask
 from poly_bot.harvest.pricing import buy_yield_pct, passes_harvest_price_band
 from poly_bot.harvest.scan import scan_harvest_opportunities
 from poly_bot.persistence.schema import Market, Token, TokenQuote
@@ -28,12 +28,19 @@ def test_buy_yield_at_985_weather_fee() -> None:
     assert net < gross
 
 
+def test_fillable_usd_at_ask() -> None:
+    asks = [(0.985, 5.0), (0.990, 100.0)]
+    filled, vwap = fillable_usd_at_ask(asks, order_usd=10.0, max_price=0.995)
+    assert filled == pytest.approx(10.0, abs=0.01)
+    assert vwap == pytest.approx(0.9875, abs=0.001)
+
+
 def test_harvest_price_band() -> None:
     assert passes_harvest_price_band(0.985, min_buy_price=0.983, max_buy_price=0.995)
     assert not passes_harvest_price_band(0.90, min_buy_price=0.983, max_buy_price=0.995)
 
 
-def test_scan_finds_high_no_mid(settings) -> None:
+def test_scan_finds_high_no_ask(settings) -> None:
     runner = DiscoveryRunner(settings)
     runner.init_database()
     now = datetime.now(UTC)
@@ -41,6 +48,7 @@ def test_scan_finds_high_no_mid(settings) -> None:
     settings.harvest_min_buy_price = 0.97
     settings.catalog_quote_hot_hours = 6.0
     settings.harvest_quote_max_age_seconds = 0
+    settings.harvest_min_fill_usd = 0
 
     with Session(runner._engine) as session:
         session.add(
@@ -75,6 +83,7 @@ def test_scan_finds_high_no_mid(settings) -> None:
                 token_id="ht-yes",
                 condition_id="0xharv1",
                 mid=0.02,
+                ask=0.03,
                 updated_at=now,
             )
         )
@@ -83,6 +92,7 @@ def test_scan_finds_high_no_mid(settings) -> None:
                 token_id="ht-no",
                 condition_id="0xharv1",
                 mid=0.986,
+                ask=0.987,
                 updated_at=now,
             )
         )
@@ -97,4 +107,5 @@ def test_scan_finds_high_no_mid(settings) -> None:
         )
     assert len(opps) == 1
     assert opps[0].side == "no"
-    assert opps[0].price == pytest.approx(0.986)
+    assert opps[0].ask == pytest.approx(0.987)
+    assert opps[0].est_profit_usd > 0

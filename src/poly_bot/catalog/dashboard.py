@@ -134,13 +134,17 @@ def create_app(settings: Settings) -> FastAPI:
                 "domain": o.domain,
                 "side": o.side,
                 "outcome_label": o.outcome_label,
-                "price": o.price,
+                "token_id": o.token_id,
+                "ask": o.ask,
+                "mid": o.mid,
                 "net_yield_pct": round(o.net_yield_pct * 100, 3),
-                "gross_yield_pct": round(o.gross_yield_pct * 100, 3),
+                "fillable_usd": round(o.fillable_usd, 2),
+                "est_profit_usd": round(o.est_profit_usd, 3),
+                "minutes_left": round(o.minutes_left, 1),
+                "window_end_ts": o.window_end_ts.isoformat(),
                 "hours_left": o.hours_left,
                 "is_live": o.is_live,
                 "resolution_kind": o.resolution_kind,
-                "quote_age_s": o.quote_age_s,
             }
             for o in opps
         ]
@@ -1200,16 +1204,18 @@ def _render_harvest_page(settings: Settings, opps: list, *, hot_only: bool) -> s
         live = "LIVE" if o.is_live else ""
         rows.append(
             "<tr>"
+            f"<td class='num'>{o.minutes_left:.0f}m</td>"
             f"<td class='num'>{o.net_yield_pct * 100:.2f}%</td>"
-            f"<td>{html.escape(o.side.upper())} {html.escape(o.outcome_label[:16])}</td>"
-            f"<td class='num'>{o.price:.3f}</td>"
-            f"<td class='num'>{o.hours_left:.1f}h</td>"
+            f"<td>{html.escape(o.side.upper())} {html.escape(o.outcome_label[:14])}</td>"
+            f"<td class='num'>{o.ask:.3f}</td>"
+            f"<td class='num'>{o.fillable_usd:.0f}</td>"
+            f"<td class='num'>{o.est_profit_usd:.2f}</td>"
             f"<td>{html.escape(o.domain)}</td>"
             f"<td>{live}</td>"
-            f"<td>{html.escape(o.question[:90])}</td>"
+            f"<td>{html.escape(o.question[:80])}</td>"
             "</tr>"
         )
-    body = "\n".join(rows) if rows else "<tr><td colspan='7'>No priced opportunities in band.</td></tr>"
+    body = "\n".join(rows) if rows else "<tr><td colspan='9'>No priced opportunities in band.</td></tr>"
     alt = f"/harvest?hot_only={'false' if hot_only else 'true'}"
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -1227,13 +1233,13 @@ th {{ color: #8b9cb3; }}
 </style></head><body>
 <header>
   <h1 style="margin:0">Harvest targets</h1>
-  <p class="sub">{mode} · price {settings.harvest_min_buy_price:.3f}–{settings.harvest_max_buy_price:.3f} · net ≥ {min_pct:.1f}%</p>
-  <p><a href="/">Catalog</a> · <a href="{alt}">{'Show all window' if hot_only else 'HOT only'}</a></p>
+  <p class="sub">{mode} · ask {settings.harvest_min_buy_price:.3f}–{settings.harvest_max_buy_price:.3f} · net ≥ {min_pct:.1f}% · ${settings.harvest_order_usd:.0f} · sorted by window end</p>
+  <p><a href="/">Catalog</a> · <a href="{alt}">{'Show all window' if hot_only else 'HOT only'}</a> · CLI: <code>poly-bot harvest scan --log</code></p>
 </header>
 <table>
   <thead><tr>
-    <th class="num">Net%</th><th>Side</th><th class="num">Mid</th><th class="num">Window</th>
-    <th>Domain</th><th></th><th>Question</th>
+    <th class="num">Left</th><th class="num">Net%</th><th>Side</th><th class="num">Ask</th>
+    <th class="num">Fill$</th><th class="num">Est$</th><th>Domain</th><th></th><th>Question</th>
   </tr></thead>
   <tbody>{body}</tbody>
 </table>

@@ -87,30 +87,52 @@ class ClobPublicClient:
             self._merge_price_map(data, result, value_key="spread")
         return result
 
+    async def fetch_book(self, token_id: str) -> dict[str, Any] | None:
+        """Full order book for one token."""
+        async with self._client() as client:
+            try:
+                response = await client.get("/book", params={"token_id": token_id})
+                if response.status_code == 404:
+                    return None
+                response.raise_for_status()
+                data = response.json()
+                return data if isinstance(data, dict) else None
+            except httpx.HTTPError as exc:
+                logger.debug("clob_book_miss", token_id=token_id[:16], error=str(exc))
+        return None
+
     async def fetch_books_best(
         self, token_ids: list[str]
     ) -> dict[str, tuple[float | None, float | None]]:
-        """Fallback: best bid/ask per token via /book."""
+        """Best bid/ask per token via /book."""
         out: dict[str, tuple[float | None, float | None]] = {}
-        async with self._client() as client:
-            for tid in token_ids:
-                try:
-                    response = await client.get("/book", params={"token_id": tid})
-                    response.raise_for_status()
-                    data = response.json()
-                    bids = data.get("bids") or []
-                    asks = data.get("asks") or []
-                    best_bid = max(
-                        (float(b["price"]) for b in bids if b.get("price")),
-                        default=None,
-                    )
-                    best_ask = min(
-                        (float(a["price"]) for a in asks if a.get("price")),
-                        default=None,
-                    )
-                    out[tid] = (best_bid, best_ask)
-                except httpx.HTTPError:
-                    continue
+        for tid in token_ids:
+            data = await self.fetch_book(tid)
+            if not data:
+                continue
+            bids = self._book_levels(data.get("bids"))
+            asks = self._book_levels(data.get("asks"))
+            best_bid = bids[-1][0] if bids else None
+            best_ask = asks[0][0] if asks else None
+            out[tid] = (best_bid, best_ask)
+        return out
+
+    @staticmethod
+    def _book_levels(raw: object) -> list[tuple[float, float]]:
+        if not isinstance(raw, list):
+            return []
+        out: list[tuple[float, float]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                price = float(item.get("price") or 0)
+                size = float(item.get("size") or item.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+            if price > 0 and size > 0:
+                out.append((price, size))
+        out.sort(key=lambda x: x[0])
         return out
 
     @staticmethod
