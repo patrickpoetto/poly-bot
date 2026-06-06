@@ -3,6 +3,7 @@
 from datetime import UTC, datetime
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from poly_bot.persistence.schema import (
@@ -78,28 +79,42 @@ class CatalogRepository:
             self._session.add(series)
 
     def upsert_event(self, event: Event) -> None:
-        existing = self._session.get(Event, event.id)
         now = datetime.now(UTC)
-        if existing:
-            for field in (
-                "slug",
-                "title",
-                "series_id",
-                "start_ts",
-                "end_ts",
-                "game_start_ts",
-                "active",
-                "closed",
-                "tags_json",
-                "raw_payload",
-            ):
-                setattr(existing, field, getattr(event, field))
-            existing.last_seen_at = now
-            self._session.add(existing)
-        else:
-            event.first_seen_at = now
-            event.last_seen_at = now
-            self._session.add(event)
+        existing = self._session.get(Event, event.id)
+        if existing is not None:
+            self._apply_event_fields(existing, event, now)
+            return
+
+        event.first_seen_at = now
+        event.last_seen_at = now
+        try:
+            with self._session.begin_nested():
+                self._session.add(event)
+                self._session.flush()
+        except IntegrityError:
+            row = self._session.get(Event, event.id)
+            if row is None:
+                row = self._session.exec(select(Event).where(Event.id == event.id)).first()
+            if row is None:
+                raise
+            self._apply_event_fields(row, event, now)
+
+    @staticmethod
+    def _apply_event_fields(existing: Event, event: Event, now: datetime) -> None:
+        for field in (
+            "slug",
+            "title",
+            "series_id",
+            "start_ts",
+            "end_ts",
+            "game_start_ts",
+            "active",
+            "closed",
+            "tags_json",
+            "raw_payload",
+        ):
+            setattr(existing, field, getattr(event, field))
+        existing.last_seen_at = now
 
     def replace_market_tags(self, condition_id: str, tags: list[str]) -> None:
         for row in self._session.exec(

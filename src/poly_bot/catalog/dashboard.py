@@ -98,6 +98,53 @@ def create_app(settings: Settings) -> FastAPI:
             for e in group_expiring_by_event(markets)
         ]
 
+    @app.get("/harvest", response_class=HTMLResponse)
+    def harvest_page(
+        hot_only: bool = Query(default=True),
+    ) -> str:
+        from poly_bot.harvest.scan import scan_harvest_opportunities
+
+        with Session(get_engine(settings)) as session:
+            opps = scan_harvest_opportunities(
+                session,
+                settings,
+                hot_only=hot_only,
+                require_fresh_quotes=False,
+            )
+        return _render_harvest_page(settings, opps[:200], hot_only=hot_only)
+
+    @app.get("/api/harvest")
+    def api_harvest(
+        hot_only: bool = Query(default=True),
+    ) -> list[dict[str, object]]:
+        from poly_bot.harvest.scan import scan_harvest_opportunities
+
+        with Session(get_engine(settings)) as session:
+            opps = scan_harvest_opportunities(
+                session,
+                settings,
+                hot_only=hot_only,
+                require_fresh_quotes=False,
+            )
+        return [
+            {
+                "condition_id": o.condition_id,
+                "slug": o.slug,
+                "question": o.question,
+                "domain": o.domain,
+                "side": o.side,
+                "outcome_label": o.outcome_label,
+                "price": o.price,
+                "net_yield_pct": round(o.net_yield_pct * 100, 3),
+                "gross_yield_pct": round(o.gross_yield_pct * 100, 3),
+                "hours_left": o.hours_left,
+                "is_live": o.is_live,
+                "resolution_kind": o.resolution_kind,
+                "quote_age_s": o.quote_age_s,
+            }
+            for o in opps
+        ]
+
     @app.get("/health")
     def health() -> JSONResponse:
         return JSONResponse({"status": "ok"})
@@ -918,6 +965,7 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
   <nav class="tabs">
     <a href="/?{query}" class="{'active' if tab == 'markets' else ''}">Markets</a>
     <a href="/events?hours={hours}" class="{'active' if tab == 'events' else ''}">Events & fees</a>
+    <a href="/harvest">Harvest</a>
     <a href="/weather">Weather</a>
     <a href="/taxonomy">Taxonomy</a>
   </nav>
@@ -1077,7 +1125,12 @@ def _market_row(m: ExpiringMarket) -> str:
     spr = m.yes_spread if m.yes_spread is not None else m.no_spread
     kickoff = m.game_start_ts or m.end_ts
     if m.is_live:
-        status = f'<span class="tag" style="color:var(--green)">LIVE</span> {abs(m.hours_left):.1f}h'
+        status = (
+            f'<span class="tag" style="color:var(--green)">LIVE</span> '
+            f"{m.hours_left:.1f}h window"
+        )
+    elif m.resolution_kind == "in_play" and m.hours_to_kickoff is not None:
+        status = f"{m.hours_to_kickoff:.1f}h kick · {m.hours_left:.1f}h window"
     elif m.hours_left < 1:
         status = f'<span class="urgent">{m.hours_left:.1f}h</span>'
     else:
@@ -1135,6 +1188,58 @@ def _fmt_vol(v: float | None) -> str:
     return f"{v:.0f}"
 
 
+def _render_harvest_page(settings: Settings, opps: list, *, hot_only: bool) -> str:
+    from poly_bot.harvest.scan import HarvestOpportunity
+
+    hot = settings.catalog_quote_hot_hours
+    min_pct = settings.harvest_min_net_yield_pct * 100
+    mode = f"HOT ≤{hot:.0f}h" if hot_only else "full window"
+    rows = []
+    for o in opps:
+        assert isinstance(o, HarvestOpportunity)
+        live = "LIVE" if o.is_live else ""
+        rows.append(
+            "<tr>"
+            f"<td class='num'>{o.net_yield_pct * 100:.2f}%</td>"
+            f"<td>{html.escape(o.side.upper())} {html.escape(o.outcome_label[:16])}</td>"
+            f"<td class='num'>{o.price:.3f}</td>"
+            f"<td class='num'>{o.hours_left:.1f}h</td>"
+            f"<td>{html.escape(o.domain)}</td>"
+            f"<td>{live}</td>"
+            f"<td>{html.escape(o.question[:90])}</td>"
+            "</tr>"
+        )
+    body = "\n".join(rows) if rows else "<tr><td colspan='7'>No priced opportunities in band.</td></tr>"
+    alt = f"/harvest?hot_only={'false' if hot_only else 'true'}"
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Harvest · poly_bot</title>
+<style>
+body {{ font-family: system-ui, sans-serif; background: #0a0e14; color: #e8eef7; margin: 0; padding: 1rem 1.25rem; }}
+a {{ color: #6eb6ff; }}
+header {{ margin-bottom: 1rem; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; }}
+th, td {{ border-bottom: 1px solid #243044; padding: 0.45rem 0.5rem; text-align: left; }}
+th {{ color: #8b9cb3; }}
+.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+.sub {{ color: #8b9cb3; font-size: 0.9rem; }}
+</style></head><body>
+<header>
+  <h1 style="margin:0">Harvest targets</h1>
+  <p class="sub">{mode} · price {settings.harvest_min_buy_price:.3f}–{settings.harvest_max_buy_price:.3f} · net ≥ {min_pct:.1f}%</p>
+  <p><a href="/">Catalog</a> · <a href="{alt}">{'Show all window' if hot_only else 'HOT only'}</a></p>
+</header>
+<table>
+  <thead><tr>
+    <th class="num">Net%</th><th>Side</th><th class="num">Mid</th><th class="num">Window</th>
+    <th>Domain</th><th></th><th>Question</th>
+  </tr></thead>
+  <tbody>{body}</tbody>
+</table>
+</body></html>"""
+
+
 def _market_json(m: ExpiringMarket) -> dict[str, object]:
     mid = m.yes_mid if m.yes_mid is not None else m.no_mid
     summary = fee_summary(
@@ -1152,7 +1257,11 @@ def _market_json(m: ExpiringMarket) -> dict[str, object]:
         "question": m.question,
         "domain": m.domain,
         "end_ts": m.end_ts.isoformat(),
+        "window_end_ts": m.window_end_ts.isoformat() if m.window_end_ts else None,
+        "resolution_kind": m.resolution_kind,
+        "hours_to_kickoff": m.hours_to_kickoff,
         "hours_left": m.hours_left,
+        "is_live": m.is_live,
         "yes_mid": m.yes_mid,
         "no_mid": m.no_mid,
         "open_interest": m.open_interest,

@@ -85,11 +85,19 @@ class Settings(BaseSettings):
         gt=0,
         le=168,
     )
+    catalog_quote_hot_hours: float = Field(
+        default=2.0,
+        validation_alias="CATALOG_QUOTE_HOT_HOURS",
+        gt=0,
+        le=48,
+        description="Harvest + live quote refresh: markets within this many hours of window end",
+    )
     catalog_sports_in_play_hours: float = Field(
         default=4.0,
         validation_alias="CATALOG_SPORTS_IN_PLAY_HOURS",
         ge=0.5,
         le=48,
+        description="Sports stay in catalog window this long after kickoff (certainty harvest)",
     )
     catalog_enrich_interval_seconds: float = Field(
         default=60.0,
@@ -142,6 +150,34 @@ class Settings(BaseSettings):
         validation_alias="CATALOG_ENRICH_STALE_SECONDS",
         ge=5,
     )
+
+    # Certainty harvest (near-resolution buys at 98–99¢)
+    harvest_min_net_yield_pct: float = Field(
+        default=0.012,
+        validation_alias="HARVEST_MIN_NET_YIELD_PCT",
+        gt=0,
+        le=0.5,
+        description="Minimum net return after taker fee (0.012 = 1.2%)",
+    )
+    harvest_min_buy_price: float = Field(
+        default=0.983,
+        validation_alias="HARVEST_MIN_BUY_PRICE",
+        gt=0.5,
+        lt=1.0,
+    )
+    harvest_max_buy_price: float = Field(
+        default=0.995,
+        validation_alias="HARVEST_MAX_BUY_PRICE",
+        gt=0.5,
+        le=1.0,
+    )
+    harvest_quote_max_age_seconds: float = Field(
+        default=180.0,
+        validation_alias="HARVEST_QUOTE_MAX_AGE_SECONDS",
+        ge=0,
+        description="Ignore mids older than this in harvest scan (0 = no age filter)",
+    )
+
     catalog_dashboard_host: str = Field(
         default="127.0.0.1",
         validation_alias="CATALOG_DASHBOARD_HOST",

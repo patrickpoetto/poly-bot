@@ -21,7 +21,12 @@ def catalog_window_filter(
     end_expr: str = "COALESCE(m.end_ts, e.end_ts)",
     kickoff_expr: str = "COALESCE(m.game_start_ts, e.game_start_ts, m.end_ts, e.end_ts)",
 ) -> str:
-    """Markets in the live catalog window (pre-match end_ts OR sports in-play)."""
+    """Markets in the live catalog window.
+
+    Non-sports: ``end_ts`` in (now, now+hours].
+    Sports pre-match: kickoff in (now, now+hours].
+    Sports in-play: kickoff was within the last ``sports_in_play_hours`` (default 4h).
+    """
     standard = end_ts_in_window(dialect_name, end_expr=end_expr)
     if is_sqlite(dialect_name):
         sports_pre = (

@@ -17,10 +17,12 @@ app = typer.Typer(
 )
 discovery_app = typer.Typer(help="Market catalog discovery engine.")
 catalog_app = typer.Typer(help="Live catalog — expiring window, quotes, dashboard.")
+harvest_app = typer.Typer(help="Near-resolution harvest — priced outcomes in expiring window.")
 ops_app = typer.Typer(help="Operations — migrate, backup, reconciliation.")
 weather_app = typer.Typer(help="Daily temperature markets — stations, events, bins.")
 app.add_typer(discovery_app, name="discovery")
 app.add_typer(catalog_app, name="catalog")
+app.add_typer(harvest_app, name="harvest")
 app.add_typer(ops_app, name="ops")
 app.add_typer(weather_app, name="weather")
 
@@ -332,6 +334,61 @@ def catalog_events(
         )
     Console().print(table)
     typer.echo(f"Total events: {len(group_expiring_by_event(markets))}")
+
+
+@harvest_app.command("scan")
+def harvest_scan(
+    hours: float | None = typer.Option(
+        None,
+        "--hours",
+        "-h",
+        help="Expiring window (default: CATALOG_EXPIRING_HOURS).",
+    ),
+    hot_only: bool = typer.Option(
+        True,
+        "--hot/--all-window",
+        help="Only markets within CATALOG_QUOTE_HOT_HOURS of window end.",
+    ),
+    stale_ok: bool = typer.Option(
+        False,
+        "--stale-quotes",
+        help="Include opportunities even if quote age exceeds harvest limit.",
+    ),
+    limit: int = typer.Option(50, "--limit", "-n"),
+) -> None:
+    """List Yes/No mids in harvest price band (98–99¢, net yield ≥ target)."""
+    settings, log = _bootstrap()
+    from poly_bot.catalog.watch import CatalogWatch
+    from poly_bot.harvest.display import print_harvest_table
+    from poly_bot.harvest.scan import scan_harvest_opportunities
+    from sqlmodel import Session
+
+    watch = CatalogWatch(settings)
+    watch.init_database()
+    with Session(watch._engine) as session:
+        opps = scan_harvest_opportunities(
+            session,
+            settings,
+            hours=hours,
+            hot_only=hot_only,
+            require_fresh_quotes=not stale_ok,
+        )
+    shown = opps[:limit]
+    print_harvest_table(
+        shown,
+        hot_hours=settings.catalog_quote_hot_hours,
+        min_net_pct=settings.harvest_min_net_yield_pct,
+    )
+    log.info(
+        "harvest_scan_done",
+        total=len(opps),
+        shown=len(shown),
+        hot_only=hot_only,
+    )
+    typer.echo(
+        f"\n{len(opps)} opportunities"
+        + (f" (showing {len(shown)})" if len(shown) < len(opps) else "")
+    )
 
 
 @app.command("run")

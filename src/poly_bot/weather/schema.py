@@ -62,7 +62,7 @@ class WeatherDailyEvent(SQLModel, table=True):
     event_slug: str = Field(index=True)
     city_key: str = Field(foreign_key="weather_cities.city_key", index=True)
     station_id: str = Field(foreign_key="weather_stations.id", index=True)
-    forecast_date: date = Field(index=True)
+    forecast_date: date = Field()
     days_ahead: int = Field(
         default=0,
         description="Days from sync-day UTC to forecast_date",

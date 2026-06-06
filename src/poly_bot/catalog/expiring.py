@@ -95,14 +95,28 @@ def list_expiring_markets(
     for row in rows:
         end_ts = _parse_dt(row[6])
         kickoff_ts = _parse_dt(row[7])
+        domain = str(row[3] or "unknown")
         if end_ts is None and kickoff_ts is None:
             continue
-        domain = str(row[3] or "unknown")
-        reference = kickoff_ts if domain == "sports" and kickoff_ts else end_ts
-        if reference is None:
-            continue
-        hours_left = (reference - now).total_seconds() / 3600.0
-        is_live = domain == "sports" and kickoff_ts is not None and kickoff_ts <= now
+        effective_kickoff = kickoff_ts
+        if domain == "sports" and effective_kickoff is None and end_ts is not None:
+            effective_kickoff = end_ts
+        is_sports_in_play = domain == "sports" and effective_kickoff is not None
+        is_live = is_sports_in_play and effective_kickoff <= now
+        resolution_kind = "in_play" if is_sports_in_play else "fixed"
+        hours_to_kickoff: float | None = None
+        if is_sports_in_play:
+            assert effective_kickoff is not None
+            window_end = effective_kickoff + timedelta(hours=sports_in_play_hours)
+            hours_left = (window_end - now).total_seconds() / 3600.0
+            if effective_kickoff > now:
+                hours_to_kickoff = (effective_kickoff - now).total_seconds() / 3600.0
+            display_end = end_ts or effective_kickoff
+        else:
+            window_end = end_ts or kickoff_ts
+            assert window_end is not None
+            hours_left = (window_end - now).total_seconds() / 3600.0
+            display_end = window_end
         cid = str(row[0])
         result.append(
             ExpiringMarket(
@@ -112,9 +126,14 @@ def list_expiring_markets(
                 domain=domain,
                 structure=str(row[4] or "unknown"),
                 recurrence=str(row[5] or "one_off"),
-                end_ts=end_ts or kickoff_ts,
-                game_start_ts=kickoff_ts,
+                end_ts=display_end,
+                game_start_ts=effective_kickoff if is_sports_in_play else kickoff_ts,
                 is_live=is_live,
+                resolution_kind=resolution_kind,
+                window_end_ts=window_end,
+                hours_to_kickoff=round(hours_to_kickoff, 2)
+                if hours_to_kickoff is not None
+                else None,
                 hours_left=round(hours_left, 2),
                 event_id=str(row[8]) if row[8] else None,
                 event_title=str(row[9]) if row[9] else None,

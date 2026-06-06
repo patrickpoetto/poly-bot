@@ -19,6 +19,9 @@ class ExpiringMarket(BaseModel):
     end_ts: datetime
     game_start_ts: datetime | None = None
     is_live: bool = False
+    resolution_kind: str = "fixed"
+    window_end_ts: datetime | None = None
+    hours_to_kickoff: float | None = None
     hours_left: float
     event_id: str | None
     event_title: str | None
