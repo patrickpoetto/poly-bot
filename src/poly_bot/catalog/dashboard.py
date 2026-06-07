@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import json
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
+import structlog
 from fastapi import FastAPI, Form, HTTPException, Query
 from fastapi.responses import (
     HTMLResponse,
@@ -31,10 +33,68 @@ from poly_bot.persistence.db import get_engine, init_db
 from poly_bot.persistence.schema import Market
 from poly_bot.settings import Settings
 
+logger: structlog.stdlib.BoundLogger = structlog.get_logger()
 
-def create_app(settings: Settings) -> FastAPI:
+
+async def _discovery_background(settings: Settings) -> None:
+    """Discovery scheduler — runs forever with configured intervals."""
+    from poly_bot.discovery.scheduler import DiscoveryScheduler
+
+    sched = DiscoveryScheduler(settings)
+    sched.init_database()
+    await sched.run_forever()
+
+
+async def _enrich_background(settings: Settings) -> None:
+    """Enrich quotes for the lookahead window on a fixed interval."""
+    from poly_bot.catalog.enricher import CatalogEnricher
+
+    interval = settings.catalog_enrich_interval_seconds
+    while True:
+        try:
+            with Session(get_engine(settings)) as session:
+                enricher = CatalogEnricher(settings, session)
+                stats = await enricher.enrich_expiring_window(hours=48, force=False)
+                logger.debug("dashboard_enrich_done", **stats)
+        except Exception:
+            logger.exception("dashboard_enrich_failed")
+        await asyncio.sleep(interval)
+
+
+async def _reconcile_background(settings: Settings) -> None:
+    """Close expired markets — runs every hour."""
+    from poly_bot.ops.reconcile_scheduler import run_reconcile_loop
+
+    await run_reconcile_loop(get_engine(settings), interval_seconds=3600)
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI, settings: Settings):  # type: ignore[misc]
+    tasks = [
+        asyncio.create_task(_discovery_background(settings), name="discovery"),
+        asyncio.create_task(_enrich_background(settings), name="enrich"),
+        asyncio.create_task(_reconcile_background(settings), name="reconcile"),
+    ]
+    logger.info("dashboard_background_started", tasks=[t.get_name() for t in tasks])
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("dashboard_background_stopped")
+
+
+def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
     init_db(get_engine(settings))
-    app = FastAPI(title="poly_bot catalog", version="0.2.0")
+    lifespan = (
+        contextlib.asynccontextmanager(
+            lambda app: _lifespan(app, settings)  # type: ignore[arg-type]
+        )
+        if background
+        else None
+    )
+    app = FastAPI(title="poly_bot catalog", version="0.2.0", lifespan=lifespan)
 
     static_dir = Path(__file__).resolve().parent / "static"
     if static_dir.is_dir():
@@ -2129,10 +2189,10 @@ def run_dashboard(settings: Settings) -> None:
     except ImportError as exc:
         raise SystemExit("Install dashboard extras: pip install -e '.[dashboard]'") from exc
 
-    app = create_app(settings)
+    app = create_app(settings, background=True)
     uvicorn.run(
         app,
         host=settings.catalog_dashboard_host,
         port=settings.catalog_dashboard_port,
-        log_level="info",
+        log_level="warning",
     )
