@@ -30,7 +30,7 @@ postgres = [
     "alembic>=1.14.0",
 ]
 production = [
-    "poly-bot[postgres,dashboard]",
+    "poly-bot[postgres,dashboard,trading]",
     "prometheus-client>=0.21.0",
 ]
 dev = [
