@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import structlog
-from sqlalchemy import func
 from sqlmodel import Session, select
 
 from poly_bot.catalog.taxonomy import TaxonomyOverrideStore

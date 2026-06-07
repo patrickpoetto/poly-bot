@@ -102,9 +102,10 @@ def list_expiring_markets(
         if domain == "sports" and effective_kickoff is None and end_ts is not None:
             effective_kickoff = end_ts
         is_sports_in_play = domain == "sports" and effective_kickoff is not None
-        is_live = is_sports_in_play and effective_kickoff <= now
+        is_live = is_sports_in_play and effective_kickoff is not None and effective_kickoff <= now
         resolution_kind = "in_play" if is_sports_in_play else "fixed"
         hours_to_kickoff: float | None = None
+        window_end: datetime | None = None
         if is_sports_in_play:
             assert effective_kickoff is not None
             window_end = effective_kickoff + timedelta(hours=sports_in_play_hours)
@@ -113,7 +114,7 @@ def list_expiring_markets(
                 hours_to_kickoff = (effective_kickoff - now).total_seconds() / 3600.0
             display_end = end_ts or effective_kickoff
         else:
-            window_end = end_ts or kickoff_ts
+            window_end = end_ts if end_ts is not None else kickoff_ts
             assert window_end is not None
             hours_left = (window_end - now).total_seconds() / 3600.0
             display_end = window_end
@@ -225,9 +226,7 @@ def _conditions_with_tokens(session: Session, condition_ids: list[str]) -> set[s
         return set()
     placeholders, params = _in_params(condition_ids)
     rows = session.execute(
-        text(
-            f"SELECT DISTINCT condition_id FROM tokens WHERE condition_id IN ({placeholders})"
-        ),
+        text(f"SELECT DISTINCT condition_id FROM tokens WHERE condition_id IN ({placeholders})"),
         params,
     ).fetchall()
     return {str(r[0]) for r in rows}
@@ -321,10 +320,7 @@ def _load_tags(session: Session, condition_ids: list[str]) -> dict[str, list[str
         return {}
     placeholders, params = _in_params(condition_ids)
     rows = session.execute(
-        text(
-            f"SELECT condition_id, tag FROM market_tags "
-            f"WHERE condition_id IN ({placeholders})"
-        ),
+        text(f"SELECT condition_id, tag FROM market_tags WHERE condition_id IN ({placeholders})"),
         params,
     ).fetchall()
     out: dict[str, list[str]] = {}

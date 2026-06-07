@@ -17,8 +17,8 @@ def print_harvest_table(
 ) -> None:
     table = Table(
         title=(
-            f"Harvest · HOT ≤{hot_hours:.0f}h · net ≥{min_net_pct * 100:.1f}% · "
-            f"${order_usd:.0f} size"
+            f"Harvest · HOT ≤{hot_hours:.0f}h (sports from kickoff) · "
+            f"net ≥{min_net_pct * 100:.1f}% · ${order_usd:.0f} size"
         )
     )
     table.add_column("Ends", justify="right")

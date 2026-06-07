@@ -49,10 +49,13 @@ def test_weather_from_question_when_tags_missing() -> None:
 def test_weather_slug_hint() -> None:
     from poly_bot.discovery.classifier.rules import classify_domain_from_text
 
-    assert classify_domain_from_text(
-        slug="highest-temperature-nyc-2026-05-28",
-        question="NYC high temp",
-    ) == "weather"
+    assert (
+        classify_domain_from_text(
+            slug="highest-temperature-nyc-2026-05-28",
+            question="NYC high temp",
+        )
+        == "weather"
+    )
 
 
 def test_liquidity_tier_from_volume() -> None:

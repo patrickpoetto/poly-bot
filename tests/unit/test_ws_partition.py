@@ -38,6 +38,4 @@ def test_partition_max_shards_cap() -> None:
 def test_partition_is_stable_for_sorted_input() -> None:
     a = ["b", "a", "c", "d"]
     b = ["d", "c", "b", "a"]
-    assert _partition(a, shard_size=2, max_shards=4) == _partition(
-        b, shard_size=2, max_shards=4
-    )
+    assert _partition(a, shard_size=2, max_shards=4) == _partition(b, shard_size=2, max_shards=4)

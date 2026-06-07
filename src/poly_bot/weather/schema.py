@@ -85,9 +85,7 @@ class WeatherBin(SQLModel, table=True):
     """One binary market = one temperature outcome band for a daily event."""
 
     __tablename__ = "weather_bins"
-    __table_args__ = (
-        Index("ix_weather_bins_event_index", "weather_event_id", "bin_index"),
-    )
+    __table_args__ = (Index("ix_weather_bins_event_index", "weather_event_id", "bin_index"),)
 
     condition_id: str = Field(primary_key=True, foreign_key="markets.condition_id")
     weather_event_id: str = Field(foreign_key="weather_daily_events.id", index=True)
@@ -121,9 +119,7 @@ class WeatherStationWuSnapshot(SQLModel, table=True):
     """Latest Wunderground station reading for a market local day (resolution link)."""
 
     __tablename__ = "weather_station_wu_snapshots"
-    __table_args__ = (
-        Index("ix_weather_wu_snap_forecast_date", "forecast_date"),
-    )
+    __table_args__ = (Index("ix_weather_wu_snap_forecast_date", "forecast_date"),)
 
     station_id: str = Field(foreign_key="weather_stations.id", primary_key=True)
     forecast_date: date = Field(primary_key=True)

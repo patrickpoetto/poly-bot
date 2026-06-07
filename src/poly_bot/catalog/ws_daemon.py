@@ -219,9 +219,7 @@ class PersistentWSDaemon:
         self._engine = get_engine(settings)
         self._hours = hours if hours is not None else settings.catalog_quote_horizon_hours
         self._refresh_seconds = (
-            refresh_seconds
-            if refresh_seconds is not None
-            else settings.catalog_ws_refresh_seconds
+            refresh_seconds if refresh_seconds is not None else settings.catalog_ws_refresh_seconds
         )
         self._stop = asyncio.Event()
         self._shards: list[_ShardConnection] = []

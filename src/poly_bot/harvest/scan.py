@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Literal
 
 from sqlmodel import Session
 
 from poly_bot.catalog.expiring import list_expiring_markets
 from poly_bot.catalog.models import ExpiringMarket
+from poly_bot.catalog.time_window import in_hot_window
+from poly_bot.harvest.book_sanity import (
+    book_sanity_reject_reason,
+    max_bid_ask_spread_for_domain,
+)
 from poly_bot.harvest.pricing import buy_yield_pct, passes_harvest_price_band
 from poly_bot.harvest.quotes import SideQuote, refresh_side_quotes, side_quotes_from_db
 from poly_bot.settings import Settings
@@ -52,7 +57,7 @@ def _time_ok(
 ) -> bool:
     if m.hours_left <= 0:
         return False
-    if hot_only and m.hours_left > settings.catalog_quote_hot_hours:
+    if hot_only and not in_hot_window(m, settings):
         return False
     cap = max_minutes_left
     if cap is None and settings.harvest_max_minutes_left > 0:
@@ -68,8 +73,10 @@ def _evaluate_side(
     *,
     side: Literal["yes", "no"],
     sq: SideQuote,
+    other_sq: SideQuote | None,
     settings: Settings,
     require_liquidity: bool,
+    require_book_sanity: bool,
 ) -> HarvestOpportunity | None:
     price = sq.vwap_ask if sq.vwap_ask is not None else sq.ask
     if price is None:
@@ -84,6 +91,23 @@ def _evaluate_side(
     ):
         return None
 
+    if require_book_sanity:
+        if not sq.book_fetched or sq.ask is None:
+            return None
+        max_book_age = settings.harvest_max_book_age_seconds
+        if max_book_age > 0:
+            if sq.book_age_s is None or sq.book_age_s > max_book_age:
+                return None
+        sanity = book_sanity_reject_reason(
+            ask=price,
+            bid=sq.bid,
+            other_bid=other_sq.bid if other_sq else None,
+            max_bid_ask_spread=max_bid_ask_spread_for_domain(settings, m.domain),
+            max_complement_sum=settings.harvest_max_complement_sum,
+        )
+        if sanity is not None:
+            return None
+
     gross, net, fee = buy_yield_pct(
         price,
         fees_enabled=m.fees_enabled,
@@ -96,7 +120,7 @@ def _evaluate_side(
         return None
 
     fillable = sq.fillable_usd
-    if fillable <= 0 and sq.ask is not None:
+    if fillable <= 0 and price is not None and not require_book_sanity:
         fillable = settings.harvest_order_usd
     if require_liquidity and fillable < settings.harvest_min_fill_usd:
         return None
@@ -141,6 +165,7 @@ def _collect_opportunities(
     *,
     require_fresh_quotes: bool,
     require_liquidity: bool,
+    require_book_sanity: bool,
 ) -> list[HarvestOpportunity]:
     max_age = settings.harvest_quote_max_age_seconds
     out: list[HarvestOpportunity] = []
@@ -154,12 +179,15 @@ def _collect_opportunities(
             if require_fresh_quotes and max_age > 0:
                 if sq.quote_age_s is None or sq.quote_age_s > max_age:
                     continue
+            other = quotes.get("no" if side == "yes" else "yes")
             opp = _evaluate_side(
                 m,
                 side=side,
                 sq=sq,
+                other_sq=other,
                 settings=settings,
                 require_liquidity=require_liquidity,
+                require_book_sanity=require_book_sanity,
             )
             if opp is not None:
                 out.append(opp)
@@ -203,6 +231,7 @@ def scan_harvest_opportunities(
         settings,
         require_fresh_quotes=require_fresh_quotes,
         require_liquidity=False,
+        require_book_sanity=False,
     )
 
 
@@ -241,4 +270,5 @@ async def scan_harvest_opportunities_live(
         settings,
         require_fresh_quotes=require_fresh_quotes,
         require_liquidity=True,
+        require_book_sanity=True,
     )

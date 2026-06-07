@@ -12,8 +12,12 @@ import structlog
 
 from poly_bot.settings import Settings
 from poly_bot.weather.market_window import market_day_window_utc
-from poly_bot.weather.temperature import api_value_to_celsius, local_hour_label, round_c_for_resolution
 from poly_bot.weather.schema import WeatherStation
+from poly_bot.weather.temperature import (
+    api_value_to_celsius,
+    local_hour_label,
+    round_c_for_resolution,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -131,9 +135,13 @@ def _pick_day_from_arrays(
         if _date_from_local_iso(vt) != target:
             continue
         if i < len(temps_max) and temps_max[i] is not None:
-            tmax = round_c_for_resolution(api_value_to_celsius(float(temps_max[i]), api_units=api_units))
+            tmax = round_c_for_resolution(
+                api_value_to_celsius(float(temps_max[i]), api_units=api_units)
+            )
         if temps_min and i < len(temps_min) and temps_min[i] is not None:
-            tmin = round_c_for_resolution(api_value_to_celsius(float(temps_min[i]), api_units=api_units))
+            tmin = round_c_for_resolution(
+                api_value_to_celsius(float(temps_min[i]), api_units=api_units)
+            )
         break
     return tmax, tmin
 
@@ -243,8 +251,12 @@ async def fetch_day_tmax(
             )
             tmax, tmin = _pick_day_from_arrays(
                 valid_times=list(daily.get("validTimeLocal") or []),
-                temps_max=list(daily.get("calendarDayTemperatureMax") or daily.get("temperatureMax") or []),
-                temps_min=list(daily.get("calendarDayTemperatureMin") or daily.get("temperatureMin") or []),
+                temps_max=list(
+                    daily.get("calendarDayTemperatureMax") or daily.get("temperatureMax") or []
+                ),
+                temps_min=list(
+                    daily.get("calendarDayTemperatureMin") or daily.get("temperatureMin") or []
+                ),
                 target=forecast_date,
                 api_units=api_units,
             )
@@ -262,7 +274,9 @@ async def fetch_day_tmax(
         api_units=api_units,
         geocode=geocode,
     )
-    return WuDayForecast(tmax_c=tmax, tmin_c=tmin, tmax_hours_local=hours, source=source or "missing")
+    return WuDayForecast(
+        tmax_c=tmax, tmin_c=tmin, tmax_hours_local=hours, source=source or "missing"
+    )
 
 
 async def _hourly_tmax_hours(
@@ -343,9 +357,7 @@ async def fetch_station_reading(
     async def _run(c: httpx.AsyncClient) -> WuStationReading:
         key = api_key or await resolve_wu_api_key(c, settings, cache=cache)
         current = await fetch_current_c(c, settings, station, api_key=key)
-        day = await fetch_day_tmax(
-            c, settings, station, api_key=key, forecast_date=forecast_date
-        )
+        day = await fetch_day_tmax(c, settings, station, api_key=key, forecast_date=forecast_date)
         return WuStationReading(current_temp_c=current, day=day)
 
     try:

@@ -31,9 +31,10 @@ class ClobPublicClient:
 
     @retry(
         retry=retry_if_exception(
-            lambda exc: isinstance(exc, httpx.HTTPStatusError)
-            and exc.response.status_code == 429
-            or isinstance(exc, httpx.TransportError)
+            lambda exc: (
+                (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429)
+                or isinstance(exc, httpx.TransportError)
+            )
         ),
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=1, min=1, max=20),

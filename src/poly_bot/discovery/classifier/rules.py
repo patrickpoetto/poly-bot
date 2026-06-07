@@ -139,7 +139,9 @@ def classify_liquidity_tier(
                 break
     liq = liquidity_usd
     if liq is None:
-        liq = _float_or_none(raw.get("liquidityNum") or raw.get("liquidityClob") or raw.get("liquidity"))
+        liq = _float_or_none(
+            raw.get("liquidityNum") or raw.get("liquidityClob") or raw.get("liquidity")
+        )
     score = max(vol or 0.0, liq or 0.0)
     if score >= 1_000_000:
         return "high"
@@ -200,17 +202,11 @@ def classify_market(
         resolution_source = "chainlink"
     elif domain == "sports":
         resolution_source = "sports_api"
-    elif domain == "weather":
-        resolution_source = "uma"
-    elif domain == "politics":
+    elif domain == "weather" or domain == "politics":
         resolution_source = "uma"
 
     if overrides is not None:
-        cid = (
-            raw.get("conditionId")
-            or raw.get("condition_id")
-            or raw.get("id")
-        )
+        cid = raw.get("conditionId") or raw.get("condition_id") or raw.get("id")
         hit = overrides.lookup(
             condition_id=str(cid) if cid else None,
             slug=slug,

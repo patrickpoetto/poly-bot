@@ -11,16 +11,16 @@ from poly_bot.persistence.schema import TokenQuote
 from poly_bot.settings import Settings
 from poly_bot.weather.dashboard_views import BinTick, WeatherCityRow, load_bin_ticks, load_city_rows
 from poly_bot.weather.forecast_views import load_forecast_context_for_rows
-from poly_bot.weather.quotes import refresh_event_quotes_from_clob
-from poly_bot.weather.schema import WeatherStationWuSnapshot
-from poly_bot.weather.station_sync import latest_wu_sync_time
-from poly_bot.weather.temperature import format_temp_pair
 from poly_bot.weather.market_window import (
     country_flag_emoji,
     days_ahead_of_today,
     format_days_ahead_label,
     market_day_window_utc,
 )
+from poly_bot.weather.quotes import refresh_event_quotes_from_clob
+from poly_bot.weather.schema import WeatherStationWuSnapshot
+from poly_bot.weather.station_sync import latest_wu_sync_time
+from poly_bot.weather.temperature import format_temp_pair
 
 
 def _utc_dt(dt: datetime | None) -> datetime | None:
@@ -34,11 +34,7 @@ def _utc_dt(dt: datetime | None) -> datetime | None:
 
 def _quote_health(session: Session, rows: list[WeatherCityRow]) -> dict[str, object]:
     token_ids = [
-        tid
-        for row in rows
-        for b in row.bins
-        for tid in (b.yes_token_id, b.no_token_id)
-        if tid
+        tid for row in rows for b in row.bins for tid in (b.yes_token_id, b.no_token_id) if tid
     ]
     if not token_ids:
         return {"last_at": None, "stale_s": None, "ok": 0, "missing": len(rows)}
@@ -65,7 +61,9 @@ def _quote_health(session: Session, rows: list[WeatherCityRow]) -> dict[str, obj
     }
 
 
-def _wu_health(session: Session, rows: list[WeatherCityRow], forecast_date: date) -> dict[str, object]:
+def _wu_health(
+    session: Session, rows: list[WeatherCityRow], forecast_date: date
+) -> dict[str, object]:
     station_ids = {r.event.station_id for r in rows}
     snaps = list(
         session.exec(
@@ -156,9 +154,7 @@ def build_weather_cards_payload(
 
         async def _refresh_all() -> None:
             for row in rows:
-                await refresh_event_quotes_from_clob(
-                    session, settings, event_id=row.event.id
-                )
+                await refresh_event_quotes_from_clob(session, settings, event_id=row.event.id)
 
         asyncio.run(_refresh_all())
         session.commit()
@@ -190,11 +186,18 @@ def build_weather_cards_payload(
             "error": snap.error_message if snap else "",
             "fetched_at": snap.fetched_at.isoformat() if snap and snap.fetched_at else None,
             "current_c": snap.current_temp_c if snap else None,
-            "current": format_temp_pair(snap.current_temp_c if snap else None, resolution_unit=unit),
+            "current": format_temp_pair(
+                snap.current_temp_c if snap else None, resolution_unit=unit
+            ),
             "tmax_c": snap.tmax_c if snap else None,
-            "tmax": format_temp_pair(float(snap.tmax_c) if snap and snap.tmax_c is not None else None, resolution_unit=unit),
+            "tmax": format_temp_pair(
+                float(snap.tmax_c) if snap and snap.tmax_c is not None else None,
+                resolution_unit=unit,
+            ),
             "tmin_c": snap.tmin_c if snap else None,
-            "tmax_hours_local": (snap.tmax_hours_local.split(",") if snap and snap.tmax_hours_local else []),
+            "tmax_hours_local": (
+                snap.tmax_hours_local.split(",") if snap and snap.tmax_hours_local else []
+            ),
             "source": snap.source if snap else "",
             "url": st.wunderground_url if st else "",
         }

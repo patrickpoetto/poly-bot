@@ -6,12 +6,17 @@ import asyncio
 import html
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from urllib.parse import urlencode
 
-from pathlib import Path
-
 from fastapi import FastAPI, Form, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlmodel import Session, select
@@ -319,9 +324,7 @@ def create_app(settings: Settings) -> FastAPI:
         forecast_date = date.fromisoformat(day)
         with Session(get_engine(settings)) as session:
             rows = load_city_rows(session, forecast_date=forecast_date)
-            ctx = load_forecast_context_for_rows(
-                session, rows, forecast_date=forecast_date
-            )
+            ctx = load_forecast_context_for_rows(session, rows, forecast_date=forecast_date)
         out: list[dict[str, object]] = []
         for row in rows:
             s = ctx.get(row.event.station_id)
@@ -477,9 +480,7 @@ def create_app(settings: Settings) -> FastAPI:
                 payload: dict[str, object]
                 with Session(get_engine(settings)) as session:
                     try:
-                        await refresh_event_quotes_from_clob(
-                            session, settings, event_id=event_id
-                        )
+                        await refresh_event_quotes_from_clob(session, settings, event_id=event_id)
                     except Exception:
                         pass
                     payload = weather_event_live_snapshot(session, event_id=event_id)
@@ -664,8 +665,7 @@ def _live_snapshot(
     with engine.connect() as conn:
         quote_row = conn.execute(text("SELECT MAX(updated_at) FROM token_quotes")).one()
         markets_active = int(
-            conn.execute(text("SELECT COUNT(*) FROM markets WHERE active = TRUE")).scalar()
-            or 0
+            conn.execute(text("SELECT COUNT(*) FROM markets WHERE active = TRUE")).scalar() or 0
         )
         fees_with = int(
             conn.execute(
@@ -677,12 +677,8 @@ def _live_snapshot(
 
     with Session(engine) as session:
         in_play = settings.catalog_sports_in_play_hours
-        expiring = count_expiring_markets(
-            session, hours=hours, sports_in_play_hours=in_play
-        )
-        markets = list_expiring_markets(
-            session, hours=hours, sports_in_play_hours=in_play
-        )
+        expiring = count_expiring_markets(session, hours=hours, sports_in_play_hours=in_play)
+        markets = list_expiring_markets(session, hours=hours, sports_in_play_hours=in_play)
         events = group_expiring_by_event(markets)
         fee_in_window = sum(1 for m in markets if m.fees_enabled or m.event_fees_enabled)
         store = CatalogStateStore(session)
@@ -709,9 +705,7 @@ def _live_snapshot(
         },
     }
     if include_quotes:
-        visible = _filter_markets(markets, domain=domain, q=q, fees_only=fees_only)[
-            :quote_limit
-        ]
+        visible = _filter_markets(markets, domain=domain, q=q, fees_only=fees_only)[:quote_limit]
         snapshot["quotes"] = _quotes_payload(visible)
     return snapshot
 
@@ -762,7 +756,9 @@ def _filter_markets(
         out = [
             m
             for m in out
-            if ql in m.question.lower() or ql in m.slug.lower() or ql in (m.event_title or "").lower()
+            if ql in m.question.lower()
+            or ql in m.slug.lower()
+            or ql in (m.event_title or "").lower()
         ]
     return out
 
@@ -967,8 +963,8 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
     <div class="stat">Updated <b id="stat-updated">—</b></div>
   </div>
   <nav class="tabs">
-    <a href="/?{query}" class="{'active' if tab == 'markets' else ''}">Markets</a>
-    <a href="/events?hours={hours}" class="{'active' if tab == 'events' else ''}">Events & fees</a>
+    <a href="/?{query}" class="{"active" if tab == "markets" else ""}">Markets</a>
+    <a href="/events?hours={hours}" class="{"active" if tab == "events" else ""}">Events & fees</a>
     <a href="/harvest">Harvest</a>
     <a href="/weather">Weather</a>
     <a href="/taxonomy">Taxonomy</a>
@@ -977,15 +973,15 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
     <input type="hidden" name="hours" value="{hours}"/>
     <select name="domain">
       <option value="">All domains</option>
-      {''.join(f'<option value="{html.escape(d)}" {"selected" if d == domain else ""}>{html.escape(d)}</option>' for d in domains)}
+      {"".join(f'<option value="{html.escape(d)}" {"selected" if d == domain else ""}>{html.escape(d)}</option>' for d in domains)}
     </select>
     <input type="search" name="q" value="{html.escape(q)}" placeholder="Search question…" size="28"/>
-    <label><input type="checkbox" name="fees_only" value="true" {'checked' if fees_only else ''}/> Fees only</label>
+    <label><input type="checkbox" name="fees_only" value="true" {"checked" if fees_only else ""}/> Fees only</label>
     <button type="submit">Apply</button>
   </form>
 </header>
 <main>
-  <div id="panel-markets" class="{'hidden' if tab != 'markets' else ''}">
+  <div id="panel-markets" class="{"hidden" if tab != "markets" else ""}">
     <div class="table-wrap">
       <table id="markets-table">
         <thead><tr>
@@ -998,7 +994,7 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
       </table>
     </div>
   </div>
-  <div id="panel-events" class="{'hidden' if tab != 'events' else ''}">
+  <div id="panel-events" class="{"hidden" if tab != "events" else ""}">
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -1119,9 +1115,7 @@ document.getElementById('markets-table')?.addEventListener('click', (e) => {{
 
 def _market_row(m: ExpiringMarket) -> str:
     left_cls = "urgent" if m.hours_left < 1 and not m.is_live else ""
-    if m.is_live:
-        left_cls = "soon"
-    elif m.hours_left < 3:
+    if m.is_live or m.hours_left < 3:
         left_cls = "soon"
     mid = m.yes_mid if m.yes_mid is not None else m.no_mid
     fee_lbl = market_fee_label(m)
@@ -1130,8 +1124,7 @@ def _market_row(m: ExpiringMarket) -> str:
     kickoff = m.game_start_ts or m.end_ts
     if m.is_live:
         status = (
-            f'<span class="tag" style="color:var(--green)">LIVE</span> '
-            f"{m.hours_left:.1f}h window"
+            f'<span class="tag" style="color:var(--green)">LIVE</span> {m.hours_left:.1f}h window'
         )
     elif m.resolution_kind == "in_play" and m.hours_to_kickoff is not None:
         status = f"{m.hours_to_kickoff:.1f}h kick · {m.hours_left:.1f}h window"
@@ -1142,7 +1135,7 @@ def _market_row(m: ExpiringMarket) -> str:
     cid = html.escape(m.condition_id, quote=True)
     return (
         f'<tr data-cid="{cid}">'
-        f'<td>{html.escape(kickoff.strftime("%m-%d %H:%M"))}</td>'
+        f"<td>{html.escape(kickoff.strftime('%m-%d %H:%M'))}</td>"
         f'<td class="num {left_cls}">{status}</td>'
         f'<td><span class="tag">{html.escape(m.domain)}</span></td>'
         f'<td class="num" data-col="yes">{_num(m.yes_mid, 3)}</td>'
@@ -1170,7 +1163,7 @@ def _event_row(e: object) -> str:
         f'<td class="num">{e.market_count}</td>'
         f'<td class="num">{left}</td>'
         f'<td class="num">{_fmt_vol(e.total_volume_24h)}</td>'
-        f'<td>{html.escape(rate)}</td>'
+        f"<td>{html.escape(rate)}</td>"
         f'<td class="num">{e.markets_with_fees}/{e.market_count}</td>'
         "</tr>"
     )
@@ -1215,7 +1208,11 @@ def _render_harvest_page(settings: Settings, opps: list, *, hot_only: bool) -> s
             f"<td>{html.escape(o.question[:80])}</td>"
             "</tr>"
         )
-    body = "\n".join(rows) if rows else "<tr><td colspan='9'>No priced opportunities in band.</td></tr>"
+    body = (
+        "\n".join(rows)
+        if rows
+        else "<tr><td colspan='9'>No priced opportunities in band.</td></tr>"
+    )
     alt = f"/harvest?hot_only={'false' if hot_only else 'true'}"
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -1234,7 +1231,7 @@ th {{ color: #8b9cb3; }}
 <header>
   <h1 style="margin:0">Harvest targets</h1>
   <p class="sub">{mode} · ask {settings.harvest_min_buy_price:.3f}–{settings.harvest_max_buy_price:.3f} · net ≥ {min_pct:.1f}% · ${settings.harvest_order_usd:.0f} · sorted by window end</p>
-  <p><a href="/">Catalog</a> · <a href="{alt}">{'Show all window' if hot_only else 'HOT only'}</a> · CLI: <code>poly-bot harvest scan --log</code></p>
+  <p><a href="/">Catalog</a> · <a href="{alt}">{"Show all window" if hot_only else "HOT only"}</a> · CLI: <code>poly-bot harvest scan --log</code></p>
 </header>
 <table>
   <thead><tr>

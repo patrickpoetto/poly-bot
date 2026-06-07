@@ -81,9 +81,7 @@ def test_parse_bin_exact() -> None:
 
 
 def test_parse_wunderground_url() -> None:
-    wu = parse_wunderground_url(
-        "https://www.wunderground.com/history/daily/gb/london/EGLC"
-    )
+    wu = parse_wunderground_url("https://www.wunderground.com/history/daily/gb/london/EGLC")
     assert wu is not None
     assert wu.icao == "EGLC"
     assert wu.country_code == "gb"

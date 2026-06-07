@@ -11,8 +11,13 @@ def is_sqlite(dialect_name: str) -> bool:
 
 def active_market_filter(dialect_name: str) -> str:
     if is_sqlite(dialect_name):
-        return "m.active = 1 AND m.closed = 0"
-    return "m.active IS TRUE AND m.closed IS FALSE"
+        return (
+            "m.active = 1 AND m.closed = 0 AND m.accepting_orders = 1 AND m.enable_order_book = 1"
+        )
+    return (
+        "m.active IS TRUE AND m.closed IS FALSE "
+        "AND m.accepting_orders IS TRUE AND m.enable_order_book IS TRUE"
+    )
 
 
 def catalog_window_filter(
@@ -60,11 +65,7 @@ def end_ts_in_window(dialect_name: str, *, end_expr: str = "COALESCE(m.end_ts, e
             f"AND datetime({end_expr}) > datetime(:now) "
             f"AND datetime({end_expr}) <= datetime(:until)"
         )
-    return (
-        f"{end_expr} IS NOT NULL "
-        f"AND {end_expr} > :now "
-        f"AND {end_expr} <= :until"
-    )
+    return f"{end_expr} IS NOT NULL AND {end_expr} > :now AND {end_expr} <= :until"
 
 
 def ts_before_cutoff(dialect_name: str, column: str) -> str:

@@ -57,11 +57,7 @@ def discovery_scan(
     runner.init_database()
     log.info("scan_starting", data_dir=str(settings.poly_bot_data_dir))
 
-    stats = (
-        asyncio.run(runner.scan_active())
-        if skip_closed
-        else asyncio.run(runner.scan_all())
-    )
+    stats = asyncio.run(runner.scan_active()) if skip_closed else asyncio.run(runner.scan_all())
 
     catalog_stats = runner.stats()
     typer.echo(
@@ -167,9 +163,10 @@ def discovery_backfill_fees(
 ) -> None:
     """Backfill fee columns from stored Gamma raw_payload."""
     settings, log = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.discovery.backfill_fees import backfill_fees_from_raw
     from poly_bot.persistence.db import get_engine, init_db
-    from sqlmodel import Session
 
     init_db(get_engine(settings))
     with Session(get_engine(settings)) as session:
@@ -219,9 +216,10 @@ def _echo_taxonomy_result(
 def catalog_link() -> None:
     """Link series slugs and sync tags from events."""
     settings, log = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.catalog.linker import CatalogLinker
     from poly_bot.persistence.db import get_engine, init_db
-    from sqlmodel import Session
 
     init_db(get_engine(settings))
     with Session(get_engine(settings)) as session:
@@ -241,9 +239,10 @@ def catalog_enrich(
 ) -> None:
     """REST refresh: midpoints, spreads, OI for markets expiring within horizon."""
     settings, log = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.catalog.enricher import CatalogEnricher
     from poly_bot.catalog.watch import CatalogWatch
-    from sqlmodel import Session
 
     watch = CatalogWatch(settings)
     watch.init_database()
@@ -258,6 +257,146 @@ def catalog_enrich(
     typer.echo(f"Enrichment: {stats}")
 
 
+@catalog_app.command("window-stats")
+def catalog_window_stats(
+    hours: float | None = typer.Option(
+        None,
+        "--hours",
+        "-h",
+        help="Catalog window (default: CATALOG_EXPIRING_HOURS).",
+    ),
+    show_band: bool = typer.Option(
+        False,
+        "--show-band",
+        help="List markets with DB mid in harvest price band.",
+    ),
+    hot_only: bool = typer.Option(
+        False,
+        "--hot",
+        help="With --show-band: only HOT-tier markets.",
+    ),
+) -> None:
+    """Funnel: DB totals → catalog window → HOT → quoted → harvest band."""
+    settings, _log = _bootstrap()
+    from rich.console import Console
+    from rich.table import Table
+    from sqlmodel import Session
+
+    from poly_bot.catalog.time_window import hot_window_label
+    from poly_bot.catalog.watch import CatalogWatch
+    from poly_bot.catalog.window_stats import compute_window_stats, list_harvest_band_rows
+
+    watch = CatalogWatch(settings)
+    watch.init_database()
+    with Session(watch._engine) as session:
+        stats = compute_window_stats(session, settings, hours=hours)
+        band_rows = (
+            list_harvest_band_rows(session, settings, hours=hours, hot_only=hot_only)
+            if show_band
+            else []
+        )
+
+    typer.echo("\nCatalog window funnel")
+    typer.echo(f"  Total in DB:              {stats.total_markets:,}")
+    typer.echo(f"  Active + open:            {stats.active_open:,}")
+    typer.echo(f"  Closed / inactive:        {stats.closed_or_inactive:,}")
+    typer.echo(f"  Catalog window ≤{stats.horizon_hours:.0f}h:     {stats.in_catalog_window:,}")
+    typer.echo(f"  {hot_window_label(settings)}:  {stats.in_hot_window:,}")
+    typer.echo(
+        f"  With tokens (catalog):    {stats.with_tokens:,}"
+        f" ({stats.with_both_tokens:,} with yes+no)"
+    )
+    typer.echo(
+        f"  token_quotes globally:    {stats.global_quotes_total:,}",
+    )
+    if stats.latest_quote_age_s is not None:
+        typer.echo(f"  Latest quote age:         {stats.latest_quote_age_s / 60:.0f}m ago")
+    else:
+        typer.echo("  Latest quote age:         never")
+    typer.echo(f"  With DB quote (catalog):  {stats.with_any_quote:,}")
+    typer.echo(
+        f"  Mid ≥ 95¢ (catalog win):  {stats.mid_ge_95:,}  (DB mids — harvest scan uses live books)"
+    )
+    typer.echo(
+        f"  Mid in harvest band:      {stats.in_harvest_band:,}  "
+        f"({settings.harvest_min_buy_price:.3f}–{settings.harvest_max_buy_price:.3f})"
+    )
+
+    if stats.in_catalog_window > 0 and stats.with_any_quote == 0:
+        typer.echo("")
+        if stats.global_quotes_total == 0:
+            typer.echo(
+                "  ⚠ No quotes in DB — start catalog pipeline:\n"
+                "    docker compose --profile heavy up -d catalog-watch ws-daemon\n"
+                "    or once: poly-bot catalog enrich --force"
+            )
+        elif stats.with_tokens < stats.in_catalog_window:
+            typer.echo("  ⚠ Some catalog markets lack tokens — run discovery delta scan")
+        else:
+            typer.echo(
+                "  ⚠ Catalog window has tokens but no mids — enrich/WS not covering "
+                "this slice. Run: poly-bot catalog enrich --force"
+            )
+
+    if stats.by_domain:
+        table = Table(title="By domain (catalog window)")
+        table.add_column("Domain")
+        table.add_column("Catalog", justify="right")
+        table.add_column("HOT", justify="right")
+        table.add_column("Live", justify="right")
+        table.add_column("Quoted", justify="right")
+        table.add_column("≥95¢", justify="right")
+        table.add_column("Band", justify="right")
+        for d in stats.by_domain:
+            table.add_row(
+                d.domain,
+                str(d.in_catalog),
+                str(d.in_hot),
+                str(d.live_sports) if d.domain == "sports" else "—",
+                str(d.with_quote),
+                str(d.mid_ge_95),
+                str(d.in_harvest_band),
+            )
+        Console().print(table)
+
+    if show_band:
+        title = "DB mid in harvest band"
+        if hot_only:
+            title += f" ({hot_window_label(settings)} only)"
+        else:
+            title += f" (catalog ≤{stats.horizon_hours:.0f}h)"
+        band_table = Table(title=title)
+        band_table.add_column("HOT")
+        band_table.add_column("Left", justify="right")
+        band_table.add_column("Side")
+        band_table.add_column("Mid", justify="right")
+        band_table.add_column("Yes", justify="right")
+        band_table.add_column("No", justify="right")
+        band_table.add_column("Domain")
+        band_table.add_column("Question", max_width=42)
+        if not band_rows:
+            typer.echo(
+                "\nNo rows (DB mid in band). Try without --hot or run harvest scan for live asks."
+            )
+        for r in band_rows:
+            live = "L" if r.is_live else ""
+            band_table.add_row(
+                "✓" if r.in_hot else "",
+                f"{live}{r.hours_left:.1f}h",
+                r.band_side[:12],
+                f"{r.band_mid:.3f}",
+                f"{r.yes_mid:.3f}" if r.yes_mid is not None else "—",
+                f"{r.no_mid:.3f}" if r.no_mid is not None else "—",
+                r.domain,
+                (r.question[:40] + "…") if len(r.question) > 41 else r.question,
+            )
+        Console().print(band_table)
+        typer.echo(
+            f"\n{len(band_rows)} side(s) — DB mids only; "
+            "use `harvest scan` for live ask + book sanity."
+        )
+
+
 @catalog_app.command("expiring")
 def catalog_expiring(
     hours: float = typer.Option(6.0, "--hours", "-h"),
@@ -265,10 +404,11 @@ def catalog_expiring(
 ) -> None:
     """Print table of markets expiring within the next N hours."""
     settings, _log = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.catalog.display import print_expiring_table
     from poly_bot.catalog.expiring import list_expiring_markets
     from poly_bot.catalog.watch import CatalogWatch
-    from sqlmodel import Session
 
     watch = CatalogWatch(settings)
     watch.init_database()
@@ -304,12 +444,13 @@ def catalog_events(
 ) -> None:
     """Events with markets expiring in the window (fee summary)."""
     settings, _log = _bootstrap()
-    from poly_bot.catalog.events_view import group_expiring_by_event
-    from poly_bot.catalog.expiring import list_expiring_markets
-    from poly_bot.catalog.watch import CatalogWatch
     from rich.console import Console
     from rich.table import Table
     from sqlmodel import Session
+
+    from poly_bot.catalog.events_view import group_expiring_by_event
+    from poly_bot.catalog.expiring import list_expiring_markets
+    from poly_bot.catalog.watch import CatalogWatch
 
     watch = CatalogWatch(settings)
     watch.init_database()
@@ -355,10 +496,10 @@ def harvest_scan(
         "-m",
         help="Tighter time cap (overrides HOT hours when set).",
     ),
-    stale_ok: bool = typer.Option(
+    require_fresh: bool = typer.Option(
         False,
-        "--stale-quotes",
-        help="Require fresh DB quote age (live scan always uses CLOB).",
+        "--require-fresh",
+        help="DB-only: reject quotes older than HARVEST_QUOTE_MAX_AGE_SECONDS.",
     ),
     db_only: bool = typer.Option(
         False,
@@ -374,6 +515,8 @@ def harvest_scan(
 ) -> None:
     """Near-expiry outcomes with ask in 98–99¢ band and net yield ≥ target."""
     settings, log_ = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.catalog.watch import CatalogWatch
     from poly_bot.harvest.display import print_harvest_table
     from poly_bot.harvest.paper import append_paper_log
@@ -381,7 +524,6 @@ def harvest_scan(
         scan_harvest_opportunities,
         scan_harvest_opportunities_live,
     )
-    from sqlmodel import Session
 
     watch = CatalogWatch(settings)
     watch.init_database()
@@ -393,7 +535,7 @@ def harvest_scan(
                 hours=hours,
                 hot_only=hot_only,
                 max_minutes_left=minutes,
-                require_fresh_quotes=not stale_ok,
+                require_fresh_quotes=require_fresh,
             )
         else:
             opps = asyncio.run(
@@ -403,7 +545,7 @@ def harvest_scan(
                     hours=hours,
                     hot_only=hot_only,
                     max_minutes_left=minutes,
-                    require_fresh_quotes=not stale_ok,
+                    require_fresh_quotes=False,
                 )
             )
     shown = opps[:limit]
@@ -429,13 +571,89 @@ def harvest_scan(
     )
 
 
+@harvest_app.command("diagnose")
+def harvest_diagnose(
+    hours: float | None = typer.Option(None, "--hours", "-h"),
+    hot_only: bool = typer.Option(True, "--hot/--all-window"),
+    db_only: bool = typer.Option(False, "--db-only"),
+) -> None:
+    """Show why harvest scan finds 0 (or N) opportunities — funnel counts."""
+    settings, _log = _bootstrap()
+    from rich.console import Console
+    from rich.table import Table
+    from sqlmodel import Session
+
+    from poly_bot.catalog.watch import CatalogWatch
+    from poly_bot.harvest.diagnose import diagnose_harvest
+
+    watch = CatalogWatch(settings)
+    watch.init_database()
+    with Session(watch._engine) as session:
+        diag = asyncio.run(
+            diagnose_harvest(
+                session,
+                settings,
+                hours=hours,
+                hot_only=hot_only,
+                live_books=not db_only,
+                require_fresh_quotes=False,
+            )
+        )
+
+    from poly_bot.catalog.time_window import hot_window_label
+
+    mode = hot_window_label(settings) if hot_only else f"window ≤{diag.horizon_hours:.0f}h"
+    typer.echo(f"\nHarvest diagnose ({mode}, {'DB' if db_only else 'live books'})")
+    typer.echo(f"  Markets in horizon:     {diag.markets_in_horizon}")
+    typer.echo(f"  Markets in time filter: {diag.markets_in_hot}")
+    typer.echo(f"  Outcome sides quoted:   {diag.sides_with_quote}")
+    typer.echo(f"  Price ≥ 95¢:            {diag.sides_price_ge_95}")
+    typer.echo(
+        f"  In band {settings.harvest_min_buy_price:.3f}–{settings.harvest_max_buy_price:.3f}: {diag.sides_in_price_band}"
+    )
+    typer.echo(
+        f"  Net ≥ {settings.harvest_min_net_yield_pct * 100:.1f}%:       {diag.sides_pass_net_yield}"
+    )
+    if not db_only:
+        typer.echo(f"  Book sanity:            {diag.sides_pass_book_sanity}")
+    typer.echo(f"  Pass liquidity:         {diag.sides_pass_liquidity}")
+    typer.echo(f"  → Opportunities:        {diag.opportunities}")
+    if diag.stale_skipped:
+        typer.echo(f"  (skipped stale quotes:  {diag.stale_skipped})")
+
+    if diag.near_misses:
+        table = Table(title="Near misses (price ≥ 90¢ in HOT window)")
+        table.add_column("Price")
+        table.add_column("Net%")
+        table.add_column("Side")
+        table.add_column("Left")
+        table.add_column("Why not")
+        table.add_column("Question", max_width=32)
+        for n in diag.near_misses[:10]:
+            table.add_row(
+                f"{n.price:.3f} ({n.price_source})",
+                f"{n.net_yield_pct * 100:.2f}",
+                n.side,
+                f"{n.hours_left:.1f}h",
+                n.reject_reason,
+                n.question[:32],
+            )
+        Console().print(table)
+    elif diag.markets_in_hot == 0:
+        typer.echo("\nNo markets in time filter — try: harvest diagnose --all-window")
+    elif diag.sides_price_ge_95 == 0:
+        typer.echo("\nNothing near 98¢ in this window right now (normal off-peak).")
+        typer.echo("Try: harvest scan --all-window   or widen HOT hours in .env")
+
+
 @harvest_app.command("paper")
 def harvest_paper(limit: int = typer.Option(20, "--limit", "-n")) -> None:
     """Show recent harvest scan log lines."""
     settings, _log = _bootstrap()
-    from poly_bot.harvest.paper import read_paper_log
     from rich.console import Console
     from rich.table import Table
+
+    from poly_bot.harvest.paper import read_paper_log
 
     rows = read_paper_log(settings, limit=limit)
     table = Table(title="Harvest paper log (recent)")
@@ -499,9 +717,7 @@ def catalog_ws_daemon(
         "-h",
         help="Quote horizon hours (default: max of CATALOG_EXPIRING_HOURS and weather days).",
     ),
-    refresh: float = typer.Option(
-        120.0, "--refresh", help="Resubscribe interval (seconds)."
-    ),
+    refresh: float = typer.Option(120.0, "--refresh", help="Resubscribe interval (seconds)."),
 ) -> None:
     """Persistent CLOB WebSocket — auto-reconnect + rolling subscription."""
     settings, log = _bootstrap()
@@ -524,16 +740,15 @@ def catalog_taxonomy_add(
     key: str = typer.Argument(..., help="tag slug, condition_id, or slug prefix"),
     domain: str = typer.Option("", "--domain", help="Override domain."),
     structure: str = typer.Option("", "--structure", help="Override structure."),
-    resolution: str = typer.Option(
-        "", "--resolution", help="Override resolution_source."
-    ),
+    resolution: str = typer.Option("", "--resolution", help="Override resolution_source."),
     note: str = typer.Option("", "--note"),
 ) -> None:
     """Add or update a taxonomy override."""
     settings, _log = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.catalog.taxonomy import upsert_override
     from poly_bot.persistence.db import get_engine, init_db
-    from sqlmodel import Session
 
     init_db(get_engine(settings))
     with Session(get_engine(settings)) as session:
@@ -547,8 +762,7 @@ def catalog_taxonomy_add(
             note=note,
         )
     typer.echo(
-        f"Override #{row.id}: {row.kind}={row.key} "
-        f"→ domain={row.domain} structure={row.structure}"
+        f"Override #{row.id}: {row.kind}={row.key} → domain={row.domain} structure={row.structure}"
     )
 
 
@@ -556,9 +770,10 @@ def catalog_taxonomy_add(
 def catalog_taxonomy_list() -> None:
     """List taxonomy overrides."""
     settings, _log = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.catalog.taxonomy import list_overrides
     from poly_bot.persistence.db import get_engine, init_db
-    from sqlmodel import Session
 
     init_db(get_engine(settings))
     with Session(get_engine(settings)) as session:
@@ -583,9 +798,10 @@ def catalog_reclassify(
 ) -> None:
     """Re-run classifier rules on stored raw_payload."""
     settings, log = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.ops.reclassify import reclassify_markets
     from poly_bot.persistence.db import get_engine, init_db
-    from sqlmodel import Session
 
     init_db(get_engine(settings))
     with Session(get_engine(settings)) as session:
@@ -610,9 +826,10 @@ def ops_migrate() -> None:
 def ops_reconcile() -> None:
     """Report catalog data-quality issues."""
     settings, _log = _bootstrap()
+    from sqlmodel import Session
+
     from poly_bot.ops.reconcile import run_reconciliation
     from poly_bot.persistence.db import get_engine, init_db
-    from sqlmodel import Session
 
     init_db(get_engine(settings))
     with Session(get_engine(settings)) as session:
@@ -740,8 +957,7 @@ def ops_telegram_chat_id() -> None:
     updates = asyncio.run(client.get_updates())
     if not updates:
         typer.echo(
-            "No updates yet. Open Telegram, send any message to the bot, "
-            "then re-run this command."
+            "No updates yet. Open Telegram, send any message to the bot, then re-run this command."
         )
         raise typer.Exit(code=1)
     seen: set[str] = set()
@@ -755,8 +971,7 @@ def ops_telegram_chat_id() -> None:
         title = chat.get("title") or chat.get("username") or chat.get("first_name") or ""
         typer.echo(f"chat.id={cid}  type={chat.get('type')}  title={title}")
     typer.echo(
-        "\nSet TELEGRAM_CHAT_ID to one of the values above (use the negative id "
-        "for groups)."
+        "\nSet TELEGRAM_CHAT_ID to one of the values above (use the negative id for groups)."
     )
 
 
@@ -841,12 +1056,13 @@ def weather_serve() -> None:
         typer.echo("WEATHER_MARKET_SYNC_ENABLED=false — exiting.")
         raise typer.Exit(1)
 
+    from sqlmodel import Session
+
     from poly_bot.discovery.runner import DiscoveryRunner
     from poly_bot.persistence.db import get_engine
     from poly_bot.weather.aviation_sync import WeatherAviationSync
     from poly_bot.weather.station_sync import WeatherStationSnapshotSync
     from poly_bot.weather.sync import WeatherCatalogSync
-    from sqlmodel import Session
 
     runner = DiscoveryRunner(settings)
     runner.init_database()
@@ -974,35 +1190,39 @@ def weather_export(
     with Session(get_engine(settings)) as session:
         repo = WeatherRepository(session)
         events = repo.list_daily_events(min_date=ref, max_date=max_date)
-        payload: dict[str, object] = {
-            "reference_date": ref.isoformat(),
-            "horizon_days": settings.weather_forecast_horizon_days,
-            "stations": [],
-            "cities": [],
-            "daily_events": [],
-            "bins": [],
-        }
+        stations_out: list[object] = []
+        cities_out: list[object] = []
+        events_out: list[object] = []
+        bins_out: list[object] = []
         station_ids: set[str] = set()
         city_keys: set[str] = set()
         for ev in events:
             if ev.station_id not in station_ids:
                 st = repo.get_station(ev.station_id)
                 if st:
-                    payload["stations"].append(st.model_dump(mode="json"))
+                    stations_out.append(st.model_dump(mode="json"))
                     station_ids.add(ev.station_id)
             if ev.city_key not in city_keys:
                 city = session.get(WeatherCity, ev.city_key)
                 if city:
-                    payload["cities"].append(city.model_dump(mode="json"))
+                    cities_out.append(city.model_dump(mode="json"))
                     city_keys.add(ev.city_key)
-            payload["daily_events"].append(ev.model_dump(mode="json"))
+            events_out.append(ev.model_dump(mode="json"))
             for b in repo.bins_for_event(ev.id):
-                payload["bins"].append(b.model_dump(mode="json"))
+                bins_out.append(b.model_dump(mode="json"))
+        payload = {
+            "reference_date": ref.isoformat(),
+            "horizon_days": settings.weather_forecast_horizon_days,
+            "stations": stations_out,
+            "cities": cities_out,
+            "daily_events": events_out,
+            "bins": bins_out,
+        }
 
     path = out_path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    typer.echo(f"Exported {len(events)} events, {len(payload['bins'])} bins → {path}")
+    typer.echo(f"Exported {len(events)} events, {len(bins_out)} bins → {path}")
 
 
 @weather_app.command("station-sync")
@@ -1055,7 +1275,7 @@ def weather_aviation_sync() -> None:
 @weather_app.command("aviation-status")
 def weather_aviation_status() -> None:
     """Coverage summary: TAF/METAR ingest and shadow trading signals."""
-    from datetime import date, timedelta
+    from datetime import date
 
     from sqlalchemy import func
     from sqlmodel import Session, col, select
@@ -1083,7 +1303,7 @@ def weather_aviation_status() -> None:
             list(
                 session.exec(
                     select(WeatherStationForecastConfig).where(
-                        WeatherStationForecastConfig.trading_enabled.is_(True)
+                        col(WeatherStationForecastConfig.trading_enabled).is_(True)
                     )
                 ).all()
             )
@@ -1091,17 +1311,16 @@ def weather_aviation_status() -> None:
         fc_n = len(
             list(
                 session.exec(
-                    select(WeatherDailyForecast).where(
-                        WeatherDailyForecast.forecast_date >= ref
-                    )
+                    select(WeatherDailyForecast).where(WeatherDailyForecast.forecast_date >= ref)
                 ).all()
             )
         )
         sig_n = len(list(session.exec(select(WeatherTradingSignal)).all()))
         edges = list(
             session.exec(
-                select(WeatherTradingSignal.edge_hint, func.count())
-                .group_by(col(WeatherTradingSignal.edge_hint))
+                select(WeatherTradingSignal.edge_hint, func.count()).group_by(
+                    col(WeatherTradingSignal.edge_hint)
+                )
             ).all()
         )
     typer.echo(f"Reference date (UTC): {ref}")

@@ -214,19 +214,11 @@ class CatalogRepository:
         return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
     def count_markets_with_fees(self) -> int:
-        stmt = (
-            select(func.count())
-            .select_from(Market)
-            .where(col(Market.fees_enabled).is_(True))
-        )
+        stmt = select(func.count()).select_from(Market).where(col(Market.fees_enabled).is_(True))
         return int(self._session.exec(stmt).one())
 
     def count_events_with_fees(self) -> int:
-        stmt = (
-            select(func.count())
-            .select_from(Event)
-            .where(col(Event.fees_enabled).is_(True))
-        )
+        stmt = select(func.count()).select_from(Event).where(col(Event.fees_enabled).is_(True))
         return int(self._session.exec(stmt).one())
 
     def count_markets_with_series(self) -> int:

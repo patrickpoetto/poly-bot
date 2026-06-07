@@ -37,10 +37,9 @@ class GammaClient:
     @retry(
         retry=retry_if_exception(
             lambda exc: (
-                isinstance(exc, httpx.HTTPStatusError)
-                and exc.response.status_code == 429
+                (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429)
+                or isinstance(exc, httpx.TransportError)
             )
-            or isinstance(exc, httpx.TransportError)
         ),
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=1, min=1, max=30),
@@ -95,9 +94,7 @@ class GammaClient:
                     items = []
 
                 next_cursor = (
-                    payload.get("next_cursor")
-                    or payload.get("nextCursor")
-                    or payload.get("cursor")
+                    payload.get("next_cursor") or payload.get("nextCursor") or payload.get("cursor")
                 )
                 page_num += 1
                 logger.debug(
@@ -199,9 +196,7 @@ class GammaClient:
                 for item in items:
                     if not isinstance(item, dict):
                         continue
-                    updated = _parse_gamma_datetime(
-                        item.get("updatedAt") or item.get("updated_at")
-                    )
+                    updated = _parse_gamma_datetime(item.get("updatedAt") or item.get("updated_at"))
                     if updated is not None and updated <= since_utc:
                         return
                     page_had_recent = True
@@ -251,9 +246,7 @@ class GammaClient:
                 for item in items:
                     if not isinstance(item, dict):
                         continue
-                    updated = _parse_gamma_datetime(
-                        item.get("updatedAt") or item.get("updated_at")
-                    )
+                    updated = _parse_gamma_datetime(item.get("updatedAt") or item.get("updated_at"))
                     if updated is not None and updated <= since_utc:
                         return
                     page_had_recent = True

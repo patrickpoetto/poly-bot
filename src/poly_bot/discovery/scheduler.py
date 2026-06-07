@@ -48,11 +48,9 @@ class DiscoveryScheduler:
         with Session(self._engine) as session:
             state = CatalogStateStore(session)
             last_full = state.get_datetime(KEY_LAST_FULL_SCAN_AT)
-            full_interval = timedelta(
-                minutes=self._settings.discovery_full_scan_interval_minutes
-            )
-            need_full = force_full or last_full is None or (
-                datetime.now(UTC) - last_full >= full_interval
+            full_interval = timedelta(minutes=self._settings.discovery_full_scan_interval_minutes)
+            need_full = (
+                force_full or last_full is None or (datetime.now(UTC) - last_full >= full_interval)
             )
 
         stats: dict[str, int | str]
@@ -150,9 +148,9 @@ class DiscoveryScheduler:
     ) -> None:
         logger.info("discovery_series_refresh", reason=reason, orphans=orphans)
         series_stats = await self._runner.scan_series()
-        stats["series_upserted"] = stats.get(
+        stats["series_upserted"] = stats.get("series_upserted", 0) + series_stats.get(
             "series_upserted", 0
-        ) + series_stats.get("series_upserted", 0)  # type: ignore[operator]
+        )  # type: ignore[operator]
         with Session(self._engine) as session:
             CatalogStateStore(session).set_datetime(
                 KEY_LAST_SERIES_SCAN_AT,

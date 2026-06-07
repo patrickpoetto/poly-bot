@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
-from sqlmodel import Session
 
 from poly_bot.catalog.dashboard import _live_snapshot, _quotes_payload, create_app
 from poly_bot.catalog.models import ExpiringMarket

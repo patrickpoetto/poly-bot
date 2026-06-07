@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import func, text
 from sqlmodel import Session, select
 
-from poly_bot.persistence.schema import Event, Market, Token
+from poly_bot.persistence.schema import Event, Market
 
 
 def run_reconciliation(session: Session) -> dict[str, int | list[str]]:
@@ -32,9 +32,7 @@ def run_reconciliation(session: Session) -> dict[str, int | list[str]]:
         ).one()
     )
     issues["markets_empty_raw"] = int(
-        session.exec(
-            select(func.count()).select_from(Market).where(text(empty_raw_clause))
-        ).one()
+        session.exec(select(func.count()).select_from(Market).where(text(empty_raw_clause))).one()
     )
     issues["markets_unknown_domain"] = int(
         session.exec(

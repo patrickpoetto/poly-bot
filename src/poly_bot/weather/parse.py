@@ -263,12 +263,23 @@ def parse_wunderground_url(url: str) -> ParsedWunderground | None:
 
 
 def resolution_source_from_payload(raw: dict[str, Any]) -> str:
-    return str(
-        raw.get("resolutionSource")
-        or raw.get("resolution_source")
-        or ""
-    ).strip()
+    return str(raw.get("resolutionSource") or raw.get("resolution_source") or "").strip()
 
 
 def is_daily_temperature_event_slug(slug: str) -> bool:
     return slug.strip().lower().startswith("highest-temperature-in-") and "-on-" in slug
+
+
+_MARKET_BIN_SUFFIX_RE = re.compile(r"-\d+c(?:orbelow|orabove|orhigher)?$", re.IGNORECASE)
+
+
+def infer_event_slug_from_market_slug(market_slug: str) -> str | None:
+    """Strip the bin suffix from a market slug to get the parent event slug.
+
+    Returns None if the stripped slug is not a valid daily temperature event slug.
+    """
+    slug = market_slug.strip().lower()
+    stripped = _MARKET_BIN_SUFFIX_RE.sub("", slug)
+    if is_daily_temperature_event_slug(stripped):
+        return stripped
+    return None

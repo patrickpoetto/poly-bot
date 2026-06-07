@@ -34,10 +34,7 @@ def test_epoch_to_utc_unix() -> None:
 
 
 def test_parse_tx_beijing_celsius() -> None:
-    raw = (
-        "TAF ZBAA 312305Z 0100/0206 10006KT 9999 FEW030 "
-        "TX36/0106Z TX37/0206Z TN21/0121Z"
-    )
+    raw = "TAF ZBAA 312305Z 0100/0206 10006KT 9999 FEW030 TX36/0106Z TX37/0206Z TN21/0121Z"
     issue = datetime(2026, 5, 31, 23, 5, tzinfo=UTC)
     groups = parse_tx_tn_groups(raw, issue_time=issue, unit="C")
     assert len(groups) >= 2

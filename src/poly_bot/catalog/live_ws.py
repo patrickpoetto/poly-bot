@@ -47,7 +47,7 @@ class LiveQuoteStream:
                             raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                             self._handle_message(raw)
                             messages += 1
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             continue
                 finally:
                     flush_task.cancel()

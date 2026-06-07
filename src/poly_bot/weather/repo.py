@@ -125,12 +125,9 @@ class WeatherRepository:
             self._session.add(bin_row)
 
     def delete_events_outside_horizon(self, *, min_date, max_date) -> int:
-        stale_event_ids = (
-            select(WeatherDailyEvent.id)
-            .where(
-                (col(WeatherDailyEvent.forecast_date) < min_date)
-                | (col(WeatherDailyEvent.forecast_date) > max_date)
-            )
+        stale_event_ids = select(WeatherDailyEvent.id).where(
+            (col(WeatherDailyEvent.forecast_date) < min_date)
+            | (col(WeatherDailyEvent.forecast_date) > max_date)
         )
         self._session.exec(
             delete(WeatherTradingSignal).where(

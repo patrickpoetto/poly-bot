@@ -84,9 +84,7 @@ class CatalogLinker:
         by_series: dict[str, list[str]] = defaultdict(list)
         last_cid = ""
         while True:
-            rows = self._session.execute(
-                select_sql, {"last": last_cid, "lim": _BATCH}
-            ).fetchall()
+            rows = self._session.execute(select_sql, {"last": last_cid, "lim": _BATCH}).fetchall()
             if not rows:
                 break
             for cid, slug in rows:
@@ -165,10 +163,7 @@ class CatalogLinker:
         return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
     def _sync_tags_sqlite(self) -> int:
-        insert_sql = (
-            "INSERT OR IGNORE INTO market_tags (condition_id, tag) "
-            "VALUES (:cid, :tag)"
-        )
+        insert_sql = "INSERT OR IGNORE INTO market_tags (condition_id, tag) VALUES (:cid, :tag)"
         select_sql = text(
             """
             SELECT m.condition_id, e.tags_json
@@ -183,9 +178,7 @@ class CatalogLinker:
         inserted = 0
         last_cid = ""
         while True:
-            rows = self._session.execute(
-                select_sql, {"last": last_cid, "lim": _BATCH}
-            ).fetchall()
+            rows = self._session.execute(select_sql, {"last": last_cid, "lim": _BATCH}).fetchall()
             if not rows:
                 break
             batch: list[dict[str, str]] = []
@@ -218,8 +211,9 @@ class CatalogLinker:
         Reads only ``(condition_id, tag)`` rows from ``market_tags`` — no event
         payloads — so memory stays flat regardless of catalog size.
         """
-        select_sql = text(
-            """
+        select_sql = (
+            text(
+                """
             SELECT m.condition_id, COALESCE(
                 (SELECT string_agg(mt.tag, ',') FROM market_tags mt
                  WHERE mt.condition_id = m.condition_id), ''
@@ -230,8 +224,10 @@ class CatalogLinker:
             ORDER BY m.condition_id
             LIMIT :lim
             """
-        ) if self._is_postgres() else text(
-            """
+            )
+            if self._is_postgres()
+            else text(
+                """
             SELECT m.condition_id, COALESCE(
                 (SELECT GROUP_CONCAT(mt.tag, ',') FROM market_tags mt
                  WHERE mt.condition_id = m.condition_id), ''
@@ -242,13 +238,12 @@ class CatalogLinker:
             ORDER BY m.condition_id
             LIMIT :lim
             """
+            )
         )
         by_domain: dict[str, list[str]] = defaultdict(list)
         last_cid = ""
         while True:
-            rows = self._session.execute(
-                select_sql, {"last": last_cid, "lim": _BATCH}
-            ).fetchall()
+            rows = self._session.execute(select_sql, {"last": last_cid, "lim": _BATCH}).fetchall()
             if not rows:
                 break
             for cid, tags_csv in rows:
@@ -268,10 +263,7 @@ class CatalogLinker:
                 params: dict[str, str] = {f"c{i}": c for i, c in enumerate(chunk)}
                 params["d"] = domain
                 result = self._session.execute(
-                    text(
-                        f"UPDATE markets SET domain = :d "
-                        f"WHERE condition_id IN ({placeholders})"
-                    ),
+                    text(f"UPDATE markets SET domain = :d WHERE condition_id IN ({placeholders})"),
                     params,
                 )
                 updated += int(result.rowcount or 0)  # type: ignore[attr-defined]

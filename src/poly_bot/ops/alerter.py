@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import structlog
 
@@ -32,7 +33,7 @@ logger = structlog.get_logger(__name__)
 class Rule:
     name: str
     description: str
-    evaluate: Callable[[dict[str, Any], "AlerterContext"], tuple[bool, str]]
+    evaluate: Callable[[dict[str, Any], AlerterContext], tuple[bool, str]]
 
 
 @dataclass
@@ -66,9 +67,7 @@ def default_rules(settings: Settings) -> list[Rule]:
             return False, "no reconcile run yet"
         return age > recon_max, f"reconcile_age_s={age} (> {recon_max})"
 
-    def _reconcile_regression(
-        snap: dict[str, Any], ctx: AlerterContext
-    ) -> tuple[bool, str]:
+    def _reconcile_regression(snap: dict[str, Any], ctx: AlerterContext) -> tuple[bool, str]:
         report = snap.get("reconcile_report")
         if not isinstance(report, dict):
             return False, "no reconcile report"
@@ -80,9 +79,7 @@ def default_rules(settings: Settings) -> list[Rule]:
         ctx.last_reconcile_issue_counts = counts
         if prev is None:
             return False, "first observation, baseline only"
-        regressions = {
-            k: (prev.get(k, 0), v) for k, v in counts.items() if v > prev.get(k, 0)
-        }
+        regressions = {k: (prev.get(k, 0), v) for k, v in counts.items() if v > prev.get(k, 0)}
         if not regressions:
             return False, "no regression"
         summary = ", ".join(f"{k}: {a}→{b}" for k, (a, b) in regressions.items())
@@ -149,11 +146,7 @@ def render_message(name: str, kind: str, detail: str, *, host: str) -> str:
     icon = "🔴" if kind == "open" else "✅"
     headline = "FIRING" if kind == "open" else "RESOLVED"
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return (
-        f"{icon} *poly-bot* — `{name}` {headline}\n"
-        f"`{detail}`\n"
-        f"_host:_ `{host}`  _at:_ `{ts}`"
-    )
+    return f"{icon} *poly-bot* — `{name}` {headline}\n`{detail}`\n_host:_ `{host}`  _at:_ `{ts}`"
 
 
 async def run_alerter_loop(

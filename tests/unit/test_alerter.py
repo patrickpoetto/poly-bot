@@ -14,7 +14,6 @@ import pytest
 from poly_bot.ops.alerter import (
     AlerterContext,
     default_rules,
-    evaluate,
     render_message,
     run_alerter_loop,
     transitions,

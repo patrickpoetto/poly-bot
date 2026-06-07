@@ -60,9 +60,7 @@ def health_snapshot(settings: Settings) -> dict[str, object]:
             snapshot["discovery_activity_age_s"] = _age_seconds(
                 store.get_datetime(KEY_LAST_DISCOVERY_ACTIVITY_AT)
             )
-            snapshot["reconcile_age_s"] = _age_seconds(
-                store.get_datetime(KEY_LAST_RECONCILE_AT)
-            )
+            snapshot["reconcile_age_s"] = _age_seconds(store.get_datetime(KEY_LAST_RECONCILE_AT))
             report_raw = store.get(KEY_LAST_RECONCILE_REPORT)
             if report_raw:
                 import json as _json
@@ -101,32 +99,22 @@ def check_health(
                 ts = state.get_datetime(key)
                 age = _age_seconds(ts)
                 details[key] = age if age is not None else "never"
-            activity_age = _age_seconds(
-                state.get_datetime(KEY_LAST_DISCOVERY_ACTIVITY_AT)
-            )
+            activity_age = _age_seconds(state.get_datetime(KEY_LAST_DISCOVERY_ACTIVITY_AT))
             details[KEY_LAST_DISCOVERY_ACTIVITY_AT] = (
                 activity_age if activity_age is not None else "never"
             )
             if service == "discovery" and activity_age is not None:
                 if activity_age > max_age_seconds:
-                    details["reason"] = (
-                        f"discovery inactive ({activity_age}s > {max_age_seconds}s)"
-                    )
+                    details["reason"] = f"discovery inactive ({activity_age}s > {max_age_seconds}s)"
                     return False, details
 
     if service in ("watch", "ws", "any"):
         with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT MAX(updated_at) FROM token_quotes")
-            ).one()
+            row = conn.execute(text("SELECT MAX(updated_at) FROM token_quotes")).one()
         latest = _parse_dt(row[0] if row else None)
         age = _age_seconds(latest)
         details["quote_age_s"] = age if age is not None else "never"
-        if (
-            service in ("watch", "ws")
-            and age is not None
-            and age > max_age_seconds
-        ):
+        if service in ("watch", "ws") and age is not None and age > max_age_seconds:
             details["reason"] = f"quotes stale ({age}s > {max_age_seconds}s)"
             return False, details
 

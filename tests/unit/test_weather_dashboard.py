@@ -9,6 +9,7 @@ from sqlmodel import Session
 
 from poly_bot.catalog.dashboard import create_app
 from poly_bot.persistence.db import get_engine, init_db
+from poly_bot.persistence.schema import Market
 from poly_bot.weather.schema import (
     WeatherBin,
     WeatherCity,
@@ -18,6 +19,13 @@ from poly_bot.weather.schema import (
 
 
 def _seed_weather(session: Session) -> None:
+    session.add(
+        Market(
+            condition_id="0xabc",
+            slug="london-temp-22-below",
+            question="Will the highest temperature in London be 22°C or below on May 30?",
+        )
+    )
     session.add(
         WeatherStation(
             id="EGLC",
@@ -32,13 +40,9 @@ def _seed_weather(session: Session) -> None:
             timezone="Europe/London",
         )
     )
-    session.add(
-        WeatherCity(
-            city_key="london",
-            display_name="London",
-            default_station_id="EGLC",
-        )
-    )
+    session.flush()
+    session.add(WeatherCity(city_key="london", display_name="London", default_station_id="EGLC"))
+    session.flush()
     session.add(
         WeatherDailyEvent(
             id="ev1",
@@ -55,6 +59,7 @@ def _seed_weather(session: Session) -> None:
             market_count=2,
         )
     )
+    session.flush()
     session.add(
         WeatherBin(
             condition_id="0xabc",

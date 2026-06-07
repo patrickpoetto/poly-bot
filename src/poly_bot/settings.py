@@ -90,7 +90,10 @@ class Settings(BaseSettings):
         validation_alias="CATALOG_QUOTE_HOT_HOURS",
         gt=0,
         le=48,
-        description="Harvest + live quote refresh: markets within this many hours of window end",
+        description=(
+            "HOT tier: non-sports = hours to window end; "
+            "sports in-play = from kickoff; sports pre-match = hours to kickoff"
+        ),
     )
     catalog_sports_in_play_hours: float = Field(
         default=4.0,
@@ -200,6 +203,33 @@ class Settings(BaseSettings):
         validation_alias="HARVEST_BOOK_CONCURRENCY",
         ge=1,
         le=100,
+    )
+    harvest_max_bid_ask_spread: float = Field(
+        default=0.0,
+        validation_alias="HARVEST_MAX_BID_ASK_SPREAD",
+        ge=0,
+        le=0.5,
+        description="Live scan: max ask−bid on buy side for non-sports (0 = off)",
+    )
+    harvest_sports_max_bid_ask_spread: float = Field(
+        default=0.05,
+        validation_alias="HARVEST_SPORTS_MAX_BID_ASK_SPREAD",
+        ge=0,
+        le=0.5,
+        description="Live scan: max ask−bid for sports only (0 = complement check only)",
+    )
+    harvest_max_complement_sum: float = Field(
+        default=1.02,
+        validation_alias="HARVEST_MAX_COMPLEMENT_SUM",
+        ge=0,
+        le=2.0,
+        description="Live scan: reject if ask + other_bid exceeds this (stale loser asks)",
+    )
+    harvest_max_book_age_seconds: float = Field(
+        default=300.0,
+        validation_alias="HARVEST_MAX_BOOK_AGE_SECONDS",
+        ge=0,
+        description="Live scan: max CLOB /book snapshot age (0 = disable)",
     )
 
     catalog_dashboard_host: str = Field(

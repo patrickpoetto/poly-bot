@@ -122,7 +122,9 @@ def build_shadow_signal(
         forecast_date=ev.forecast_date,
         trading_mode=cfg.trading_mode,
         model_tmax_c=merged_tmax_c,
-        model_bin_label=model_bin.bin_label if model_bin else (f"{merged_tmax_c}°C" if merged_tmax_c else ""),
+        model_bin_label=model_bin.bin_label
+        if model_bin
+        else (f"{merged_tmax_c}°C" if merged_tmax_c else ""),
         market_favorite_c=mkt_c,
         market_favorite_mid=mkt_mid,
         edge_hint=edge,

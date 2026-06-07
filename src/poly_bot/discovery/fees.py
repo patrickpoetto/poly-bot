@@ -42,7 +42,9 @@ def gamma_market_fee_fields(raw: dict[str, Any]) -> dict[str, Any]:
         "taker_base_fee": _int_or_none(raw.get("takerBaseFee") or raw.get("taker_base_fee")),
         "fee_type": _str_or_none(raw.get("feeType") or raw.get("fee_type")),
         "fees_enabled": bool(raw.get("feesEnabled", raw.get("fees_enabled", False))),
-        "fee_schedule": parse_fee_schedule(fee_schedule if isinstance(fee_schedule, dict) else None),
+        "fee_schedule": parse_fee_schedule(
+            fee_schedule if isinstance(fee_schedule, dict) else None
+        ),
         "tick_size": _str_or_none(tick),
         "min_order_size": _str_or_none(min_size),
         "rewards_min_size": _float_or_none(rewards_min),
@@ -51,9 +53,7 @@ def gamma_market_fee_fields(raw: dict[str, Any]) -> dict[str, Any]:
             rewards_min or rewards_max or raw.get("clobRewards") or raw.get("rewardsMinSize")
         ),
         "volume_24h": _float_or_none(
-            raw.get("volume24hr")
-            or raw.get("volume24hrClob")
-            or raw.get("volume_24h")
+            raw.get("volume24hr") or raw.get("volume24hrClob") or raw.get("volume_24h")
         ),
         "liquidity_usd": _float_or_none(
             raw.get("liquidityNum") or raw.get("liquidityClob") or raw.get("liquidity")

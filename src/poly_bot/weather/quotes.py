@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 
-from sqlmodel import Session, col, select
+from sqlmodel import Session, select
 
 from poly_bot.exchange.clob_public import ClobPublicClient
 from poly_bot.persistence.schema import Token, TokenQuote
@@ -46,17 +46,10 @@ async def refresh_event_quotes_from_clob(
     event_id: str,
 ) -> int:
     """REST midpoints for one city's bins (~20 tokens) — works without ws-daemon."""
-    bins = session.exec(
-        select(WeatherBin).where(WeatherBin.weather_event_id == event_id)
-    ).all()
+    bins = session.exec(select(WeatherBin).where(WeatherBin.weather_event_id == event_id)).all()
     if not bins:
         return 0
-    token_ids = [
-        tid
-        for b in bins
-        for tid in (b.yes_token_id, b.no_token_id)
-        if tid
-    ]
+    token_ids = [tid for b in bins for tid in (b.yes_token_id, b.no_token_id) if tid]
     if not token_ids:
         return 0
 

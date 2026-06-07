@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any, TypeVar
 
 import structlog
@@ -194,9 +194,7 @@ class DiscoveryRunner:
 
         market_stats = await self._scan_markets(
             run_type="delta_weather_markets",
-            source=self._iter_weather_markets(
-                self._gamma.iter_active_markets_delta(since_markets)
-            ),
+            source=self._iter_weather_markets(self._gamma.iter_active_markets_delta(since_markets)),
         )
         event_stats = await self._scan_records(
             run_type="delta_weather_events",
@@ -267,9 +265,7 @@ class DiscoveryRunner:
                 await self.scan_events(include_closed=include_closed),
             )
         if markets:
-            market_stats = (
-                await self.scan_all() if include_closed else await self.scan_active()
-            )
+            market_stats = await self.scan_all() if include_closed else await self.scan_active()
             totals = _merge_stats(totals, market_stats)
         with Session(self._engine) as session:
             CatalogRepository(session).rollup_event_fees()

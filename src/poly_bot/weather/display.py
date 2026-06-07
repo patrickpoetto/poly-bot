@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from datetime import date
 
-import typer
 from rich.console import Console
 from rich.table import Table
 
 from poly_bot.weather.market_window import days_ahead_of_today, format_days_ahead_label
-from poly_bot.weather.schema import WeatherBin, WeatherDailyEvent, WeatherStation
+from poly_bot.weather.schema import WeatherBin, WeatherDailyEvent
 
 
 def print_weather_summary(

@@ -93,9 +93,7 @@ def backfill_fees_from_raw(
         if only_missing:
             remaining_n = int(
                 session.exec(
-                    select(func.count())
-                    .select_from(Market)
-                    .where(Market.fee_type == None)  # noqa: E711
+                    select(func.count()).select_from(Market).where(Market.fee_type == None)  # noqa: E711
                 ).one()
             )
         offset += batch_size if not only_missing else 0

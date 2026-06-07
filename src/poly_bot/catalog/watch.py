@@ -39,10 +39,7 @@ class CatalogWatch:
             stats.update(await enricher.enrich_expiring_window(hours=horizon))
 
             # Persistent WS daemon runs separately when CATALOG_WS_PERSISTENT=true.
-            if (
-                self._settings.catalog_ws_enabled
-                and not self._settings.catalog_ws_persistent
-            ):
+            if self._settings.catalog_ws_enabled and not self._settings.catalog_ws_persistent:
                 cids = subscription_condition_ids(
                     session,
                     self._settings,
@@ -71,9 +68,7 @@ class CatalogWatch:
         )
         while True:
             try:
-                stats = await asyncio.wait_for(
-                    self.run_cycle(hours=hours), timeout=cycle_timeout
-                )
+                stats = await asyncio.wait_for(self.run_cycle(hours=hours), timeout=cycle_timeout)
                 logger.info("catalog_watch_cycle", **stats)
             except TimeoutError:
                 logger.error("catalog_watch_cycle_timeout", timeout=cycle_timeout)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 
 from poly_bot.catalog.models import ExpiringMarket
 from poly_bot.core.fees import effective_fee_rate, fee_summary, format_taker_fee

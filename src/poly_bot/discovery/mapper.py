@@ -34,9 +34,7 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
 def _parse_game_start_ts(raw: dict[str, Any], *, end_ts: datetime | None) -> datetime | None:
     """Gamma sports: ``gameStartTime`` is kickoff; ``endDate`` often matches it."""
     kickoff = _parse_iso_datetime(
-        raw.get("gameStartTime")
-        or raw.get("game_start_time")
-        or raw.get("gameStart")
+        raw.get("gameStartTime") or raw.get("game_start_time") or raw.get("gameStart")
     )
     if kickoff is not None:
         return kickoff
@@ -67,9 +65,7 @@ def gamma_market_to_entities(
         overrides=overrides,
     )
     game_start_ts = (
-        _parse_game_start_ts(raw, end_ts=end_ts)
-        if classification["domain"] == "sports"
-        else None
+        _parse_game_start_ts(raw, end_ts=end_ts) if classification["domain"] == "sports" else None
     )
 
     event_id = _extract_event_id(raw)
@@ -212,20 +208,12 @@ def gamma_event_to_entity(raw: dict[str, Any]) -> Event | None:
     if not event_id:
         return None
 
-    title = (
-        raw.get("title")
-        or raw.get("name")
-        or raw.get("question")
-        or raw.get("subtitle")
-        or ""
-    )
+    title = raw.get("title") or raw.get("name") or raw.get("question") or raw.get("subtitle") or ""
 
     ev_start = _parse_iso_datetime(
         raw.get("startDate") or raw.get("start_date") or raw.get("startTime")
     )
-    ev_end = _parse_iso_datetime(
-        raw.get("endDate") or raw.get("end_date") or raw.get("endTime")
-    )
+    ev_end = _parse_iso_datetime(raw.get("endDate") or raw.get("end_date") or raw.get("endTime"))
     return Event(
         id=event_id,
         slug=str(raw.get("slug") or ""),

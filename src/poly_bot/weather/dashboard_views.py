@@ -258,7 +258,6 @@ def weather_event_live_snapshot(
     event_id: str,
 ) -> dict[str, object]:
     """Payload for SSE — quote ticks for all bins in one daily event."""
-    from datetime import datetime
 
     from poly_bot.weather.repo import WeatherRepository
 
@@ -267,9 +266,7 @@ def weather_event_live_snapshot(
         return {"error": "not found"}
     bins = WeatherRepository(session).bins_for_event(event_id)
     ticks = load_bin_ticks(session, bins)
-    quote_row = session.exec(
-        select(func.max(TokenQuote.updated_at))
-    ).one()
+    quote_row = session.exec(select(func.max(TokenQuote.updated_at))).one()
     quote_last = quote_row[0] if quote_row else None
     now = datetime.now(UTC)
     quote_age_s: int | None = None
@@ -310,23 +307,29 @@ def render_weather_page(
     poll_seconds: int,
 ) -> str:
     min_d, max_d = weather_horizon(settings)
-    day_opts = "".join(
-        f'<option value="{s.forecast_date.isoformat()}" '
-        f'{"selected" if s.forecast_date == selected_day else ""}>'
-        f'{s.forecast_date.isoformat()} ({days_ahead_label_for(s.forecast_date)}, {s.city_count} cities)'
-        f"</option>"
-        for s in summaries
-    ) or f'<option value="{selected_day.isoformat()}" selected>{selected_day}</option>'
+    day_opts = (
+        "".join(
+            f'<option value="{s.forecast_date.isoformat()}" '
+            f"{'selected' if s.forecast_date == selected_day else ''}>"
+            f"{s.forecast_date.isoformat()} ({days_ahead_label_for(s.forecast_date)}, {s.city_count} cities)"
+            f"</option>"
+            for s in summaries
+        )
+        or f'<option value="{selected_day.isoformat()}" selected>{selected_day}</option>'
+    )
 
-    day_pills = "".join(
-        f'<a class="day-pill{" active" if s.forecast_date == selected_day else ""}{" empty" if s.city_count == 0 else ""}" '
-        f'href="/weather?{urlencode({"day": s.forecast_date.isoformat(), "city": city_q})}" '
-        f'title="{s.city_count} città">'
-        f"{s.forecast_date.strftime('%d %b')} ({days_ahead_label_for(s.forecast_date)}"
-        f'{"" if s.city_count else ", vuoto"})'
-        f"</a>"
-        for s in summaries
-    ) or f'<span class="day-pill active">{selected_day.isoformat()}</span>'
+    day_pills = (
+        "".join(
+            f'<a class="day-pill{" active" if s.forecast_date == selected_day else ""}{" empty" if s.city_count == 0 else ""}" '
+            f'href="/weather?{urlencode({"day": s.forecast_date.isoformat(), "city": city_q})}" '
+            f'title="{s.city_count} città">'
+            f"{s.forecast_date.strftime('%d %b')} ({days_ahead_label_for(s.forecast_date)}"
+            f"{'' if s.city_count else ', vuoto'})"
+            f"</a>"
+            for s in summaries
+        )
+        or f'<span class="day-pill active">{selected_day.isoformat()}</span>'
+    )
 
     empty_msg = ""
     if empty_catalog:
@@ -348,7 +351,7 @@ def render_weather_page(
 <body>
 <header>
   <h1>Weather scan</h1>
-  <div class="sub">Stazione di risoluzione · oggi UTC {weather_reference_date().strftime('%d/%m/%Y')} · aggiornamento ogni {poll_seconds // 60} min</div>
+  <div class="sub">Stazione di risoluzione · oggi UTC {weather_reference_date().strftime("%d/%m/%Y")} · aggiornamento ogni {poll_seconds // 60} min</div>
   <div class="day-pills">{day_pills}</div>
   <div class="health-bar" id="health-bar">
     <span class="health-item" id="health-wu"><span class="dot"></span> WU station</span>
@@ -519,6 +522,7 @@ def render_weather_detail_page(
     taf_raw: str = "",
 ) -> str:
     from poly_bot.weather.forecast_schema import WeatherTradingSignal
+
     ev = row.event
     st = row.station
     station_line = "—"
@@ -532,9 +536,7 @@ def render_weather_detail_page(
             f'target="_blank" rel="noopener">Wunderground</a>'
         )
 
-    bin_rows = "".join(
-        _bin_row(b, ticks.get(b.condition_id)) for b in row.bins
-    )
+    bin_rows = "".join(_bin_row(b, ticks.get(b.condition_id)) for b in row.bins)
     rules = html.escape(ev.resolution_rules_text[:1200])
     if len(ev.resolution_rules_text) > 1200:
         rules += "…"
@@ -733,7 +735,7 @@ def _bin_row(b: WeatherBin, tick: BinTick | None) -> str:
     cid = html.escape(b.condition_id, quote=True)
     return (
         f'<tr data-cid="{cid}">'
-        f"<td class=\"num\">{b.bin_index}</td>"
+        f'<td class="num">{b.bin_index}</td>'
         f"<td>{html.escape(b.bin_label)}</td>"
         f'<td><span class="tag">{html.escape(b.bin_kind)}</span></td>'
         f'<td class="num">{temp}</td>'
@@ -843,13 +845,13 @@ def _weather_live_script(event_id: str) -> str:
 
 def _nav_tabs(active: str) -> str:
     return f"""<nav class="tabs">
-  <a href="/" class="{'active' if active == 'markets' else ''}">Markets</a>
-  <a href="/events" class="{'active' if active == 'events' else ''}">Events</a>
-  <a href="/weather" class="{'active' if active == 'weather' else ''}">Weather</a>
-  <a href="/weather/board" class="{'active' if active == 'board' else ''}">Board</a>
-  <a href="/weather/globe" class="{'active' if active == 'globe' else ''}">Globe</a>
-  <a href="/weather/aviation" class="{'active' if active == 'aviation' else ''}">Aviation</a>
-  <a href="/taxonomy" class="{'active' if active == 'taxonomy' else ''}">Taxonomy</a>
+  <a href="/" class="{"active" if active == "markets" else ""}">Markets</a>
+  <a href="/events" class="{"active" if active == "events" else ""}">Events</a>
+  <a href="/weather" class="{"active" if active == "weather" else ""}">Weather</a>
+  <a href="/weather/board" class="{"active" if active == "board" else ""}">Board</a>
+  <a href="/weather/globe" class="{"active" if active == "globe" else ""}">Globe</a>
+  <a href="/weather/aviation" class="{"active" if active == "aviation" else ""}">Aviation</a>
+  <a href="/taxonomy" class="{"active" if active == "taxonomy" else ""}">Taxonomy</a>
 </nav>"""
 
 
@@ -861,13 +863,16 @@ def render_weather_globe_page(
     points_json: str,
     point_count: int,
 ) -> str:
-    day_opts = "".join(
-        f'<option value="{s.forecast_date.isoformat()}" '
-        f'{"selected" if s.forecast_date == selected_day else ""}>'
-        f"{s.forecast_date.isoformat()} ({format_days_ahead_label(s.forecast_date)})"
-        f"</option>"
-        for s in summaries
-    ) or f'<option value="{selected_day.isoformat()}" selected>{selected_day}</option>'
+    day_opts = (
+        "".join(
+            f'<option value="{s.forecast_date.isoformat()}" '
+            f"{'selected' if s.forecast_date == selected_day else ''}>"
+            f"{s.forecast_date.isoformat()} ({format_days_ahead_label(s.forecast_date)})"
+            f"</option>"
+            for s in summaries
+        )
+        or f'<option value="{selected_day.isoformat()}" selected>{selected_day}</option>'
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">

@@ -164,7 +164,9 @@ def load_board_data(
     *,
     forecast_date: date,
     rows: list,
-) -> tuple[list[str], dict[str, dict[str, WeatherDailyForecast | None]], dict[str, WeatherTradingSignal]]:
+) -> tuple[
+    list[str], dict[str, dict[str, WeatherDailyForecast | None]], dict[str, WeatherTradingSignal]
+]:
     station_ids = [r.event.station_id for r in rows]
     if not station_ids:
         return [], {}, {}
@@ -188,7 +190,7 @@ def load_board_data(
     ]
     source_keys = list(preferred) + [k for k in keys if k not in preferred]
     matrix: dict[str, dict[str, WeatherDailyForecast | None]] = {
-        sid: {k: None for k in source_keys} for sid in station_ids
+        sid: dict.fromkeys(source_keys) for sid in station_ids
     }
     for r in fc_rows:
         if r.station_id in matrix and r.source_key in matrix[r.station_id]:
@@ -215,17 +217,18 @@ def render_weather_board_page(
 <html lang="en"><head><meta charset="utf-8"/><title>weather board</title>{_weather_css()}</head>
 <body><header><h1>Weather board</h1>{_nav_tabs("board")}</header><main><p class="muted">No rows.</p></main></body></html>"""
 
-    day_opts = "".join(
-        f'<option value="{s.forecast_date.isoformat()}" '
-        f'{"selected" if s.forecast_date == forecast_date else ""}>'
-        f"{s.forecast_date.isoformat()} ({format_days_ahead_label(s.forecast_date)})"
-        f"</option>"
-        for s in summaries
-    ) or f'<option value="{forecast_date.isoformat()}" selected>{forecast_date}</option>'
-
-    head_cols = "".join(
-        f"<th class='num'>{html.escape(k)}</th>" for k in source_keys
+    day_opts = (
+        "".join(
+            f'<option value="{s.forecast_date.isoformat()}" '
+            f"{'selected' if s.forecast_date == forecast_date else ''}>"
+            f"{s.forecast_date.isoformat()} ({format_days_ahead_label(s.forecast_date)})"
+            f"</option>"
+            for s in summaries
+        )
+        or f'<option value="{forecast_date.isoformat()}" selected>{forecast_date}</option>'
     )
+
+    head_cols = "".join(f"<th class='num'>{html.escape(k)}</th>" for k in source_keys)
     body = ""
     for r in rows:
         city = html.escape(r.city.display_name if r.city else r.event.city_key)
@@ -316,7 +319,11 @@ def render_weather_aviation_page(
         fallbacks = ", ".join(cfg.fallback_source_keys) if cfg else ""
         trade = "yes" if cfg and cfg.trading_enabled else "no"
         cov = taf.coverage if taf else "missing"
-        preview = html.escape((taf.raw_taf[:100] + "…") if taf and len(taf.raw_taf) > 100 else (taf.raw_taf if taf else ""))
+        preview = html.escape(
+            (taf.raw_taf[:100] + "…")
+            if taf and len(taf.raw_taf) > 100
+            else (taf.raw_taf if taf else "")
+        )
         st_rows += (
             f"<tr><td><code>{html.escape(st.icao or st.id)}</code></td>"
             f"<td>{html.escape(st.city_display or st.id)}</td>"

@@ -12,9 +12,7 @@ def test_count_unknown_event_series_zero_when_all_known(settings) -> None:
     with Session(runner._engine) as session:
         session.add(Series(id="s-1", slug="btc-5m", title="BTC 5m", recurrence_seconds=300))
         session.add(
-            Event(
-                id="e-1", slug="ev1", title="Ev1", series_id="s-1", active=True, closed=False
-            )
+            Event(id="e-1", slug="ev1", title="Ev1", series_id="s-1", active=True, closed=False)
         )
         session.commit()
     assert runner.count_unknown_event_series() == 0

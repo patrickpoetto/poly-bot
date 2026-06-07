@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -18,7 +17,7 @@ from poly_bot.weather.coordinates import lookup_coordinates
 from poly_bot.weather.market_window import weather_reference_date
 from poly_bot.weather.parse import (
     city_key_to_display,
-    is_daily_temperature_event_slug,
+    infer_event_slug_from_market_slug,
     parse_bin_from_market,
     parse_daily_event_slug,
     parse_forecast_date_from_payload,
@@ -31,16 +30,6 @@ from poly_bot.weather.repo import WeatherRepository
 from poly_bot.weather.schema import WeatherBin, WeatherCity, WeatherDailyEvent, WeatherStation
 
 logger = structlog.get_logger(__name__)
-
-_BIN_SUFFIX_RE = re.compile(r"-\d+c(?:orbelow|orabove|orhigher)?$", re.IGNORECASE)
-
-
-def infer_event_slug_from_market_slug(market_slug: str) -> str | None:
-    slug = market_slug.strip().lower()
-    stripped = _BIN_SUFFIX_RE.sub("", slug)
-    if is_daily_temperature_event_slug(stripped):
-        return stripped
-    return None
 
 
 class WeatherCatalogSync:
@@ -143,13 +132,9 @@ class WeatherCatalogSync:
                         or ""
                     )
                     or None,
-                    series_id=str(
-                        markets[0].get("series_id") or event_raw.get("seriesId") or ""
-                    )
+                    series_id=str(markets[0].get("series_id") or event_raw.get("seriesId") or "")
                     or None,
-                    end_ts=_parse_dt(
-                        event_raw.get("endDate") or markets[0].get("end_ts")
-                    ),
+                    end_ts=_parse_dt(event_raw.get("endDate") or markets[0].get("end_ts")),
                     active=bool(event_raw.get("active", markets[0].get("active", True))),
                     closed=bool(event_raw.get("closed", markets[0].get("closed", False))),
                     bin_count=len(markets),
@@ -181,9 +166,7 @@ class WeatherCatalogSync:
                         question=m["question"],
                         bin_label=bin_parsed.bin_label,
                         bin_index=_as_int(
-                            raw.get("groupItemThreshold")
-                            or raw.get("group_item_threshold")
-                            or 0
+                            raw.get("groupItemThreshold") or raw.get("group_item_threshold") or 0
                         ),
                         bin_kind=bin_parsed.bin_kind,
                         temp_c=bin_parsed.temp_c,
@@ -327,14 +310,10 @@ class WeatherCatalogSync:
             )
         return out
 
-    def _group_by_event(
-        self, rows: list[dict[str, Any]]
-    ) -> dict[str, list[dict[str, Any]]]:
+    def _group_by_event(self, rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
-            event_slug = row.get("event_slug") or infer_event_slug_from_market_slug(
-                row["slug"]
-            )
+            event_slug = row.get("event_slug") or infer_event_slug_from_market_slug(row["slug"])
             event_id = row.get("event_id")
             if not event_id and event_slug:
                 event_id = event_slug
@@ -350,9 +329,7 @@ class WeatherCatalogSync:
     def _build_event_group(
         self, group_key: str, markets: list[dict[str, Any]]
     ) -> tuple[str, str, dict[str, Any], str | None] | None:
-        event_slug = markets[0].get("_resolved_event_slug") or markets[0].get(
-            "event_slug"
-        )
+        event_slug = markets[0].get("_resolved_event_slug") or markets[0].get("event_slug")
         if not event_slug:
             event_slug = infer_event_slug_from_market_slug(markets[0]["slug"])
         if not event_slug:
@@ -378,9 +355,7 @@ class WeatherCatalogSync:
         wu = parse_wunderground_url(url)
         if wu is None:
             return None
-        description = str(
-            event_raw.get("description") or market_row.get("description") or ""
-        )
+        description = str(event_raw.get("description") or market_row.get("description") or "")
         station_name = parse_station_name_from_description(description)
         lat, lon, tz = lookup_coordinates(
             icao=wu.icao,

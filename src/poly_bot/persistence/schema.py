@@ -19,7 +19,9 @@ class Event(SQLModel, table=True):
     series_id: str | None = Field(default=None, index=True)
     start_ts: datetime | None = None
     end_ts: datetime | None = None
-    game_start_ts: datetime | None = Field(default=None, description="Sports kickoff (Gamma gameStartTime)")
+    game_start_ts: datetime | None = Field(
+        default=None, description="Sports kickoff (Gamma gameStartTime)"
+    )
     active: bool = Field(default=True, index=True)
     closed: bool = Field(default=False, index=True)
     tags_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
@@ -159,15 +161,13 @@ class TaxonomyOverride(SQLModel, table=True):
 
     id: int | None = Field(default=None, primary_key=True)
     kind: str = Field(index=True)  # "tag" | "condition_id" | "slug_prefix"
-    key: str = Field(index=True)   # tag slug, condition_id, or slug prefix
+    key: str = Field(index=True)  # tag slug, condition_id, or slug prefix
     domain: str | None = None
     structure: str | None = None
     resolution_source: str | None = None
     note: str = Field(default="")
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    __table_args__ = (
-        Index("ix_taxonomy_overrides_kind_key", "kind", "key", unique=True),
-    )
+    __table_args__ = (Index("ix_taxonomy_overrides_kind_key", "kind", "key", unique=True),)
 
 
 class CatalogRun(SQLModel, table=True):

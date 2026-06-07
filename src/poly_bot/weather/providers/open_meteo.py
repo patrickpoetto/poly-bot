@@ -136,7 +136,9 @@ class OpenMeteoMultiProvider:
                         forecast_date=fd,
                         source_key=source,
                         tmax_value=(
-                            celsius_to_station_unit(tmax_c, station.unit) if tmax_c is not None else None
+                            celsius_to_station_unit(tmax_c, station.unit)
+                            if tmax_c is not None
+                            else None
                         ),
                         unit=station.unit,
                         tmax_c=tmax_c,
@@ -146,7 +148,11 @@ class OpenMeteoMultiProvider:
                             "model_field": field,
                             "distance_km": round(dist_km, 2),
                             "query": urlencode(
-                                {"lat": station.latitude, "lon": station.longitude, "tz": station.timezone}
+                                {
+                                    "lat": station.latitude,
+                                    "lon": station.longitude,
+                                    "tz": station.timezone,
+                                }
                             ),
                             **win_meta,
                         },
@@ -160,7 +166,9 @@ class OpenMeteoMultiProvider:
                     forecast_date=fd,
                     source_key=self.source_key,
                     tmax_value=(
-                        celsius_to_station_unit(blend_c, station.unit) if blend_c is not None else None
+                        celsius_to_station_unit(blend_c, station.unit)
+                        if blend_c is not None
+                        else None
                     ),
                     unit=station.unit,
                     tmax_c=blend_c,
@@ -175,4 +183,3 @@ class OpenMeteoMultiProvider:
                 )
             )
         return out
-
