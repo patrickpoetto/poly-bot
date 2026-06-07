@@ -56,7 +56,7 @@ class OrderExecutor:
 
         # global risk caps
         if len(self._open) >= self._settings.engine_max_open_positions:
-            log.debug("risk: max_open_positions=%d reached", self._settings.engine_max_open_positions)
+            log.debug("risk: max_open_positions=%d reached", self._settings.engine_max_open_positions)  # noqa: E501
             return
         notional = sum(o.size_usd for o in self._open.values())
         if notional >= self._settings.engine_max_notional_usd:
@@ -154,12 +154,14 @@ def _build_order(c: ExecutionCandidate, *, paper: bool) -> HarvestOrder:
 
 async def _persist(order: HarvestOrder) -> None:
     """Write order to DB (non-blocking via thread pool)."""
-    import asyncio
 
     def _write() -> None:
         from sqlmodel import Session
-        from poly_bot.persistence.db import engine as db_engine
-        with Session(db_engine()) as session:
+
+        from poly_bot.persistence.db import get_engine
+        from poly_bot.settings import Settings
+
+        with Session(get_engine(Settings())) as session:
             session.add(order)
             session.commit()
 

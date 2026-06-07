@@ -10,7 +10,6 @@ from poly_bot.harvest.engine.executor import OrderExecutor
 from poly_bot.harvest.engine.monitor import PriceMonitor
 from poly_bot.harvest.engine.state import (
     EngineStats,
-    MarketDuration,
     MonitoredMarket,
     infer_duration,
     parse_underlying,
@@ -61,6 +60,7 @@ class LiveEngine:
     def _load_candidates(self) -> list[MonitoredMarket]:
         """Query DB for active markets in the monitor horizon."""
         from sqlmodel import Session, select
+
         from poly_bot.persistence.db import get_engine
         from poly_bot.persistence.schema import Market, Token
 
@@ -73,12 +73,12 @@ class LiveEngine:
             stmt = (
                 select(Market)
                 .where(
-                    Market.active.is_(True),
-                    Market.closed.is_(False),
-                    Market.end_ts.isnot(None),
-                    Market.end_ts >= datetime.now(UTC),
-                    Market.end_ts <= horizon,
-                    Market.domain.in_(["crypto", "sports"]),
+                    Market.active.is_(True),  # type: ignore[attr-defined]
+                    Market.closed.is_(False),  # type: ignore[attr-defined]
+                    Market.end_ts.isnot(None),  # type: ignore[union-attr]
+                    Market.end_ts >= datetime.now(UTC),  # type: ignore[operator]
+                    Market.end_ts <= horizon,  # type: ignore[operator]
+                    Market.domain.in_(["crypto", "sports"]),  # type: ignore[attr-defined]
                 )
             )
             db_markets = session.exec(stmt).all()

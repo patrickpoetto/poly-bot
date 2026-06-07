@@ -10,14 +10,15 @@ Stage 2: high-frequency poll of watchlist only every engine_stage2_interval_s.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import UTC, datetime
 
 import httpx
 
 from poly_bot.harvest.engine.state import (
-    ExecutionCandidate,
     EngineStats,
+    ExecutionCandidate,
     MonitoredMarket,
     WatchlistEntry,
 )
@@ -154,7 +155,8 @@ class PriceMonitor:
         async def _do(client: httpx.AsyncClient) -> None:
             mids = await self._fetch_midpoints(client, tids)
             # also fetch asks for confirmed candidates
-            asks = await self._fetch_asks(client, [t for t in tids if mids.get(t, 0) >= self._settings.engine_alert_threshold])
+            threshold = self._settings.engine_alert_threshold
+            asks = await self._fetch_asks(client, [t for t in tids if mids.get(t, 0) >= threshold])
             for tid in list(tids):
                 entry = self._watchlist.get(tid)
                 if entry is None:
@@ -231,17 +233,13 @@ class PriceMonitor:
                 tid = item.get("token_id")
                 mid = item.get("mid")
                 if tid and mid is not None:
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         result[tid] = float(mid)
-                    except (TypeError, ValueError):
-                        pass
         elif isinstance(data, dict):
             for tid, mid in data.items():
                 if mid is not None:
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         result[tid] = float(mid)
-                    except (TypeError, ValueError):
-                        pass
         return result
 
     @staticmethod

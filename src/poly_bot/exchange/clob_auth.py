@@ -15,8 +15,8 @@ log = logging.getLogger(__name__)
 
 
 def _build_client(settings: Settings) -> object:
-    from py_clob_client.client import ClobClient  # type: ignore[import-untyped]
-    from py_clob_client.clob_types import ApiCreds  # type: ignore[import-untyped]
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds
 
     if not (settings.clob_api_key and settings.clob_secret and settings.clob_passphrase):
         msg = "CLOB credentials not configured (CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE)"
@@ -48,10 +48,10 @@ async def place_market_buy(
     Raises on failure (caller logs and records reject_reason).
     """
     if settings is None:
-        settings = Settings()  # type: ignore[call-arg]
+        settings = Settings()
 
     def _sync() -> str:
-        from py_clob_client.order_builder.constants import BUY  # type: ignore[import-untyped]
+        from py_clob_client.order_builder.constants import BUY
 
         client = _build_client(settings)
         order_args = {
@@ -60,7 +60,7 @@ async def place_market_buy(
             "size": size,
             "side": BUY,
         }
-        resp = client.create_and_post_order(order_args)
+        resp = client.create_and_post_order(order_args)  # type: ignore[attr-defined]
         order_id: str = resp.get("orderID") or resp.get("order_id") or ""
         if not order_id:
             raise RuntimeError(f"CLOB returned no order_id: {resp}")
