@@ -170,6 +170,35 @@ class TaxonomyOverride(SQLModel, table=True):
     __table_args__ = (Index("ix_taxonomy_overrides_kind_key", "kind", "key", unique=True),)
 
 
+class HarvestOrder(SQLModel, table=True):
+    """Execution record for every harvest trade attempt (paper or live)."""
+
+    __tablename__ = "harvest_orders"
+
+    id: str = Field(primary_key=True)  # UUID4
+    condition_id: str = Field(index=True)
+    token_id: str = Field(index=True)
+    side: str  # "yes" | "no"
+    domain: str = Field(default="")
+    question: str = Field(default="")
+    duration_s: int | None = None  # market duration in seconds (300/900/3600)
+    underlying: str | None = None  # "btc", "eth", … parsed from question
+    price_target: float  # ask used for order sizing
+    size_usd: float  # HARVEST_ORDER_USD
+    size_shares: float  # size_usd / price_target
+    paper: bool = Field(default=True)
+    status: str = Field(default="pending")  # pending|filled|cancelled|failed
+    clob_order_id: str | None = None
+    reject_reason: str | None = None
+    net_yield_pct: float | None = None
+    pnl_usd: float | None = None
+    minutes_left_at_entry: float | None = None
+    midpoint_at_entry: float | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), index=True)
+    filled_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+
 class CatalogRun(SQLModel, table=True):
     """Audit log for discovery scan runs."""
 

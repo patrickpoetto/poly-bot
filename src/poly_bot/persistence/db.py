@@ -32,6 +32,7 @@ def get_engine(settings: Settings) -> Engine:
                 return
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")  # wait up to 30s instead of failing
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()

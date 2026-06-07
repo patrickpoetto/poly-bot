@@ -646,6 +646,42 @@ def harvest_diagnose(
         typer.echo("Try: harvest scan --all-window   or widen HOT hours in .env")
 
 
+@harvest_app.command("engine")
+def harvest_engine(
+    paper: bool = typer.Option(
+        True,
+        "--paper/--live",
+        help="Paper mode (default) or live execution.  --live requires CLOB credentials.",
+    ),
+) -> None:
+    """Live execution engine — monitors near-expiry markets and places orders."""
+    settings, log = _bootstrap()
+    if not paper and not (
+        settings.clob_api_key and settings.clob_secret and settings.clob_passphrase
+    ):
+        typer.echo(
+            "Live mode requires CLOB_API_KEY, CLOB_SECRET, CLOB_PASSPHRASE in .env", err=True
+        )
+        raise typer.Exit(code=1)
+
+    settings = settings.model_copy(update={"paper_trading": paper})
+    mode = "PAPER" if paper else "LIVE"
+    typer.echo(f"harvest engine starting [{mode}] — Ctrl+C to stop")
+    from poly_bot.harvest.engine import LiveEngine
+
+    engine = LiveEngine(settings)
+    try:
+        asyncio.run(engine.run())
+    except KeyboardInterrupt:
+        typer.echo("\nEngine stopped.")
+    finally:
+        s = engine.stats
+        typer.echo(
+            f"\nStats — orders: {s.orders_placed} (paper: {s.orders_paper}"
+            f", failed: {s.orders_failed}) | watchlist peak: {s.watchlist_size}"
+        )
+
+
 @harvest_app.command("paper")
 def harvest_paper(limit: int = typer.Option(20, "--limit", "-n")) -> None:
     """Show recent harvest scan log lines."""

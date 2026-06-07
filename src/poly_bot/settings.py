@@ -232,6 +232,74 @@ class Settings(BaseSettings):
         description="Live scan: max CLOB /book snapshot age (0 = disable)",
     )
 
+    # ── Live engine (Phase 2) ──────────────────────────────────────────────
+    paper_trading: bool = Field(
+        default=True,
+        validation_alias="PAPER_TRADING",
+        description="When True: log orders but never hit CLOB POST /order",
+    )
+    # CLOB L2 credentials (from Polymarket UI → Settings → API Keys)
+    clob_api_key: str | None = Field(default=None, validation_alias="POLYMARKET_API_KEY")
+    clob_secret: str | None = Field(default=None, validation_alias="POLYMARKET_SECRET")
+    clob_passphrase: str | None = Field(default=None, validation_alias="POLYMARKET_PASSPHRASE")
+
+    # Stage 1: coarse monitoring interval for all crypto HOT markets
+    engine_stage1_interval_s: float = Field(
+        default=2.0,
+        validation_alias="ENGINE_STAGE1_INTERVAL_S",
+        description="Seconds between Stage-1 midpoint polls (all crypto HOT markets)",
+    )
+    # Stage 2: high-frequency interval for watchlisted markets
+    engine_stage2_interval_s: float = Field(
+        default=0.5,
+        validation_alias="ENGINE_STAGE2_INTERVAL_S",
+        description="Seconds between Stage-2 midpoint polls (watchlist)",
+    )
+    # Price threshold to move from Stage 1 → Stage 2
+    engine_alert_threshold: float = Field(
+        default=0.94,
+        validation_alias="ENGINE_ALERT_THRESHOLD",
+        description="YES or NO midpoint above this triggers Stage-2 watch",
+    )
+    # Max minutes left at which we allow entry, by market duration
+    engine_max_entry_minutes_5m: float = Field(
+        default=2.0,
+        validation_alias="ENGINE_MAX_ENTRY_MINUTES_5M",
+        description="5-min markets: only enter if minutes_left ≤ this",
+    )
+    engine_max_entry_minutes_15m: float = Field(
+        default=5.0,
+        validation_alias="ENGINE_MAX_ENTRY_MINUTES_15M",
+        description="15-min markets: only enter if minutes_left ≤ this",
+    )
+    engine_max_entry_minutes_60m: float = Field(
+        default=10.0,
+        validation_alias="ENGINE_MAX_ENTRY_MINUTES_60M",
+        description="1-hour markets: only enter if minutes_left ≤ this",
+    )
+    # Lookahead window for Stage-1 candidate fetch
+    engine_monitor_horizon_minutes: float = Field(
+        default=30.0,
+        validation_alias="ENGINE_MONITOR_HORIZON_MINUTES",
+        description="Crypto markets expiring within this window are Stage-1 candidates",
+    )
+    # Risk limits
+    engine_max_open_positions: int = Field(
+        default=10,
+        validation_alias="ENGINE_MAX_OPEN_POSITIONS",
+        description="Max concurrent open orders",
+    )
+    engine_max_notional_usd: float = Field(
+        default=100.0,
+        validation_alias="ENGINE_MAX_NOTIONAL_USD",
+        description="Max total USD at risk (sum of open order sizes)",
+    )
+    engine_max_positions_per_underlying: int = Field(
+        default=3,
+        validation_alias="ENGINE_MAX_POSITIONS_PER_UNDERLYING",
+        description="Max concurrent open orders for same asset (BTC, ETH, …)",
+    )
+
     catalog_dashboard_host: str = Field(
         default="127.0.0.1",
         validation_alias="CATALOG_DASHBOARD_HOST",

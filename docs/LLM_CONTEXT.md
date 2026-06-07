@@ -131,9 +131,131 @@ Paper log: `data/harvest_paper.jsonl` via `harvest scan --log`.
 - Tests: `pytest tests/unit/test_harvest.py tests/unit/test_time_window.py`
 - Rebuild Docker after changes: `poly-bot:0.1.6-dev`
 
-## Phase 2 (next, not started)
+## Phase 2 — Trading execution (next, not started)
 
-1. Wallet + CLOB L2 auth
-2. Orders from `HarvestOpportunity` (paper first)
-3. Risk limits, PnL, reconcile vs CLOB
-4. Paper soak → small live capital
+### What already exists (don't rebuild)
+
+| Item | Location |
+|------|----------|
+| Signal dataclass | `harvest/scan.py::HarvestOpportunity` — has `token_id`, `ask`, `price`, `fillable_usd`, `net_yield_pct`, `side` |
+| Paper log | `harvest/paper.py::append_paper_log` — JSONL to `data/harvest_paper.jsonl` |
+| Wallet settings | `settings.py`: `PRIVATE_KEY`, `WALLET_ADDRESS`, `CHAIN_ID=137`, `RPC_URL` |
+| Trading deps | `pyproject.toml [trading]`: `py-clob-client>=0.22.0`, `web3>=7.0.0` — **not installed** |
+| Order size | `settings.HARVEST_ORDER_USD=10.0`, `settings.HARVEST_MIN_FILL_USD=9.5` |
+
+### Step 0 — install trading deps
+
+```bash
+pip install -e ".[trading]"
+```
+
+### Step 1 — CLOB L2 auth (`exchange/clob_auth.py`)
+
+Polymarket L2 uses a dedicated API key (separate from wallet). Get it from Polymarket UI → Settings → API Keys.
+
+```python
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
+
+creds = ApiCreds(
+    api_key=settings.clob_api_key,        # new setting: CLOB_API_KEY
+    api_secret=settings.clob_secret,      # new setting: CLOB_SECRET
+    api_passphrase=settings.clob_passphrase,  # new setting: CLOB_PASSPHRASE
+)
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    chain_id=settings.chain_id,           # 137 (Polygon)
+    key=settings.private_key.get_secret_value(),
+    creds=creds,
+)
+```
+
+New settings to add to `settings.py`:
+```python
+clob_api_key: str | None = Field(default=None, validation_alias="CLOB_API_KEY")
+clob_secret: SecretStr | None = Field(default=None, validation_alias="CLOB_SECRET")
+clob_passphrase: SecretStr | None = Field(default=None, validation_alias="CLOB_PASSPHRASE")
+paper_trading: bool = Field(default=True, validation_alias="PAPER_TRADING")
+harvest_max_open_positions: int = Field(default=5, validation_alias="HARVEST_MAX_OPEN_POSITIONS")
+harvest_max_notional_usd: float = Field(default=50.0, validation_alias="HARVEST_MAX_NOTIONAL_USD")
+```
+
+### Step 2 — DB schema (`persistence/schema.py` + Alembic migration)
+
+New tables needed:
+```python
+class Order(SQLModel, table=True):
+    id: str                     # UUID, PK
+    condition_id: str           # FK → markets
+    token_id: str
+    side: str                   # "yes" | "no"
+    order_type: str             # "FOK" | "GTC"
+    price: float                # ask price used
+    size_usd: float             # HARVEST_ORDER_USD
+    size_shares: float          # size_usd / price
+    status: str                 # "pending" | "filled" | "cancelled" | "failed"
+    clob_order_id: str | None   # ID returned by CLOB POST /order
+    paper: bool                 # True if paper trade
+    created_at: datetime
+    filled_at: datetime | None
+    net_yield_pct: float | None
+    pnl_usd: float | None       # filled after resolution
+```
+
+Use Alembic for Postgres, `SQLModel.metadata.create_all` for SQLite (same pattern as existing schema).
+
+### Step 3 — Executor (`harvest/executor.py`)
+
+```python
+async def execute_opportunity(
+    opp: HarvestOpportunity,
+    settings: Settings,
+    session: Session,
+) -> Order:
+    # 1. risk guards (raise ExecutionRejected if violated)
+    # 2. if paper_trading → write Order(paper=True), return
+    # 3. build OrderArgs (FOK, buy, price=opp.ask, size=shares)
+    # 4. POST via ClobClient → get clob_order_id
+    # 5. write Order to DB with status="filled"/"failed"
+    # 6. log via structlog
+```
+
+**Order type**: use `OrderType.FOK` (Fill or Kill) — certainty harvest needs instant fill, no resting orders.
+
+**Size in shares**: `shares = settings.harvest_order_usd / opp.ask` (buy `shares` at `opp.ask` per share).
+
+**Risk guards** (check before placing):
+- `open_positions_count < settings.harvest_max_open_positions`
+- `open_notional_usd + order_usd ≤ settings.harvest_max_notional_usd`
+- `settings.paper_trading == False` (kill switch)
+- No existing open Order for same `condition_id`
+
+### Step 4 — CLI integration
+
+Add `--execute` flag to `harvest scan`:
+```bash
+poly-bot harvest scan --execute        # live orders (requires PAPER_TRADING=false)
+poly-bot harvest scan                  # scan only, no orders (default)
+poly-bot harvest positions             # show open/closed positions + PnL
+```
+
+### Step 5 — P&L reconcile
+
+After market resolves: check `Order` table for `status=filled`, fetch resolution from CLOB or Gamma, compute `pnl_usd = (1.0 - opp.ask) * size_shares - fees`. Wire into `ops/reconcile_scheduler.py` existing loop.
+
+### Phase 2 order of work
+
+1. `pip install -e ".[trading]"` + add new settings
+2. `exchange/clob_auth.py` — thin wrapper around py-clob-client
+3. Alembic migration + `Order` table
+4. `harvest/executor.py` paper mode only
+5. `harvest scan --execute` CLI flag
+6. Paper soak 48h, check fills match expected
+7. Flip `PAPER_TRADING=false` with $10 orders
+
+### Key reference
+
+- py-clob-client docs: `ClobClient.create_order(OrderArgs)` + `ClobClient.post_order(signed_order)`
+- Polymarket API key creation: POST `/auth/api-key` signed with wallet (or use UI)
+- Order size: shares = `harvest_order_usd / ask` (USDC collateral)
+- FOK semantics: fills fully at price or rejects — no partial fills, no resting

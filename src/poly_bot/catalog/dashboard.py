@@ -116,16 +116,31 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
         tokens = [t.strip() for t in token_ids.split(",") if t.strip()][:40]
 
         async def generator() -> object:
-            clob = ClobPublicClient(settings)
-            while True:
-                prices: dict[str, float] = {}
-                if tokens:
-                    try:
-                        prices = await clob.fetch_midpoints(tokens)
-                    except Exception:
-                        pass
-                yield f"data: {json.dumps({'prices': prices, 'ts': datetime.now(UTC).isoformat()})}\n\n"
-                await asyncio.sleep(3)
+            import httpx as _httpx
+            # dedicated short-timeout client — skip tenacity retries for live stream
+            async with _httpx.AsyncClient(
+                base_url="https://clob.polymarket.com",
+                timeout=_httpx.Timeout(connect=2.0, read=4.0, write=2.0, pool=2.0),
+            ) as client:
+                last_prices: dict[str, float] = {}
+                while True:
+                    # yield first so the connection stays alive even when CLOB is slow
+                    yield f"data: {json.dumps({'prices': last_prices, 'ts': datetime.now(UTC).isoformat()})}\n\n"
+                    if tokens:
+                        try:
+                            body = [{"token_id": t} for t in tokens]
+                            r = await client.post("/midpoints", json=body)
+                            r.raise_for_status()
+                            data = r.json()
+                            if isinstance(data, list):
+                                for item in data:
+                                    if item.get("mid") is not None:
+                                        last_prices[item["token_id"]] = float(item["mid"])
+                            elif isinstance(data, dict):
+                                last_prices.update({k: float(v) for k, v in data.items() if v is not None})
+                        except Exception:
+                            pass  # keep stale prices
+                    await asyncio.sleep(3)
 
         return StreamingResponse(
             generator(),
@@ -224,6 +239,110 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
             }
             for o in opps
         ]
+
+    @app.get("/api/orders")
+    def api_orders(
+        limit: int = Query(default=50, ge=1, le=500),
+        paper: bool | None = Query(default=None),
+    ) -> list[dict[str, object]]:
+        from poly_bot.persistence.schema import HarvestOrder
+
+        with Session(get_engine(settings)) as session:
+            stmt = select(HarvestOrder).order_by(HarvestOrder.created_at.desc()).limit(limit)  # type: ignore[arg-type]
+            if paper is not None:
+                stmt = stmt.where(HarvestOrder.paper == paper)
+            rows = session.exec(stmt).all()
+        return [
+            {
+                "id": r.id,
+                "condition_id": r.condition_id,
+                "token_id": r.token_id,
+                "side": r.side,
+                "domain": r.domain,
+                "question": r.question,
+                "underlying": r.underlying,
+                "duration_s": r.duration_s,
+                "price_target": r.price_target,
+                "size_usd": r.size_usd,
+                "size_shares": r.size_shares,
+                "paper": r.paper,
+                "status": r.status,
+                "net_yield_pct": round(r.net_yield_pct * 100, 3) if r.net_yield_pct else None,
+                "pnl_usd": r.pnl_usd,
+                "minutes_left_at_entry": r.minutes_left_at_entry,
+                "midpoint_at_entry": r.midpoint_at_entry,
+                "created_at": r.created_at.isoformat(),
+                "filled_at": r.filled_at.isoformat() if r.filled_at else None,
+            }
+            for r in rows
+        ]
+
+    @app.get("/api/stream/engine")
+    async def api_stream_engine() -> StreamingResponse:
+        """SSE — engine stats from DB every 5s."""
+
+        async def generator() -> object:
+            from sqlalchemy import text as _text
+            from poly_bot.persistence.schema import HarvestOrder
+
+            while True:
+                try:
+                    now = datetime.now(UTC)
+                    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    eng = get_engine(settings)
+                    with eng.connect() as conn:
+                        total = int(conn.execute(_text("SELECT COUNT(*) FROM harvest_orders")).scalar() or 0)
+                        paper_count = int(conn.execute(_text("SELECT COUNT(*) FROM harvest_orders WHERE paper = 1")).scalar() or 0)
+                        today_count = int(conn.execute(_text(
+                            "SELECT COUNT(*) FROM harvest_orders WHERE created_at >= :ts"
+                        ), {"ts": today_start.isoformat()}).scalar() or 0)
+                        pnl_row = conn.execute(_text(
+                            "SELECT COALESCE(SUM(pnl_usd), 0) FROM harvest_orders WHERE paper = 1 AND status = 'filled'"
+                        )).scalar()
+                    with Session(eng) as session:
+                        recent_raw = session.exec(
+                            select(HarvestOrder)
+                            .order_by(HarvestOrder.created_at.desc())  # type: ignore[arg-type]
+                            .limit(20)
+                        ).all()
+                    recent = [
+                        {
+                            "id": r.id[:8],
+                            "domain": r.domain,
+                            "side": r.side,
+                            "underlying": r.underlying or "",
+                            "price_target": r.price_target,
+                            "net_yield_pct": round(r.net_yield_pct * 100, 2) if r.net_yield_pct else None,
+                            "size_usd": r.size_usd,
+                            "status": r.status,
+                            "paper": r.paper,
+                            "minutes_left": round(r.minutes_left_at_entry or 0, 1),
+                            "question": r.question[:60],
+                            "created_at": r.created_at.isoformat(),
+                        }
+                        for r in recent_raw
+                    ]
+                    last_at = recent_raw[0].created_at.isoformat() if recent_raw else None
+                    payload = {
+                        "ts": now.isoformat(),
+                        "paper_mode": settings.paper_trading,
+                        "orders_total": total,
+                        "orders_paper": paper_count,
+                        "orders_today": today_count,
+                        "pnl_paper_usd": float(pnl_row or 0),
+                        "last_order_at": last_at,
+                        "recent_orders": recent,
+                    }
+                except Exception:
+                    payload = {"ts": datetime.now(UTC).isoformat(), "error": True}
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(5)
+
+        return StreamingResponse(
+            generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/health")
     def health() -> JSONResponse:
@@ -954,7 +1073,7 @@ nav.tabs a.active {{
 }}
 main {{ padding: 1rem 1.25rem 2rem; }}
 .table-wrap {{
-  overflow: auto;
+  overflow-x: auto;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--panel);
@@ -1648,6 +1767,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--font); font
 
 /* ─── FILTER BAR ─────────────────────────────────────── */
 .filter-bar {
+  position: sticky; top: 48px; z-index: 50;
   display: flex; align-items: center; gap: 8px;
   padding: 8px 1.25rem;
   border-bottom: 1px solid var(--border);
@@ -1693,7 +1813,7 @@ col.col-juice  { width: 54px; }
 col.col-vol    { width: 60px; }
 col.col-q      { width: auto; }
 thead th {
-  position: sticky; top: 48px; z-index: 10;
+  position: sticky; top: 0; z-index: 10;
   background: var(--surface); border-bottom: 1px solid var(--border2);
   padding: 7px 8px; font-size: 10.5px; font-weight: 600;
   letter-spacing: .6px; color: var(--muted); text-transform: uppercase;
@@ -1758,6 +1878,57 @@ td.td-q { font-family: var(--font); font-size: 12px; text-align: left; color: va
 /* ─── SORT ARROWS ─────────────────────────────────────── */
 th[data-sort="asc"]::after  { content: " ↑"; color: var(--accent); }
 th[data-sort="desc"]::after { content: " ↓"; color: var(--accent); }
+
+/* ─── ENGINE PANEL ────────────────────────────────────── */
+.engine-panel {
+  margin: 0; border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.engine-header {
+  display: flex; align-items: center; gap: 1rem;
+  padding: 10px 1.25rem; cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+.engine-header:hover { background: var(--surface2); }
+.engine-title { font-weight: 600; font-size: 12.5px; letter-spacing: .3px; color: var(--text); }
+.engine-pills { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.e-pill {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .5px;
+  padding: 2px 8px; border-radius: 4px; text-transform: uppercase;
+}
+.e-pill.paper { background: rgba(245,158,11,.15); color: #fbbf24; }
+.e-pill.live  { background: rgba(34,197,94,.15);  color: #4ade80; }
+.e-pill.off   { background: rgba(100,116,139,.1); color: #94a3b8; }
+.e-stat { font-size: 11.5px; color: var(--muted); }
+.e-stat strong { color: var(--text); }
+.engine-body { padding: 0 1.25rem 1rem; }
+.engine-body.collapsed { display: none; }
+.engine-table-wrap { overflow-x: auto; margin-top: 10px; }
+.engine-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.engine-table th {
+  padding: 5px 8px; text-align: right; font-size: 10px;
+  font-weight: 600; letter-spacing: .5px; text-transform: uppercase;
+  color: var(--muted); border-bottom: 1px solid var(--border2);
+  white-space: nowrap;
+}
+.engine-table th.th-l { text-align: left; }
+.engine-table td {
+  padding: 5px 8px; border-bottom: 1px solid var(--border);
+  text-align: right; font-family: var(--font-mono); white-space: nowrap;
+  vertical-align: middle;
+}
+.engine-table td.td-l { text-align: left; font-family: var(--font); }
+.engine-table td.td-q { text-align: left; font-family: var(--font); max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+.engine-table tr:hover td { background: rgba(59,126,248,.04); }
+.s-paper  { color: #fbbf24; }
+.s-live   { color: #4ade80; }
+.s-filled { color: var(--green); }
+.s-failed { color: var(--red); }
+.s-pending{ color: var(--muted); }
+.toggle-icon { margin-left: auto; color: var(--muted); font-size: 11px; transition: transform .2s; }
+.toggle-icon.open { transform: rotate(180deg); }
+.no-orders { color: var(--muted); font-size: 12px; padding: 1.5rem 0; text-align: center; }
 </style>
 </head>
 <body>
@@ -1772,6 +1943,7 @@ th[data-sort="desc"]::after { content: " ↓"; color: var(--accent); }
     <span class="stat-pill">Active <strong id="s-active">—</strong></span>
     <span class="stat-pill">Quotes <strong id="s-quotes">—</strong></span>
     <span class="stat-pill">Discovery <strong id="s-disco">—</strong></span>
+    <span class="stat-pill">Prices <strong id="s-price-tick">—</strong></span>
   </div>
   <nav class="topbar-nav">
     <a href="/harvest">Harvest</a>
@@ -1841,6 +2013,8 @@ async function boot() {
   bindHealthStream();
   await loadMarkets();
   setInterval(tickCountdowns, 1000);
+  // refresh market list + price stream every 60s (crypto markets expire fast)
+  setInterval(() => loadMarkets(), 60_000);
 }
 
 // ── Data load ─────────────────────────────────────────────
@@ -1957,8 +2131,21 @@ function reconnectPriceStream() {
   const tids = top20.flatMap(m => [m.yes_token_id, m.no_token_id]).filter(Boolean);
   if (!tids.length) return;
   PRICE_ES = new EventSource('/api/stream/prices?token_ids=' + tids.join(','));
+  let _priceTick = 0;
   PRICE_ES.onmessage = (e) => {
-    try { applyPrices(JSON.parse(e.data).prices || {}); } catch(_) {}
+    try {
+      const d = JSON.parse(e.data);
+      const prices = d.prices || {};
+      const n = Object.keys(prices).length;
+      _priceTick++;
+      const el = document.getElementById('s-price-tick');
+      if (el) el.textContent = '#' + _priceTick + ' (' + n + ')';
+      applyPrices(prices);
+    } catch(_) {}
+  };
+  PRICE_ES.onerror = () => {
+    // browser auto-reconnects; just log so we know it happened
+    console.warn('price SSE error — browser will reconnect');
   };
 }
 
@@ -2053,8 +2240,10 @@ function bindHealthStream() {
         sQu.textContent = qa == null ? '—' : fmtAge(qa);
         const da = d.discovery_activity_age_s ?? d.full_age_s;
         sDi.textContent = da == null ? '—' : fmtAge(da);
-        dot.className = 'dot ' + (qa == null ? 'warn' : qa < 60 ? 'ok' : qa < 600 ? 'warn' : 'err');
-        stEl.textContent = qa == null ? 'no quotes' : qa < 60 ? 'live' : 'stale ' + fmtAge(qa);
+        // dot reflects live SSE price stream, not DB quote age
+        // DB quote age shown in Quotes pill separately
+        dot.className = 'dot ok';
+        stEl.textContent = 'live';
       } catch(_) {}
     };
     es.onerror = () => {
@@ -2167,6 +2356,141 @@ function esc(s) {
 
 // ── Go ────────────────────────────────────────────────────
 boot();
+</script>
+
+<!-- ── ENGINE PANEL ───────────────────────────────────── -->
+<section class="engine-panel" id="engine-panel">
+  <div class="engine-header" id="engine-header">
+    <span class="engine-title">⚡ Harvest Engine</span>
+    <div class="engine-pills">
+      <span class="e-pill off" id="e-mode">OFF</span>
+      <span class="e-stat">Orders today <strong id="e-today">—</strong></span>
+      <span class="e-stat">Total <strong id="e-total">—</strong></span>
+      <span class="e-stat">P&amp;L (paper) <strong id="e-pnl">—</strong></span>
+      <span class="e-stat">Last <strong id="e-last">—</strong></span>
+    </div>
+    <span class="toggle-icon" id="engine-toggle">▾</span>
+  </div>
+  <div class="engine-body" id="engine-body">
+    <div class="engine-table-wrap">
+      <table class="engine-table">
+        <thead>
+          <tr>
+            <th class="th-l">Time (UTC)</th>
+            <th class="th-l">Domain</th>
+            <th class="th-l">Side</th>
+            <th>Ask</th>
+            <th>Yield%</th>
+            <th>$Size</th>
+            <th>Min@entry</th>
+            <th>Mode</th>
+            <th>Status</th>
+            <th class="th-l">Question</th>
+          </tr>
+        </thead>
+        <tbody id="engine-tbody">
+          <tr><td colspan="10" class="no-orders">Engine not running — start with: <code>poly-bot harvest engine</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<script>
+'use strict';
+(function enginePanel() {
+  // ── toggle collapse ──────────────────────────────────
+  const header = document.getElementById('engine-header');
+  const body   = document.getElementById('engine-body');
+  const icon   = document.getElementById('engine-toggle');
+  let collapsed = false;
+  header.addEventListener('click', () => {
+    collapsed = !collapsed;
+    body.classList.toggle('collapsed', collapsed);
+    icon.classList.toggle('open', !collapsed);
+  });
+
+  // ── SSE stream ───────────────────────────────────────
+  const modeEl  = document.getElementById('e-mode');
+  const todayEl = document.getElementById('e-today');
+  const totalEl = document.getElementById('e-total');
+  const pnlEl   = document.getElementById('e-pnl');
+  const lastEl  = document.getElementById('e-last');
+  const tbody   = document.getElementById('engine-tbody');
+
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return d.toISOString().slice(11, 19);
+  }
+
+  function fmtAge(iso) {
+    if (!iso) return '—';
+    const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.round(s/60) + 'm ago';
+    return (s/3600).toFixed(1) + 'h ago';
+  }
+
+  function statusCls(s) {
+    if (s === 'filled') return 's-filled';
+    if (s === 'failed') return 's-failed';
+    return 's-pending';
+  }
+
+  function apply(d) {
+    if (d.error) return;
+
+    // mode pill
+    if (d.orders_total === 0 && !d.last_order_at) {
+      modeEl.textContent = 'OFF'; modeEl.className = 'e-pill off';
+    } else if (d.paper_mode) {
+      modeEl.textContent = 'PAPER'; modeEl.className = 'e-pill paper';
+    } else {
+      modeEl.textContent = 'LIVE'; modeEl.className = 'e-pill live';
+    }
+
+    todayEl.textContent = d.orders_today ?? '—';
+    totalEl.textContent = d.orders_total ?? '—';
+    const pnl = d.pnl_paper_usd;
+    pnlEl.textContent = pnl != null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '$' : '—';
+    lastEl.textContent = fmtAge(d.last_order_at);
+
+    const orders = d.recent_orders || [];
+    if (!orders.length) {
+      tbody.innerHTML = '<tr><td colspan="10" class="no-orders">No orders yet — start engine: <code>poly-bot harvest engine</code></td></tr>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const o of orders) {
+      const tr = document.createElement('tr');
+      const modeCls = o.paper ? 's-paper' : 's-live';
+      const modeLabel = o.paper ? 'paper' : 'live';
+      const yield_ = o.net_yield_pct != null ? o.net_yield_pct.toFixed(2) + '%' : '—';
+      tr.innerHTML =
+        '<td class="td-l">' + fmtTime(o.created_at) + '</td>' +
+        '<td class="td-l">' + (o.domain || '—') + '</td>' +
+        '<td class="td-l">' + (o.underlying ? o.underlying.toUpperCase() + ' ' : '') + o.side.toUpperCase() + '</td>' +
+        '<td>' + o.price_target.toFixed(4) + '</td>' +
+        '<td>' + yield_ + '</td>' +
+        '<td>' + o.size_usd.toFixed(0) + '</td>' +
+        '<td>' + (o.minutes_left != null ? o.minutes_left.toFixed(1) + 'm' : '—') + '</td>' +
+        '<td class="' + modeCls + '">' + modeLabel + '</td>' +
+        '<td class="' + statusCls(o.status) + '">' + o.status + '</td>' +
+        '<td class="td-q" title="' + o.question.replace(/"/g,'&quot;') + '">' + o.question + '</td>';
+      frag.appendChild(tr);
+    }
+    tbody.innerHTML = '';
+    tbody.appendChild(frag);
+  }
+
+  function connect() {
+    const es = new EventSource('/api/stream/engine');
+    es.onmessage = (e) => { try { apply(JSON.parse(e.data)); } catch(_) {} };
+    es.onerror = () => { es.close(); setTimeout(connect, 6000); };
+  }
+  connect();
+})();
 </script>
 </body>
 </html>
