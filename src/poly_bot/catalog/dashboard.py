@@ -87,13 +87,7 @@ async def _lifespan(app: FastAPI, settings: Settings):  # type: ignore[misc]
 
 def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
     init_db(get_engine(settings))
-    lifespan = (
-        contextlib.asynccontextmanager(
-            lambda app: _lifespan(app, settings)  # type: ignore[arg-type]
-        )
-        if background
-        else None
-    )
+    lifespan = (lambda app: _lifespan(app, settings)) if background else None
     app = FastAPI(title="poly_bot catalog", version="0.2.0", lifespan=lifespan)
 
     static_dir = Path(__file__).resolve().parent / "static"
