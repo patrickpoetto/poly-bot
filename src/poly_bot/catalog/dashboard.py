@@ -41,25 +41,42 @@ def create_app(settings: Settings) -> FastAPI:
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/", response_class=HTMLResponse)
-    def index(
-        hours: float = Query(default=6.0, ge=1, le=168),
+    def index() -> str:
+        return _render_main_page(settings)
+
+    @app.get("/api/markets")
+    def api_markets_live(
+        limit: int = Query(default=100, ge=1, le=500),
         domain: str = Query(default=""),
         q: str = Query(default=""),
-        fees_only: bool = Query(default=False),
-    ) -> str:
-        all_markets = _load_markets(settings, hours=hours)
-        markets = _filter_markets(all_markets, domain=domain, q=q, fees_only=fees_only)
-        events = group_expiring_by_event(markets)
-        return _render_page(
-            settings=settings,
-            hours=hours,
-            all_markets=all_markets,
-            markets=markets[:500],
-            events=events[:80],
-            domain=domain,
-            q=q,
-            fees_only=fees_only,
-            tab="markets",
+    ) -> list[dict[str, object]]:
+        with Session(get_engine(settings)) as session:
+            return _query_live_markets(session, limit=limit, domain=domain, q=q)
+
+    @app.get("/api/stream/prices")
+    async def api_stream_prices(
+        token_ids: str = Query(default=""),
+    ) -> StreamingResponse:
+        from poly_bot.exchange.clob_public import ClobPublicClient
+
+        tokens = [t.strip() for t in token_ids.split(",") if t.strip()][:40]
+
+        async def generator() -> object:
+            clob = ClobPublicClient(settings)
+            while True:
+                prices: dict[str, float] = {}
+                if tokens:
+                    try:
+                        prices = await clob.fetch_midpoints(tokens)
+                    except Exception:
+                        pass
+                yield f"data: {json.dumps({'prices': prices, 'ts': datetime.now(UTC).isoformat()})}\n\n"
+                await asyncio.sleep(3)
+
+        return StreamingResponse(
+            generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.get("/events", response_class=HTMLResponse)
@@ -1421,6 +1438,689 @@ def _sample_row(m: Market) -> str:
         f"<td>{quick_form}</td>"
         "</tr>"
     )
+
+
+def _query_live_markets(
+    session: Session,
+    *,
+    limit: int = 100,
+    domain: str = "",
+    q: str = "",
+) -> list[dict[str, object]]:
+    """Top N markets sorted by end_ts ASC — no hour-window restriction."""
+    from sqlalchemy import text as sa_text
+
+    from poly_bot.persistence import dialect as sql_dialect
+
+    dialect = session.get_bind().dialect.name  # type: ignore[union-attr]
+    active = sql_dialect.active_market_filter(dialect)
+    if sql_dialect.is_sqlite(dialect):
+        future = "datetime(COALESCE(m.end_ts, e.end_ts)) > datetime('now')"
+        order = "datetime(COALESCE(m.end_ts, e.end_ts)) ASC"
+    else:
+        future = "COALESCE(m.end_ts, e.end_ts) > NOW()"
+        order = "COALESCE(m.end_ts, e.end_ts) ASC"
+
+    domain_filter = "AND m.domain = :domain" if domain else ""
+    q_filter = "AND (LOWER(m.question) LIKE :q OR LOWER(m.slug) LIKE :q)" if q else ""
+
+    rows = session.execute(
+        sa_text(
+            f"""
+            SELECT
+                m.condition_id, m.slug, m.question, m.domain,
+                COALESCE(m.end_ts, e.end_ts) AS end_ts,
+                m.game_start_ts,
+                t0.token_id AS yes_token_id, t1.token_id AS no_token_id,
+                q0.mid AS yes_mid, q1.mid AS no_mid,
+                en.volume_24h, en.open_interest,
+                m.fees_enabled, m.taker_base_fee,
+                e.title AS event_title
+            FROM markets m
+            LEFT JOIN events e ON e.id = m.event_id
+            LEFT JOIN tokens t0 ON t0.condition_id = m.condition_id AND t0.outcome_index = 0
+            LEFT JOIN tokens t1 ON t1.condition_id = m.condition_id AND t1.outcome_index = 1
+            LEFT JOIN token_quotes q0 ON q0.token_id = t0.token_id
+            LEFT JOIN token_quotes q1 ON q1.token_id = t1.token_id
+            LEFT JOIN market_enrichment en ON en.condition_id = m.condition_id
+            WHERE {active}
+              AND COALESCE(m.end_ts, e.end_ts) IS NOT NULL
+              AND {future}
+              {domain_filter}
+              {q_filter}
+            ORDER BY {order}
+            LIMIT :limit
+            """
+        ),
+        {
+            "limit": limit,
+            **({"domain": domain} if domain else {}),
+            **({"q": f"%{q.lower()}%"} if q else {}),
+        },
+    ).fetchall()
+
+    out: list[dict[str, object]] = []
+    for r in rows:
+        (
+            cid, slug, question, dom, end_ts, game_start_ts,
+            yes_tid, no_tid, yes_mid, no_mid,
+            vol, oi, fees_enabled, taker_fee, event_title,
+        ) = r
+        end_dt = _coerce_dt(end_ts)
+        out.append(
+            {
+                "condition_id": cid,
+                "slug": slug or "",
+                "question": question or "",
+                "domain": dom or "unknown",
+                "end_ts": end_dt.isoformat() if end_dt else None,
+                "game_start_ts": _coerce_dt(game_start_ts).isoformat()
+                if game_start_ts
+                else None,
+                "yes_token_id": yes_tid,
+                "no_token_id": no_tid,
+                "yes_mid": float(yes_mid) if yes_mid is not None else None,
+                "no_mid": float(no_mid) if no_mid is not None else None,
+                "volume_24h": float(vol) if vol is not None else None,
+                "open_interest": float(oi) if oi is not None else None,
+                "event_title": event_title,
+            }
+        )
+    return out
+
+
+_MAIN_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>poly_bot · live markets</title>
+<style>
+:root {
+  --bg: #080c10;
+  --surface: #0f1620;
+  --surface2: #141e2c;
+  --border: #1a2535;
+  --border2: #243044;
+  --text: #dde6f0;
+  --muted: #4d6380;
+  --accent: #3b7ef8;
+  --green: #22c55e;
+  --amber: #f59e0b;
+  --red: #ef4444;
+  --purple: #a855f7;
+  --teal: #14b8a6;
+  --pink: #ec4899;
+  --font: "SF Pro Text","Inter",system-ui,-apple-system,sans-serif;
+  --font-mono: "SF Mono","Fira Code",ui-monospace,monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; line-height: 1.5; min-height: 100vh; }
+
+/* ─── TOP BAR ─────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: 0 1.25rem; height: 48px;
+  background: rgba(8,12,16,.92); backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; font-size: 15px; letter-spacing: -0.3px; color: var(--text); }
+.brand span { color: var(--accent); }
+.live-indicator { display: flex; align-items: center; gap: 6px; }
+.dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--muted); flex-shrink: 0;
+  transition: background 0.3s;
+}
+.dot.ok { background: var(--green); animation: pulse-dot 2s ease-out infinite; }
+.dot.warn { background: var(--amber); }
+.dot.err { background: var(--red); }
+@keyframes pulse-dot {
+  0%,100% { box-shadow: 0 0 0 0 rgba(34,197,94,.5); }
+  50% { box-shadow: 0 0 0 5px rgba(34,197,94,0); }
+}
+.status-text { color: var(--muted); font-size: 12px; }
+.topbar-stats { display: flex; gap: 1.25rem; margin-left: auto; }
+.stat-pill { font-size: 11.5px; color: var(--muted); }
+.stat-pill strong { color: var(--text); font-weight: 600; }
+.topbar-nav { display: flex; gap: 2px; }
+.topbar-nav a {
+  color: var(--muted); text-decoration: none; font-size: 12.5px;
+  padding: 4px 10px; border-radius: 6px;
+  transition: color .15s, background .15s;
+}
+.topbar-nav a:hover { color: var(--text); background: var(--surface2); }
+
+/* ─── FILTER BAR ─────────────────────────────────────── */
+.filter-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 1.25rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.chip {
+  padding: 3px 10px; border-radius: 20px; font-size: 11.5px; font-weight: 500;
+  border: 1px solid var(--border2); background: transparent; color: var(--muted);
+  cursor: pointer; transition: all .15s; letter-spacing: .3px;
+}
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+.chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.chip.active.d-crypto { background: #1d4ed8; border-color: #1d4ed8; }
+.chip.active.d-sports { background: #15803d; border-color: #15803d; }
+.chip.active.d-politics { background: #b45309; border-color: #b45309; }
+.chip.active.d-finance { background: #0f766e; border-color: #0f766e; }
+.chip.active.d-science { background: #7e22ce; border-color: #7e22ce; }
+.search-wrap { margin-left: auto; position: relative; }
+.search-input {
+  background: var(--surface2); border: 1px solid var(--border2); color: var(--text);
+  border-radius: 8px; padding: 5px 10px 5px 30px; font-size: 12.5px; width: 220px;
+  outline: none; transition: border-color .15s;
+}
+.search-input:focus { border-color: var(--accent); }
+.search-icon { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 12px; pointer-events: none; }
+.refresh-btn {
+  background: var(--surface2); border: 1px solid var(--border2); color: var(--muted);
+  border-radius: 8px; padding: 5px 10px; cursor: pointer; font-size: 13px;
+  transition: all .15s;
+}
+.refresh-btn:hover { color: var(--text); border-color: var(--accent); }
+.count-badge { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* ─── TABLE ───────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+col.col-left   { width: 70px; }
+col.col-exp    { width: 96px; }
+col.col-dom    { width: 88px; }
+col.col-price  { width: 60px; }
+col.col-juice  { width: 54px; }
+col.col-vol    { width: 60px; }
+col.col-q      { width: auto; }
+thead th {
+  position: sticky; top: 48px; z-index: 10;
+  background: var(--surface); border-bottom: 1px solid var(--border2);
+  padding: 7px 8px; font-size: 10.5px; font-weight: 600;
+  letter-spacing: .6px; color: var(--muted); text-transform: uppercase;
+  text-align: right; white-space: nowrap; user-select: none; cursor: pointer;
+}
+thead th:first-child, thead th.th-left { text-align: left; }
+thead th.th-q { text-align: left; }
+thead th:hover { color: var(--text); }
+tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+tbody tr:hover { background: rgba(59,126,248,.04); }
+td {
+  padding: 7px 8px; font-family: var(--font-mono); font-size: 12px;
+  text-align: right; vertical-align: middle; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+td.td-left { text-align: left; }
+td.td-q { font-family: var(--font); font-size: 12px; text-align: left; color: var(--text); max-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.loading-row { text-align: center; color: var(--muted); padding: 3rem; font-family: var(--font); }
+.empty-row { text-align: center; color: var(--muted); padding: 2rem; font-family: var(--font); }
+
+/* ─── COUNTDOWN ───────────────────────────────────────── */
+.cd {
+  font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+  display: inline-block; min-width: 52px; text-align: right;
+  color: var(--muted);
+}
+.cd.ok    { color: var(--text); }
+.cd.warm  { color: #fcd34d; }
+.cd.soon  { color: var(--amber); }
+.cd.crit  { color: var(--red); }
+.cd.urg   { color: var(--red); animation: blink .4s step-end infinite; }
+.cd.exp   { color: var(--muted); font-style: italic; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* ─── DOMAIN BADGES ───────────────────────────────────── */
+.badge {
+  display: inline-block; padding: 2px 7px; border-radius: 4px;
+  font-family: var(--font); font-size: 10px; font-weight: 600;
+  letter-spacing: .4px; text-transform: uppercase;
+}
+.b-crypto   { background: rgba(59,130,246,.15); color: #60a5fa; }
+.b-sports   { background: rgba(34,197,94,.15);  color: #4ade80; }
+.b-politics { background: rgba(245,158,11,.15); color: #fbbf24; }
+.b-finance  { background: rgba(20,184,166,.15); color: #2dd4bf; }
+.b-science  { background: rgba(168,85,247,.15); color: #c084fc; }
+.b-culture  { background: rgba(236,72,153,.15); color: #f472b6; }
+.b-unknown  { background: rgba(100,116,139,.1); color: #94a3b8; }
+
+/* ─── PRICE CELLS ─────────────────────────────────────── */
+.price-cell { transition: color .2s; }
+.price-cell.harvest { color: #22c55e; font-weight: 700; }
+.flash-up   { animation: fup .7s ease-out; }
+.flash-down { animation: fdn .7s ease-out; }
+@keyframes fup { 0% { background: rgba(34,197,94,.35); } 100% { background: transparent; } }
+@keyframes fdn { 0% { background: rgba(239,68,68,.35); } 100% { background: transparent; } }
+
+/* ─── JUICE ───────────────────────────────────────────── */
+.juice-pos { color: var(--muted); }
+.juice-tight { color: var(--green); }
+.juice-neg { color: var(--red); }
+
+/* ─── SORT ARROWS ─────────────────────────────────────── */
+th[data-sort="asc"]::after  { content: " ↑"; color: var(--accent); }
+th[data-sort="desc"]::after { content: " ↓"; color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">poly<span>_bot</span></span>
+  <div class="live-indicator">
+    <span class="dot" id="dot"></span>
+    <span class="status-text" id="status-text">connecting…</span>
+  </div>
+  <div class="topbar-stats">
+    <span class="stat-pill">Active <strong id="s-active">—</strong></span>
+    <span class="stat-pill">Quotes <strong id="s-quotes">—</strong></span>
+    <span class="stat-pill">Discovery <strong id="s-disco">—</strong></span>
+  </div>
+  <nav class="topbar-nav">
+    <a href="/harvest">Harvest</a>
+    <a href="/events">Events</a>
+    <a href="/weather">Weather</a>
+    <a href="/taxonomy">Taxonomy</a>
+  </nav>
+</header>
+
+<div class="filter-bar">
+  <div class="chips" id="chips">
+    <button class="chip active" data-domain="">ALL</button>
+    <button class="chip d-crypto" data-domain="crypto">Crypto</button>
+    <button class="chip d-sports" data-domain="sports">Sports</button>
+    <button class="chip d-politics" data-domain="politics">Politics</button>
+    <button class="chip d-finance" data-domain="finance">Finance</button>
+    <button class="chip d-science" data-domain="science">Science</button>
+  </div>
+  <span class="count-badge" id="count-badge"></span>
+  <div class="search-wrap">
+    <span class="search-icon">🔍</span>
+    <input class="search-input" id="search" placeholder="Search markets…" autocomplete="off"/>
+  </div>
+  <button class="refresh-btn" id="refresh-btn" title="Reload markets">↻</button>
+</div>
+
+<div class="table-wrap">
+  <table id="markets-table">
+    <colgroup>
+      <col class="col-left"/><col class="col-exp"/><col class="col-dom"/>
+      <col class="col-price"/><col class="col-price"/>
+      <col class="col-juice"/><col class="col-vol"/><col class="col-q"/>
+    </colgroup>
+    <thead>
+      <tr>
+        <th class="th-left" data-col="left">LEFT</th>
+        <th data-col="end_ts">EXPIRES (UTC)</th>
+        <th class="th-left" data-col="domain">DOMAIN</th>
+        <th data-col="yes_mid">YES</th>
+        <th data-col="no_mid">NO</th>
+        <th data-col="juice">JUICE</th>
+        <th data-col="volume_24h">VOL 24h</th>
+        <th class="th-q" data-col="question">QUESTION</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"><tr><td colspan="8" class="loading-row">Loading markets…</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+'use strict';
+// ── State ─────────────────────────────────────────────────
+let ALL_MARKETS = [];        // raw API response
+let PRICES = {};             // token_id → mid (live from CLOB)
+let PREV_PRICES = {};        // for flash direction
+let ACTIVE_DOMAIN = '';
+let SEARCH_Q = '';
+let SORT_COL = 'left';
+let SORT_ASC = true;
+let PRICE_ES = null;         // EventSource for prices
+
+const MIN_HARVEST = 0.983, MAX_HARVEST = 0.995;
+
+// ── Boot ──────────────────────────────────────────────────
+async function boot() {
+  bindFilters();
+  bindHealthStream();
+  await loadMarkets();
+  setInterval(tickCountdowns, 1000);
+}
+
+// ── Data load ─────────────────────────────────────────────
+async function loadMarkets() {
+  const btn = document.getElementById('refresh-btn');
+  btn.textContent = '…';
+  try {
+    const qs = new URLSearchParams({ limit: 100 });
+    if (ACTIVE_DOMAIN) qs.set('domain', ACTIVE_DOMAIN);
+    if (SEARCH_Q) qs.set('q', SEARCH_Q);
+    const resp = await fetch('/api/markets?' + qs);
+    ALL_MARKETS = await resp.json();
+    // seed PRICES from DB mids (overwritten by SSE later)
+    for (const m of ALL_MARKETS) {
+      if (m.yes_token_id && m.yes_mid !== null) PRICES[m.yes_token_id] = m.yes_mid;
+      if (m.no_token_id  && m.no_mid  !== null) PRICES[m.no_token_id]  = m.no_mid;
+    }
+    renderTable();
+    reconnectPriceStream();
+  } catch(e) {
+    document.getElementById('tbody').innerHTML =
+      '<tr><td colspan="8" class="empty-row">Failed to load — ' + e.message + '</td></tr>';
+  } finally {
+    btn.textContent = '↻';
+  }
+}
+
+// ── Render ────────────────────────────────────────────────
+function renderTable() {
+  const filtered = applySort(filterMarkets(ALL_MARKETS));
+  const badge = document.getElementById('count-badge');
+  badge.textContent = filtered.length + ' markets';
+  if (!filtered.length) {
+    document.getElementById('tbody').innerHTML =
+      '<tr><td colspan="8" class="empty-row">No markets match.</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const m of filtered) frag.appendChild(makeRow(m));
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+  tbody.appendChild(frag);
+}
+
+function filterMarkets(list) {
+  return list.filter(m => {
+    if (ACTIVE_DOMAIN && m.domain !== ACTIVE_DOMAIN) return false;
+    if (SEARCH_Q) {
+      const ql = SEARCH_Q.toLowerCase();
+      if (!m.question.toLowerCase().includes(ql) &&
+          !m.slug.toLowerCase().includes(ql) &&
+          !(m.event_title||'').toLowerCase().includes(ql)) return false;
+    }
+    return true;
+  });
+}
+
+function applySort(list) {
+  return [...list].sort((a, b) => {
+    let av, bv;
+    switch(SORT_COL) {
+      case 'left':    av = secondsLeft(a.end_ts); bv = secondsLeft(b.end_ts); break;
+      case 'end_ts':  av = a.end_ts || ''; bv = b.end_ts || ''; break;
+      case 'domain':  av = a.domain; bv = b.domain; break;
+      case 'yes_mid': av = livePrice(a.yes_token_id, a.yes_mid) ?? -1;
+                      bv = livePrice(b.yes_token_id, b.yes_mid) ?? -1; break;
+      case 'no_mid':  av = livePrice(a.no_token_id, a.no_mid) ?? -1;
+                      bv = livePrice(b.no_token_id, b.no_mid) ?? -1; break;
+      case 'juice':   av = juice(a); bv = juice(b); break;
+      case 'volume_24h': av = a.volume_24h ?? -1; bv = b.volume_24h ?? -1; break;
+      default:        av = a.end_ts || ''; bv = b.end_ts || '';
+    }
+    const cmp = typeof av === 'number' ? av - bv : String(av).localeCompare(String(bv));
+    return SORT_ASC ? cmp : -cmp;
+  });
+}
+
+function makeRow(m) {
+  const tr = document.createElement('tr');
+  tr.dataset.cid = m.condition_id;
+  tr.dataset.endTs = m.end_ts || '';
+  tr.dataset.yTid = m.yes_token_id || '';
+  tr.dataset.nTid = m.no_token_id || '';
+  tr.dataset.domain = m.domain;
+
+  const endFmt = fmtExpires(m.end_ts);
+  const domBadge = `<span class="badge b-${m.domain}">${m.domain}</span>`;
+  const yMid = livePrice(m.yes_token_id, m.yes_mid);
+  const nMid = livePrice(m.no_token_id, m.no_mid);
+  const j = juice(m);
+
+  const yHarvest = yMid !== null && yMid >= MIN_HARVEST && yMid <= MAX_HARVEST;
+  const nHarvest = nMid !== null && nMid >= MIN_HARVEST && nMid <= MAX_HARVEST;
+
+  const link = `https://polymarket.com/market/${m.slug}`;
+
+  tr.innerHTML = `
+    <td class="td-left"><span class="cd" id="cd-${m.condition_id}">—</span></td>
+    <td>${endFmt}</td>
+    <td class="td-left">${domBadge}</td>
+    <td class="price-cell${yHarvest?' harvest':''}" id="y-${m.yes_token_id||m.condition_id}">${fmtMid(yMid)}</td>
+    <td class="price-cell${nHarvest?' harvest':''}" id="n-${m.no_token_id||m.condition_id}">${fmtMid(nMid)}</td>
+    <td class="${juiceCls(j)}">${fmtJuice(j)}</td>
+    <td>${fmtVol(m.volume_24h)}</td>
+    <td class="td-q" title="${esc(m.question)}"><a href="${link}" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">${esc(m.question)}</a></td>
+  `;
+  return tr;
+}
+
+// ── Price stream ──────────────────────────────────────────
+function reconnectPriceStream() {
+  if (PRICE_ES) { PRICE_ES.close(); PRICE_ES = null; }
+  const top20 = ALL_MARKETS.slice(0, 20);
+  const tids = top20.flatMap(m => [m.yes_token_id, m.no_token_id]).filter(Boolean);
+  if (!tids.length) return;
+  PRICE_ES = new EventSource('/api/stream/prices?token_ids=' + tids.join(','));
+  PRICE_ES.onmessage = (e) => {
+    try { applyPrices(JSON.parse(e.data).prices || {}); } catch(_) {}
+  };
+}
+
+function applyPrices(newPrices) {
+  for (const [tid, mid] of Object.entries(newPrices)) {
+    PREV_PRICES[tid] = PRICES[tid];
+    PRICES[tid] = mid;
+    updatePriceCell(tid);
+  }
+  // refresh juice and harvest classes for affected rows
+  const tids = new Set(Object.keys(newPrices));
+  document.querySelectorAll('tr[data-y-tid]').forEach(tr => {
+    if (tids.has(tr.dataset.yTid) || tids.has(tr.dataset.nTid)) {
+      updateRowDerived(tr);
+    }
+  });
+}
+
+function updatePriceCell(tid) {
+  // find cell (could be yes or no)
+  const yCell = document.getElementById('y-' + tid);
+  const nCell = document.getElementById('n-' + tid);
+  const cell = yCell || nCell;
+  if (!cell) return;
+
+  const mid = PRICES[tid];
+  const prev = PREV_PRICES[tid];
+  const text = fmtMid(mid);
+  if (cell.textContent === text) return;
+  cell.textContent = text;
+
+  const harvest = mid !== null && mid >= MIN_HARVEST && mid <= MAX_HARVEST;
+  cell.classList.toggle('harvest', harvest);
+
+  cell.classList.remove('flash-up', 'flash-down');
+  void cell.offsetWidth;
+  if (prev !== undefined && prev !== null) {
+    cell.classList.add(mid > prev ? 'flash-up' : 'flash-down');
+  }
+}
+
+function updateRowDerived(tr) {
+  const yTid = tr.dataset.yTid;
+  const nTid = tr.dataset.nTid;
+  const cid  = tr.dataset.cid;
+  const yMid = PRICES[yTid] ?? null;
+  const nMid = PRICES[nTid] ?? null;
+  const j = (yMid !== null && nMid !== null) ? (1 - yMid - nMid) : null;
+  const jCell = tr.querySelector('.juice-pos, .juice-tight, .juice-neg');
+  if (jCell) {
+    jCell.textContent = fmtJuice(j);
+    jCell.className = juiceCls(j);
+  }
+}
+
+// ── Countdown ─────────────────────────────────────────────
+function tickCountdowns() {
+  const now = Date.now();
+  document.querySelectorAll('tr[data-end-ts]').forEach(tr => {
+    const endTs = tr.dataset.endTs;
+    if (!endTs) return;
+    const diff = new Date(endTs).getTime() - now;
+    const el = document.getElementById('cd-' + tr.dataset.cid);
+    if (!el) return;
+    if (diff <= 0) { el.textContent = 'expired'; el.className = 'cd exp'; return; }
+    const s = Math.floor(diff / 1000);
+    let txt, cls;
+    if (s < 60)    { txt = '0:' + pad(s);                            cls = 'cd urg'; }
+    else if (s < 300)  { txt = Math.floor(s/60) + ':' + pad(s%60);  cls = 'cd crit'; }
+    else if (s < 3600) { txt = Math.floor(s/60) + ':' + pad(s%60);  cls = 'cd soon'; }
+    else if (s < 7200) { txt = Math.floor(s/3600) + 'h ' + pad(Math.floor((s%3600)/60)) + 'm'; cls = 'cd warm'; }
+    else               { txt = Math.floor(s/3600) + 'h ' + pad(Math.floor((s%3600)/60)) + 'm'; cls = 'cd ok'; }
+    el.textContent = txt; el.className = cls;
+  });
+}
+
+// ── Health SSE ────────────────────────────────────────────
+function bindHealthStream() {
+  const dot  = document.getElementById('dot');
+  const stEl = document.getElementById('status-text');
+  const sAc  = document.getElementById('s-active');
+  const sQu  = document.getElementById('s-quotes');
+  const sDi  = document.getElementById('s-disco');
+
+  function connect() {
+    const es = new EventSource('/api/stream?hours=168');
+    es.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        sAc.textContent = (d.counts?.markets_active || 0).toLocaleString();
+        const qa = d.quote_age_s;
+        sQu.textContent = qa == null ? '—' : fmtAge(qa);
+        const da = d.discovery_activity_age_s ?? d.full_age_s;
+        sDi.textContent = da == null ? '—' : fmtAge(da);
+        dot.className = 'dot ' + (qa == null ? 'warn' : qa < 60 ? 'ok' : qa < 600 ? 'warn' : 'err');
+        stEl.textContent = qa == null ? 'no quotes' : qa < 60 ? 'live' : 'stale ' + fmtAge(qa);
+      } catch(_) {}
+    };
+    es.onerror = () => {
+      dot.className = 'dot err'; stEl.textContent = 'offline';
+      es.close(); setTimeout(connect, 4000);
+    };
+  }
+  connect();
+}
+
+// ── Filters ───────────────────────────────────────────────
+function bindFilters() {
+  document.getElementById('chips').addEventListener('click', e => {
+    const chip = e.target.closest('.chip');
+    if (!chip) return;
+    document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    ACTIVE_DOMAIN = chip.dataset.domain || '';
+    renderTable();
+  });
+
+  let searchTimer;
+  document.getElementById('search').addEventListener('input', e => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      SEARCH_Q = e.target.value.trim();
+      renderTable();
+    }, 200);
+  });
+
+  document.getElementById('refresh-btn').addEventListener('click', loadMarkets);
+
+  document.querySelectorAll('thead th[data-col]').forEach(th => {
+    th.addEventListener('click', () => {
+      const col = th.dataset.col;
+      if (SORT_COL === col) { SORT_ASC = !SORT_ASC; }
+      else { SORT_COL = col; SORT_ASC = col === 'left' || col === 'end_ts'; }
+      document.querySelectorAll('thead th').forEach(h => delete h.dataset.sort);
+      th.dataset.sort = SORT_ASC ? 'asc' : 'desc';
+      renderTable();
+    });
+  });
+}
+
+// ── Helpers ───────────────────────────────────────────────
+function livePrice(tid, fallback) {
+  if (tid && PRICES[tid] !== undefined) return PRICES[tid];
+  return fallback ?? null;
+}
+
+function juice(m) {
+  const y = livePrice(m.yes_token_id, m.yes_mid);
+  const n = livePrice(m.no_token_id, m.no_mid);
+  if (y === null || n === null) return null;
+  return 1 - y - n;
+}
+
+function juiceCls(j) {
+  if (j === null) return 'juice-pos';
+  if (j < 0.005) return 'juice-tight';
+  if (j < 0) return 'juice-neg';
+  return 'juice-pos';
+}
+
+function secondsLeft(isoStr) {
+  if (!isoStr) return Infinity;
+  return Math.max(0, (new Date(isoStr).getTime() - Date.now()) / 1000);
+}
+
+function fmtMid(v) {
+  if (v === null || v === undefined) return '—';
+  return v.toFixed(3);
+}
+
+function fmtJuice(j) {
+  if (j === null) return '—';
+  return (j >= 0 ? '+' : '') + (j * 100).toFixed(1) + '¢';
+}
+
+function fmtExpires(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const hhmm = d.toISOString().slice(11, 16);
+  if (sameDay) return hhmm;
+  const mdd = d.toISOString().slice(5, 10).replace('-', '/');
+  return mdd + ' ' + hhmm;
+}
+
+function fmtVol(v) {
+  if (v == null) return '—';
+  if (v >= 1e6) return (v/1e6).toFixed(1) + 'M';
+  if (v >= 1e3) return (v/1e3).toFixed(0) + 'k';
+  return v.toFixed(0);
+}
+
+function fmtAge(s) {
+  if (s === null || s === undefined) return '—';
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.round(s/60) + 'm';
+  return (s/3600).toFixed(1) + 'h';
+}
+
+function pad(n) { return String(n).padStart(2,'0'); }
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Go ────────────────────────────────────────────────────
+boot();
+</script>
+</body>
+</html>
+"""
+
+
+def _render_main_page(settings: Settings) -> str:
+    return _MAIN_PAGE_HTML
 
 
 def run_dashboard(settings: Settings) -> None:
