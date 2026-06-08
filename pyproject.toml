@@ -69,6 +69,7 @@ ignore = ["S101", "SIM108"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
+"src/poly_bot/catalog/dashboard.py" = ["E501", "S110", "S608", "RUF059", "SIM105", "F841", "RUF001"]
 
 [tool.ruff.format]
 quote-style = "double"

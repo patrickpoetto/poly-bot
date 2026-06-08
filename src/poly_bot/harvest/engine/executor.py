@@ -63,6 +63,20 @@ class OrderExecutor:
             log.debug("risk: max_notional=%.0f reached", self._settings.engine_max_notional_usd)
             return
 
+        # price band guard — only execute within configured harvest band
+        if c.ask < self._settings.harvest_min_buy_price:
+            log.debug(
+                "band_skip %s ask=%.4f < min=%.4f",
+                market.condition_id[:12], c.ask, self._settings.harvest_min_buy_price,
+            )
+            return
+        if c.ask > self._settings.harvest_max_buy_price:
+            log.debug(
+                "band_skip %s ask=%.4f > max=%.4f",
+                market.condition_id[:12], c.ask, self._settings.harvest_max_buy_price,
+            )
+            return
+
         # domain policy check
         policy = get_policy(domain)
         verdict: PolicyVerdict = policy.check(c, self._open_by_underlying(), self._settings)
@@ -92,6 +106,7 @@ class OrderExecutor:
         )
         order.status = "filled"
         order.filled_at = datetime.now(UTC)
+        order.pnl_usd = round(order.size_usd * (order.net_yield_pct or 0), 4)
         self._stats.last_order_at = datetime.now(UTC)
         await _persist(order)
         return order

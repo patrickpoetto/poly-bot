@@ -111,8 +111,6 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
     async def api_stream_prices(
         token_ids: str = Query(default=""),
     ) -> StreamingResponse:
-        from poly_bot.exchange.clob_public import ClobPublicClient
-
         tokens = [t.strip() for t in token_ids.split(",") if t.strip()][:40]
 
         async def generator() -> object:
@@ -283,22 +281,24 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
 
         async def generator() -> object:
             from sqlalchemy import text as _text
+
             from poly_bot.persistence.schema import HarvestOrder
 
             while True:
                 try:
                     now = datetime.now(UTC)
-                    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
                     eng = get_engine(settings)
                     with eng.connect() as conn:
                         total = int(conn.execute(_text("SELECT COUNT(*) FROM harvest_orders")).scalar() or 0)
                         paper_count = int(conn.execute(_text("SELECT COUNT(*) FROM harvest_orders WHERE paper = 1")).scalar() or 0)
+                        today_date = now.strftime("%Y-%m-%d")
                         today_count = int(conn.execute(_text(
-                            "SELECT COUNT(*) FROM harvest_orders WHERE created_at >= :ts"
-                        ), {"ts": today_start.isoformat()}).scalar() or 0)
+                            "SELECT COUNT(*) FROM harvest_orders WHERE DATE(created_at) = :d"
+                        ), {"d": today_date}).scalar() or 0)
                         pnl_row = conn.execute(_text(
-                            "SELECT COALESCE(SUM(pnl_usd), 0) FROM harvest_orders WHERE paper = 1 AND status = 'filled'"
-                        )).scalar()
+                            "SELECT COALESCE(SUM(pnl_usd), 0) FROM harvest_orders"
+                            " WHERE paper = 1 AND status = 'filled' AND DATE(created_at) = :d"
+                        ), {"d": today_date}).scalar()
                     with Session(eng) as session:
                         recent_raw = session.exec(
                             select(HarvestOrder)
