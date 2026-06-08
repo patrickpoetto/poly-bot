@@ -26,8 +26,8 @@ from poly_bot.settings import Settings
 
 log = logging.getLogger(__name__)
 
-# taker fee used for net yield estimation (bps → ratio)
-_TAKER_FEE = 0.02
+# worst-case taker fee across all Polymarket markets (0.42%)
+_TAKER_FEE = 0.0042
 
 
 def _net_yield(ask: float) -> float:
