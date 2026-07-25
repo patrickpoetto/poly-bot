@@ -74,3 +74,8 @@ Thumbs.db
 
 # Docker (local overrides)
 docker-compose.override.yml
+.claude/settings.local.json
+
+# Research scratch (notebooks, exported datasets)
+*.ipynb
+*.parquet
