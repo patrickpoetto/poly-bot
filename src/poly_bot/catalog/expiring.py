@@ -394,20 +394,10 @@ def subscription_condition_ids(
     *,
     hours: float | None = None,
 ) -> list[str]:
-    """Markets to stream/enrich: standard expiring window + weather forecast bins."""
-    from poly_bot.weather.quotes import weather_condition_ids
-
+    """Markets to stream/enrich: expiring window."""
     horizon = hours if hours is not None else settings.catalog_quote_horizon_hours
-    standard = expiring_condition_ids(
+    return expiring_condition_ids(
         session,
         hours=horizon,
         sports_in_play_hours=settings.catalog_sports_in_play_hours,
     )
-    weather = weather_condition_ids(session, settings)
-    seen: set[str] = set(standard)
-    out = list(standard)
-    for cid in weather:
-        if cid not in seen:
-            out.append(cid)
-            seen.add(cid)
-    return out

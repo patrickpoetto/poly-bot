@@ -184,7 +184,7 @@ class HarvestOrder(SQLModel, table=True):
     duration_s: int | None = None  # market duration in seconds (300/900/3600)
     underlying: str | None = None  # "btc", "eth", … parsed from question
     price_target: float  # ask used for order sizing
-    size_usd: float  # HARVEST_ORDER_USD
+    size_usd: float  # order size in USD (base = harvest_order_usd; chain = compounded)
     size_shares: float  # size_usd / price_target
     paper: bool = Field(default=True)
     status: str = Field(default="pending")  # pending|filled|cancelled|failed
@@ -194,9 +194,41 @@ class HarvestOrder(SQLModel, table=True):
     pnl_usd: float | None = None
     minutes_left_at_entry: float | None = None
     midpoint_at_entry: float | None = None
+    session_id: str | None = Field(default=None, index=True)
+    # compound chain fields
+    chain_id: str | None = Field(default=None, index=True)   # shared UUID across a chain
+    chain_level: int = Field(default=0)                       # 0=base, 1/2/3...=compound
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), index=True)
     filled_at: datetime | None = None
     resolved_at: datetime | None = None
+
+
+class ChainTicket(SQLModel, table=True):
+    """Pending compound-chain credit — created on win, consumed when next order is placed."""
+
+    __tablename__ = "chain_tickets"
+
+    id: str = Field(primary_key=True)             # UUID4
+    chain_id: str = Field(index=True)             # same UUID as the chain's orders
+    chain_level: int = Field(default=1)           # level of the NEXT order (always > 0)
+    size_usd: float                               # compounded size for next order
+    parent_order_id: str = Field(index=True)      # harvest_orders.id that won
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    status: str = Field(default="pending")        # "pending" | "consumed" | "cancelled"
+    consumed_by_order_id: str | None = None       # harvest_orders.id that consumed this
+
+
+class TradingSession(SQLModel, table=True):
+    """Snapshot of a trading session — groups paper orders for historical analysis."""
+
+    __tablename__ = "trading_sessions"
+
+    id: str = Field(primary_key=True)  # UUID4
+    label: str = Field(default="")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), index=True)
+    order_count: int = Field(default=0)
+    pnl_usd: float | None = None
+    notes: str = Field(default="")
 
 
 class CatalogRun(SQLModel, table=True):

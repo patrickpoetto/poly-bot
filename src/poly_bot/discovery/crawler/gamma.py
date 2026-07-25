@@ -8,9 +8,9 @@ import httpx
 import structlog
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-_MAX_OFFSET = 9_900
-
 from poly_bot.settings import Settings
+
+_MAX_OFFSET = 9_900
 
 logger = structlog.get_logger(__name__)
 

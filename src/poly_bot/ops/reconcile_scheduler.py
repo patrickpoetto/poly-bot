@@ -25,7 +25,7 @@ from poly_bot.persistence.catalog_state import (
     KEY_LAST_RECONCILE_REPORT,
     CatalogStateStore,
 )
-from poly_bot.persistence.db import get_engine, init_db
+from poly_bot.persistence.db import get_engine
 from poly_bot.settings import Settings
 
 logger = structlog.get_logger(__name__)
@@ -37,11 +37,10 @@ async def run_reconcile_loop(
     interval_seconds: int = 3600,
 ) -> None:
     engine = get_engine(settings)
-    init_db(engine)
     logger.info("reconcile_loop_start", interval_s=interval_seconds)
     while True:
         try:
-            _run_once(engine)
+            await asyncio.to_thread(_run_once, engine)
             record_reconcile_run(success=True)
         except Exception:
             logger.exception("reconcile_loop_failed")

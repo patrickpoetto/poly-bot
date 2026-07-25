@@ -98,6 +98,16 @@ class ExecutionCandidate:
 
 
 @dataclass
+class ChainTicketData:
+    """In-memory representation of a pending compound-chain credit."""
+    ticket_id: str
+    chain_id: str
+    chain_level: int     # level of the NEXT order
+    size_usd: float
+    created_at: datetime
+
+
+@dataclass
 class EngineStats:
     stage1_markets: int = 0
     watchlist_size: int = 0

@@ -16,13 +16,13 @@ from poly_bot.harvest.scan import _evaluate_side, scan_harvest_opportunities
 from poly_bot.persistence.schema import Market, Token, TokenQuote
 
 
-def test_buy_yield_at_985_weather_fee() -> None:
+def test_buy_yield_at_985_politics_fee() -> None:
     gross, net, fee = buy_yield_pct(
         0.985,
         fees_enabled=True,
-        fee_type="weather",
+        fee_type="politics",
         fee_schedule=None,
-        domain="weather",
+        domain="politics",
     )
     assert gross == pytest.approx(0.01523, rel=1e-3)
     assert fee > 0
@@ -66,8 +66,8 @@ def test_book_sanity_accepts_tight_winning_book() -> None:
     assert reason is None
 
 
-def test_book_sanity_weather_wide_spread_ok_when_complement_holds() -> None:
-    """Weather: bid 83¢ ask 98¢ is fine if the other side bids ~1¢."""
+def test_book_sanity_wide_spread_ok_when_complement_holds() -> None:
+    """Wide spread (bid 83c ask 98c) is fine if the other side bids ~1c."""
     reason = book_sanity_reject_reason(
         ask=0.984,
         bid=0.830,

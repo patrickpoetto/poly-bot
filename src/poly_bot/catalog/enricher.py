@@ -144,13 +144,17 @@ class CatalogEnricher:
             return 0
         if self._settings.catalog_fetch_open_interest:
             return await self._enrich_open_interest(condition_ids, now)
-        for cid in condition_ids:
-            enrich_row = self._session.get(MarketEnrichment, cid)
-            if enrich_row is None:
-                enrich_row = MarketEnrichment(condition_id=cid)
-            enrich_row.enriched_at = now
-            self._session.add(enrich_row)
-        self._session.commit()
+        # Commit in small batches to avoid holding the write lock for too long.
+        batch_size = 200
+        for i in range(0, len(condition_ids), batch_size):
+            for cid in condition_ids[i : i + batch_size]:
+                enrich_row = self._session.get(MarketEnrichment, cid)
+                if enrich_row is None:
+                    enrich_row = MarketEnrichment(condition_id=cid)
+                enrich_row.enriched_at = now
+                self._session.add(enrich_row)
+            self._session.commit()
+            await asyncio.sleep(0)  # yield between batches so discovery can write
         return len(condition_ids)
 
     def _tokens_by_id(self, token_ids: list[str]) -> list[Token]:

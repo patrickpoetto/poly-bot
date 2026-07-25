@@ -103,10 +103,9 @@ def check_health(
             details[KEY_LAST_DISCOVERY_ACTIVITY_AT] = (
                 activity_age if activity_age is not None else "never"
             )
-            if service == "discovery" and activity_age is not None:
-                if activity_age > max_age_seconds:
-                    details["reason"] = f"discovery inactive ({activity_age}s > {max_age_seconds}s)"
-                    return False, details
+            if service == "discovery" and activity_age is not None and activity_age > max_age_seconds:  # noqa: E501
+                details["reason"] = f"discovery inactive ({activity_age}s > {max_age_seconds}s)"
+                return False, details
 
     if service in ("watch", "ws", "any"):
         with engine.connect() as conn:

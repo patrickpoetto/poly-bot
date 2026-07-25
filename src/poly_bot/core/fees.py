@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 # Protocol taker fee rates by market category (docs.polymarket.com/trading/fees)
@@ -12,7 +13,6 @@ _FEE_TYPE_RATES: dict[str, float] = {
     "politics": 0.04,
     "economics": 0.05,
     "culture": 0.05,
-    "weather": 0.05,
     "general_fees": 0.05,
     "mentions": 0.04,
     "tech": 0.04,
@@ -27,7 +27,7 @@ def effective_fee_rate(
     fee_schedule: dict[str, Any] | None,
     domain: str | None = None,
 ) -> float | None:
-    """Curve fee rate (Θ) for fee = C × rate × p × (1-p)."""
+    """Curve fee rate (Theta) for fee = C x rate x p x (1-p)."""
     if isinstance(fee_schedule, dict):
         raw = fee_schedule.get("rate")
         if raw is not None:
@@ -62,10 +62,8 @@ def maker_rebate_per_share(
     if frac is None and isinstance(fee_schedule, dict):
         raw = fee_schedule.get("rebateRate")
         if raw is not None:
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 frac = float(raw)
-            except (TypeError, ValueError):
-                pass
     if frac is None:
         frac = _DEFAULT_MAKER_REBATE_FRAC
     return taker_fee_per_share(price, fee_rate) * frac

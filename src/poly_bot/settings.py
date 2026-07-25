@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -154,7 +154,7 @@ class Settings(BaseSettings):
         ge=5,
     )
 
-    # Certainty harvest (near-resolution buys at 98–99¢)
+    # Certainty harvest (near-resolution buys at 98-99c)
     harvest_min_net_yield_pct: float = Field(
         default=0.012,
         validation_alias="HARVEST_MIN_NET_YIELD_PCT",
@@ -209,14 +209,14 @@ class Settings(BaseSettings):
         validation_alias="HARVEST_MAX_BID_ASK_SPREAD",
         ge=0,
         le=0.5,
-        description="Live scan: max ask−bid on buy side for non-sports (0 = off)",
+        description="Live scan: max ask-bid on buy side for non-sports (0 = off)",
     )
     harvest_sports_max_bid_ask_spread: float = Field(
-        default=0.05,
+        default=0.08,
         validation_alias="HARVEST_SPORTS_MAX_BID_ASK_SPREAD",
         ge=0,
         le=0.5,
-        description="Live scan: max ask−bid for sports only (0 = complement check only)",
+        description="Live scan: max ask-bid for sports only (0 = complement check only)",
     )
     harvest_max_complement_sum: float = Field(
         default=1.02,
@@ -243,6 +243,18 @@ class Settings(BaseSettings):
     clob_secret: str | None = Field(default=None, validation_alias="POLYMARKET_SECRET")
     clob_passphrase: str | None = Field(default=None, validation_alias="POLYMARKET_PASSPHRASE")
 
+    # Crypto filter: allowlist of underlyings and active-hours window (UTC)
+    engine_crypto_symbols: str = Field(
+        default="",
+        validation_alias="ENGINE_CRYPTO_SYMBOLS",
+        description="Comma-separated crypto underlyings to trade (e.g. btc,eth). Empty = all.",
+    )
+    engine_crypto_active_hours: str = Field(
+        default="",
+        validation_alias="ENGINE_CRYPTO_ACTIVE_HOURS",
+        description="UTC hour range for crypto trading, format 'START-END' (e.g. 8-20). Empty = 24h.",  # noqa: E501
+    )
+
     # Stage 1: coarse monitoring interval for all crypto HOT markets
     engine_stage1_interval_s: float = Field(
         default=2.0,
@@ -254,6 +266,19 @@ class Settings(BaseSettings):
         default=0.5,
         validation_alias="ENGINE_STAGE2_INTERVAL_S",
         description="Seconds between Stage-2 midpoint polls (watchlist)",
+    )
+    # Stop-loss thresholds (mid price below which open positions are closed)
+    engine_stop_loss_crypto: float = Field(
+        default=0.96,
+        validation_alias="ENGINE_STOP_LOSS_CRYPTO",
+        gt=0.0,
+        lt=1.0,
+    )
+    engine_stop_loss_sports: float = Field(
+        default=0.60,
+        validation_alias="ENGINE_STOP_LOSS_SPORTS",
+        gt=0.0,
+        lt=1.0,
     )
     # Price threshold to move from Stage 1 → Stage 2
     engine_alert_threshold: float = Field(
@@ -287,17 +312,153 @@ class Settings(BaseSettings):
     engine_max_open_positions: int = Field(
         default=10,
         validation_alias="ENGINE_MAX_OPEN_POSITIONS",
-        description="Max concurrent open orders",
+        description="Max concurrent open orders (base + chain combined)",
     )
     engine_max_notional_usd: float = Field(
         default=100.0,
         validation_alias="ENGINE_MAX_NOTIONAL_USD",
-        description="Max total USD at risk (sum of open order sizes)",
+        description="Max USD deployed in base (chain_level=0) orders; chain orders are exempt",
     )
     engine_max_positions_per_underlying: int = Field(
         default=3,
         validation_alias="ENGINE_MAX_POSITIONS_PER_UNDERLYING",
         description="Max concurrent open orders for same asset (BTC, ETH, …)",
+    )
+    # Compound chain capital allocation
+    engine_chain_enabled: bool = Field(
+        default=True,
+        validation_alias="ENGINE_CHAIN_ENABLED",
+        description="Enable compound chain strategy: wins fund next order at compounded size",
+    )
+    engine_max_chains: int = Field(
+        default=0,
+        validation_alias="ENGINE_MAX_CHAINS",
+        ge=0,
+        description=(
+            "Max distinct chains per session (0 = unlimited). "
+            "Applies to new chain creation only; existing chains continue to compound."
+        ),
+    )
+
+    # ── NearCT strategy ──────────────────────────────────────────────────────
+    nearct_ask_min: float = Field(
+        default=0.990,
+        validation_alias="NEARCT_ASK_MIN",
+        description="Minimum ask to enter a near-certainty position",
+    )
+    nearct_scan_horizon_min: float = Field(
+        default=4.0,
+        validation_alias="NEARCT_SCAN_HORIZON_MIN",
+        description="Look-ahead window (minutes) for expiring markets",
+    )
+    nearct_min_depth_usd: float = Field(
+        default=15.0,
+        validation_alias="NEARCT_MIN_DEPTH_USD",
+        description="Minimum book depth at ask (USD) to accept the market",
+    )
+    nearct_min_yield_pct: float = Field(
+        default=0.006,
+        validation_alias="NEARCT_MIN_YIELD_PCT",
+        ge=0.0,
+        le=0.05,
+        description=(
+            "Minimum net yield per trade (0.006 = 0.6%). Filters near-1.0 asks "
+            "whose risk/reward is poor (e.g. ask 0.999 pays 0.09% but loses 100%)."
+        ),
+    )
+    nearct_domains: str = Field(
+        default="crypto",
+        validation_alias="NEARCT_DOMAINS",
+        description=(
+            "Comma-separated domains to trade. Only crypto entries can be "
+            "verified against the underlying price feed; sports/unknown at 0.99 "
+            "near expiry are adversely selected (in-play flips)."
+        ),
+    )
+    nearct_verify_base_major_pct: float = Field(
+        default=0.0015,
+        validation_alias="NEARCT_VERIFY_BASE_MAJOR_PCT",
+        ge=0.0,
+        le=0.05,
+        description="BTC/ETH: required spot-to-strike distance per sqrt-minute (0.0015 = 0.15%)",
+    )
+    nearct_verify_base_alt_pct: float = Field(
+        default=0.003,
+        validation_alias="NEARCT_VERIFY_BASE_ALT_PCT",
+        ge=0.0,
+        le=0.05,
+        description="Altcoins: required spot-to-strike distance per sqrt-minute (0.003 = 0.3%)",
+    )
+    # ── Maker quoting (v3) ──────────────────────────────────────────────────
+    nearct_min_sigma: float = Field(
+        default=8.0,
+        validation_alias="NEARCT_MIN_SIGMA",
+        ge=1.0,
+        le=50.0,
+        description="Certainty gate: spot-to-strike distance in realized-vol sigmas",
+    )
+    nearct_target_yield_pct: float = Field(
+        default=0.018,
+        validation_alias="NEARCT_TARGET_YIELD_PCT",
+        gt=0.0,
+        le=0.10,
+        description="Maker bid priced at 1/(1+target): 0.018 -> bid 0.982, no maker fee",
+    )
+    nearct_quote_horizon_min: float = Field(
+        default=90.0,
+        validation_alias="NEARCT_QUOTE_HORIZON_MIN",
+        ge=5.0,
+        le=360.0,
+        description="Quote markets expiring within this window (minutes)",
+    )
+    nearct_min_quote_minutes: float = Field(
+        default=2.0,
+        validation_alias="NEARCT_MIN_QUOTE_MINUTES",
+        ge=0.5,
+        le=30.0,
+        description="Stop quoting a market when less than this is left",
+    )
+    # ── Sports maker ────────────────────────────────────────────────────────
+    nearct_sports_enabled: bool = Field(
+        default=True,
+        validation_alias="NEARCT_SPORTS_ENABLED",
+        description="Quote in-play sports outcomes verified by live trade consensus",
+    )
+    nearct_sports_target_yield_pct: float = Field(
+        default=0.075,
+        validation_alias="NEARCT_SPORTS_TARGET_YIELD_PCT",
+        gt=0.0,
+        le=0.25,
+        description="Sports bid priced at 1/(1+target): 0.075 -> bid 0.930",
+    )
+    nearct_sports_min_volume: float = Field(
+        default=20000.0,
+        validation_alias="NEARCT_SPORTS_MIN_VOLUME",
+        ge=0.0,
+        description="Only quote sports markets with volumeNum above this (USD)",
+    )
+    nearct_sports_consensus: float = Field(
+        default=0.96,
+        validation_alias="NEARCT_SPORTS_CONSENSUS",
+        gt=0.5,
+        lt=1.0,
+        description="Median of recent prints must clear this to quote the outcome",
+    )
+    nearct_sports_inplay_min: float = Field(
+        default=45.0,
+        validation_alias="NEARCT_SPORTS_INPLAY_MIN",
+        ge=0.0,
+        description="Quote only after this many minutes past kickoff (late-game states)",
+    )
+    nearct_start_capital: float = Field(
+        default=10.0,
+        validation_alias="NEARCT_START_CAPITAL",
+        description="Starting capital; also the reset value after a loss",
+    )
+    nearct_max_order_usd: float = Field(
+        default=500.0,
+        validation_alias="NEARCT_MAX_ORDER_USD",
+        description="Hard cap on single order size. Capital above this accumulates but is not bet.",
     )
 
     catalog_dashboard_host: str = Field(
@@ -310,111 +471,6 @@ class Settings(BaseSettings):
         ge=1024,
         le=65535,
     )
-
-    # Weather trading catalog (stations, daily events, bins)
-    weather_forecast_horizon_days: int = Field(
-        default=3,
-        validation_alias="WEATHER_FORECAST_HORIZON_DAYS",
-        ge=0,
-        le=14,
-        description="Sync today through today+N (0=today only, 3=+3 days)",
-    )
-    weather_catalog_sync_enabled: bool = Field(
-        default=True,
-        validation_alias="WEATHER_CATALOG_SYNC_ENABLED",
-    )
-    weather_market_sync_enabled: bool = Field(
-        default=True,
-        validation_alias="WEATHER_MARKET_SYNC_ENABLED",
-    )
-    weather_market_sync_interval_seconds: int = Field(
-        default=180,
-        validation_alias="WEATHER_MARKET_SYNC_INTERVAL_SECONDS",
-        ge=30,
-        le=3600,
-    )
-    weather_aviation_sync_enabled: bool = Field(
-        default=True,
-        validation_alias="WEATHER_AVIATION_SYNC_ENABLED",
-    )
-    weather_aviation_interval_seconds: int = Field(
-        default=900,
-        validation_alias="WEATHER_AVIATION_INTERVAL_SECONDS",
-        ge=60,
-        le=7200,
-    )
-    weather_aviation_api_base: str = Field(
-        default="https://aviationweather.gov/api/data",
-        validation_alias="WEATHER_AVIATION_API_BASE",
-    )
-    weather_open_meteo_api_base: str = Field(
-        default="https://api.open-meteo.com/v1/forecast",
-        validation_alias="WEATHER_OPEN_METEO_API_BASE",
-    )
-    weather_open_meteo_timeout_seconds: float = Field(
-        default=20.0,
-        validation_alias="WEATHER_OPEN_METEO_TIMEOUT_SECONDS",
-        ge=5.0,
-        le=90.0,
-    )
-    weather_open_meteo_models: str = Field(
-        default="ecmwf_ifs025,gfs_seamless,icon_seamless",
-        validation_alias="WEATHER_OPEN_METEO_MODELS",
-    )
-    weather_metar_retention_days: int = Field(
-        default=14,
-        validation_alias="WEATHER_METAR_RETENTION_DAYS",
-        ge=3,
-        le=90,
-    )
-    weather_pilot_station_ids: list[str] = Field(
-        default_factory=list,
-        validation_alias="WEATHER_PILOT_STATION_IDS",
-        description="Comma-separated station ids or ICAO with trading_enabled=true",
-    )
-    weather_wu_sync_enabled: bool = Field(
-        default=True,
-        validation_alias="WEATHER_WU_SYNC_ENABLED",
-    )
-    weather_wu_sync_interval_seconds: int = Field(
-        default=300,
-        validation_alias="WEATHER_WU_SYNC_INTERVAL_SECONDS",
-        ge=60,
-        le=3600,
-        description="Resolution-station WU poll interval (dashboard + serve loop)",
-    )
-    weather_wu_request_timeout_seconds: float = Field(
-        default=20.0,
-        validation_alias="WEATHER_WU_REQUEST_TIMEOUT_SECONDS",
-        ge=5.0,
-        le=60.0,
-    )
-    weather_wu_concurrency: int = Field(
-        default=4,
-        validation_alias="WEATHER_WU_CONCURRENCY",
-        ge=1,
-        le=16,
-    )
-    weather_wu_api_key: SecretStr | None = Field(
-        default=None,
-        validation_alias="WEATHER_WU_API_KEY",
-        description="Optional api.weather.com key; else scraped from wunderground.com",
-    )
-    weather_dashboard_poll_seconds: int = Field(
-        default=300,
-        validation_alias="WEATHER_DASHBOARD_POLL_SECONDS",
-        ge=60,
-        le=3600,
-    )
-
-    @field_validator("weather_pilot_station_ids", mode="before")
-    @classmethod
-    def _parse_pilot_stations(cls, v: object) -> list[str]:
-        if v is None or v == "":
-            return []
-        if isinstance(v, list):
-            return [str(x).strip().lower() for x in v if str(x).strip()]
-        return [p.strip().lower() for p in str(v).split(",") if p.strip()]
 
     metrics_enabled: bool = Field(default=False, validation_alias="METRICS_ENABLED")
     metrics_port: int = Field(
@@ -460,9 +516,8 @@ class Settings(BaseSettings):
 
     @property
     def catalog_quote_horizon_hours(self) -> float:
-        """Lookahead for WS + REST enrich (expiring slice + weather forecast days)."""
-        weather_hours = float((self.weather_forecast_horizon_days + 1) * 24)
-        return min(168.0, max(self.catalog_expiring_hours, weather_hours))
+        """Lookahead for WS + REST enrich (expiring slice)."""
+        return min(168.0, self.catalog_expiring_hours)
 
     @property
     def catalog_db_path(self) -> Path:

@@ -24,8 +24,8 @@ class CryptoPolicy:
             return settings.engine_max_entry_minutes_15m
         if market.duration == MarketDuration.HOUR1:
             return settings.engine_max_entry_minutes_60m
-        # unknown duration → conservative
-        return settings.engine_max_entry_minutes_5m
+        # LONG (daily finance, etc.) — allow entry anywhere in the monitor window
+        return settings.engine_monitor_horizon_minutes
 
     def check_entry_timing(
         self, market: MonitoredMarket, settings: Settings
@@ -84,6 +84,6 @@ class SportsPolicy:
 
 
 def get_policy(domain: str) -> CryptoPolicy | SportsPolicy:
-    if domain == "crypto":
+    if domain in ("crypto", "finance"):
         return CryptoPolicy()
     return SportsPolicy()

@@ -62,10 +62,7 @@ def _time_ok(
     cap = max_minutes_left
     if cap is None and settings.harvest_max_minutes_left > 0:
         cap = settings.harvest_max_minutes_left
-    if cap is not None and cap > 0:
-        if m.hours_left * 60.0 > cap:
-            return False
-    return True
+    return not (cap is not None and cap > 0 and m.hours_left * 60.0 > cap)
 
 
 def _evaluate_side(
@@ -95,9 +92,8 @@ def _evaluate_side(
         if not sq.book_fetched or sq.ask is None:
             return None
         max_book_age = settings.harvest_max_book_age_seconds
-        if max_book_age > 0:
-            if sq.book_age_s is None or sq.book_age_s > max_book_age:
-                return None
+        if max_book_age > 0 and (sq.book_age_s is None or sq.book_age_s > max_book_age):
+            return None
         sanity = book_sanity_reject_reason(
             ask=price,
             bid=sq.bid,
@@ -176,9 +172,9 @@ def _collect_opportunities(
             sq = quotes.get(side)
             if sq is None:
                 continue
-            if require_fresh_quotes and max_age > 0:
-                if sq.quote_age_s is None or sq.quote_age_s > max_age:
-                    continue
+            stale = sq.quote_age_s is None or sq.quote_age_s > max_age
+            if require_fresh_quotes and max_age > 0 and stale:
+                continue
             other = quotes.get("no" if side == "yes" else "yes")
             opp = _evaluate_side(
                 m,

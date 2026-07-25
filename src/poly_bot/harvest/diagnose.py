@@ -160,10 +160,10 @@ async def diagnose_harvest(
             sq = quotes.get(m.condition_id, {}).get(side)
             if sq is None:
                 continue
-            if require_fresh_quotes and max_age > 0:
-                if sq.quote_age_s is None or sq.quote_age_s > max_age:
-                    diag.stale_skipped += 1
-                    continue
+            stale = sq.quote_age_s is None or sq.quote_age_s > max_age
+            if require_fresh_quotes and max_age > 0 and stale:
+                diag.stale_skipped += 1
+                continue
             diag.sides_with_quote += 1
             other_sq = quotes.get(m.condition_id, {}).get("no" if side == "yes" else "yes")
             price, src = _effective_price(sq)

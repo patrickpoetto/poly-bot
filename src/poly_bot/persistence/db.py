@@ -32,7 +32,7 @@ def get_engine(settings: Settings) -> Engine:
                 return
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA busy_timeout=30000")  # wait up to 30s instead of failing
+            cursor.execute("PRAGMA busy_timeout=60000")  # wait up to 60s instead of failing
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
@@ -42,18 +42,13 @@ def get_engine(settings: Settings) -> Engine:
 
 def init_db(engine: Engine) -> None:
     """Ensure schema exists — Alembic on Postgres, create_all on SQLite."""
-    _register_weather_models()
+    # Import side-effectful schemas so SQLModel.metadata is fully populated.
+    import poly_bot.nearct.schema  # noqa: F401
     if engine.dialect.name == "postgresql":
         run_alembic_upgrade(engine)
         return
     SQLModel.metadata.create_all(engine)
     _migrate_schema(engine)
-
-
-def _register_weather_models() -> None:
-    """Register weather tables on SQLModel metadata before create_all / Alembic."""
-    from poly_bot.weather import forecast_schema as _weather_forecast_schema  # noqa: F401
-    from poly_bot.weather import schema as _weather_schema  # noqa: F401
 
 
 def run_alembic_upgrade(engine: Engine) -> None:
@@ -85,6 +80,9 @@ def _migrate_schema(engine: Engine) -> None:
     """Best-effort SQLite migrations for existing catalog DBs."""
     with engine.connect() as conn:
         _add_column_if_missing(conn, "catalog_runs", "series_upserted", "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "harvest_orders", "session_id", "TEXT")
+        _add_column_if_missing(conn, "harvest_orders", "chain_id", "TEXT")
+        _add_column_if_missing(conn, "harvest_orders", "chain_level", "INTEGER DEFAULT 0")
         for table, col, typedef in (
             ("markets", "fees_enabled", "INTEGER DEFAULT 0"),
             ("markets", "fee_type", "TEXT"),

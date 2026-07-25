@@ -1,5 +1,6 @@
 """Map Gamma API JSON payloads to SQLModel entities."""
 
+import contextlib
 import json
 from datetime import datetime
 from typing import Any
@@ -134,10 +135,8 @@ def gamma_market_enrichment_fields(raw: dict[str, Any]) -> dict[str, Any]:
     schedule = fee.get("fee_schedule")
     fee_rate_bps: int | None = None
     if isinstance(schedule, dict) and schedule.get("rate") is not None:
-        try:
+        with contextlib.suppress(TypeError, ValueError):
             fee_rate_bps = int(float(schedule["rate"]) * 10_000)
-        except (TypeError, ValueError):
-            pass
 
     return {
         "volume_24h": fee.get("volume_24h"),

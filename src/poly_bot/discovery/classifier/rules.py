@@ -42,31 +42,56 @@ _DOMAIN_TAG_MAP: dict[str, str] = {
     "science": "science",
     "pop-culture": "culture",
     "entertainment": "culture",
-    "weather": "weather",
-    "climate": "weather",
-    "temperature": "weather",
-    "global-temp": "weather",
-    "precipitation": "weather",
-    "hurricane": "weather",
 }
 
-# Slug / question hints when Gamma tags are missing or generic.
-_WEATHER_TEXT_HINTS: tuple[str, ...] = (
-    "weather",
-    "temperature",
-    "rainfall",
-    "precipitation",
-    "hurricane",
-    "snowfall",
-    "celsius",
-    "fahrenheit",
-    "high-temp",
-    "low-temp",
-    "highest-temperature",
-    "lowest-temperature",
-    "degrees in",
-    "°f",
-    "°c",
+# Sports text/slug hints — used when a market has no usable tags (e.g. FIFA World Cup,
+# lower-division football, esports leagues that Gamma doesn't tag as "sports").
+_SPORTS_QUESTION_HINTS: tuple[str, ...] = (
+    " vs. ",           # head-to-head: "France vs. Senegal"
+    "leading at halftime",
+    "to score first",
+    "to win the second half",
+    "both teams to score",
+    "exact score:",
+    "draw at halftime",
+    "will win on ",    # "Will France win on 2026-06-16?"
+    "+ goals",
+    "+ assists",
+    "+ shots",
+    "+ rebounds",
+    "+ home run",
+    "home runs o/u",
+    "total kills",
+    "total sets",
+    "map winner",
+    "game winner",
+    "map handicap",
+)
+
+# League slug prefixes that indicate sports markets lacking a "sports" tag
+_SPORTS_SLUG_PREFIXES: tuple[str, ...] = (
+    "fifwc-",   # FIFA World Cup
+    "bl2-",     # Bundesliga 2
+    "es2-",     # Spanish Segunda
+    "tur-",     # Turkish Super Lig
+    "col1-",    # Colombian Primera
+    "chi1-",    # Chilean Primera
+    "por-",     # Portuguese Liga
+    "arg-",     # Argentine Primera
+    "fra-",     # French Ligue
+    "ita-",     # Italian Serie
+    "eng-",     # English leagues
+    "ned-",     # Dutch Eredivisie
+    "bel-",     # Belgian Pro League
+    "sco-",     # Scottish Premiership
+    "gre-",     # Greek Super League
+    "bra-",     # Brazilian Serie
+    "mex-",     # Mexican Liga
+    "usa-",     # US leagues (MLS etc)
+    "sc2-",     # StarCraft II
+    "rl-",      # Rocket League
+    "val-",     # Valorant
+    "cs2-",     # Counter-Strike 2
 )
 
 
@@ -98,10 +123,13 @@ def classify_domain_from_tags(tags: list[str]) -> str:
 
 
 def classify_domain_from_text(*, slug: str, question: str = "") -> str | None:
-    """Fallback when tags do not map — Polymarket weather markets often lack a Weather tag."""
-    blob = f"{slug} {question}".lower()
-    if any(hint in blob for hint in _WEATHER_TEXT_HINTS):
-        return "weather"
+    """Fallback when tags do not map to a known domain."""
+    q_lower = question.lower()
+    if any(hint in q_lower for hint in _SPORTS_QUESTION_HINTS):
+        return "sports"
+    slug_lower = slug.lower()
+    if any(slug_lower.startswith(prefix) for prefix in _SPORTS_SLUG_PREFIXES):
+        return "sports"
     return None
 
 
@@ -202,7 +230,7 @@ def classify_market(
         resolution_source = "chainlink"
     elif domain == "sports":
         resolution_source = "sports_api"
-    elif domain == "weather" or domain == "politics":
+    elif domain == "politics":
         resolution_source = "uma"
 
     if overrides is not None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import httpx
@@ -145,10 +146,8 @@ class ClobPublicClient:
                 else:
                     raw = val
                 if raw is not None:
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         result[str(tid)] = float(raw)
-                    except (TypeError, ValueError):
-                        pass
             return
         if isinstance(data, list):
             for item in data:
@@ -157,7 +156,5 @@ class ClobPublicClient:
                 tid = str(item.get("token_id") or item.get("asset_id") or "")
                 raw = item.get(value_key) or item.get("price") or item.get("mid")
                 if tid and raw is not None:
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         result[tid] = float(raw)
-                    except (TypeError, ValueError):
-                        pass

@@ -25,10 +25,8 @@ def print_expiring_table(markets: list[ExpiringMarket], *, hours: float) -> None
 
     now = datetime.now(UTC)
     for m in markets[:200]:
-        age = ""
         if m.quote_updated_at:
-            age_sec = (now - m.quote_updated_at).total_seconds()
-            age = f"{age_sec:.0f}s"
+            (now - m.quote_updated_at).total_seconds()
         table.add_row(
             m.end_ts.strftime("%m-%d %H:%M"),
             f"{m.hours_left:.1f}h",

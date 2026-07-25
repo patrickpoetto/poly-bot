@@ -16,7 +16,7 @@ import structlog
 from sqlalchemy import text
 from sqlmodel import Session, select
 
-from poly_bot.discovery.classifier.rules import classify_domain_from_tags
+from poly_bot.discovery.classifier.rules import classify_domain_from_tags, classify_domain_from_text
 from poly_bot.persistence.schema import Series
 
 logger = structlog.get_logger(__name__)
@@ -206,15 +206,11 @@ class CatalogLinker:
     # ── domain backfill ──────────────────────────────────────────────────────
 
     def _apply_domain_from_events(self) -> int:
-        """Paginate unknown-domain markets; classify from already-materialized market_tags.
-
-        Reads only ``(condition_id, tag)`` rows from ``market_tags`` — no event
-        payloads — so memory stays flat regardless of catalog size.
-        """
+        """Paginate unknown-domain markets; classify from market_tags then text/slug fallback."""
         select_sql = (
             text(
                 """
-            SELECT m.condition_id, COALESCE(
+            SELECT m.condition_id, m.slug, m.question, COALESCE(
                 (SELECT string_agg(mt.tag, ',') FROM market_tags mt
                  WHERE mt.condition_id = m.condition_id), ''
             ) AS tags
@@ -228,7 +224,7 @@ class CatalogLinker:
             if self._is_postgres()
             else text(
                 """
-            SELECT m.condition_id, COALESCE(
+            SELECT m.condition_id, m.slug, m.question, COALESCE(
                 (SELECT GROUP_CONCAT(mt.tag, ',') FROM market_tags mt
                  WHERE mt.condition_id = m.condition_id), ''
             ) AS tags
@@ -246,13 +242,17 @@ class CatalogLinker:
             rows = self._session.execute(select_sql, {"last": last_cid, "lim": _BATCH}).fetchall()
             if not rows:
                 break
-            for cid, tags_csv in rows:
-                if not tags_csv:
-                    continue
-                tags = [t for t in str(tags_csv).split(",") if t]
+            for cid, slug, question, tags_csv in rows:
+                tags = [t for t in str(tags_csv).split(",") if t] if tags_csv else []
                 domain = classify_domain_from_tags(tags)
                 if domain == "unknown":
-                    continue
+                    domain_text = classify_domain_from_text(
+                        slug=str(slug or ""),
+                        question=str(question or ""),
+                    )
+                    if domain_text is None:
+                        continue
+                    domain = domain_text
                 by_domain[domain].append(str(cid))
             last_cid = str(rows[-1][0])
 

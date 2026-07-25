@@ -91,7 +91,7 @@ def test_non_sports_uses_hours_left(settings) -> None:
                 condition_id="0xwx",
                 slug="wx-today",
                 question="NYC high temp?",
-                domain="weather",
+                domain="politics",
                 active=True,
                 closed=False,
                 end_ts=now + timedelta(hours=5),
@@ -127,7 +127,7 @@ def test_window_stats_funnel(settings) -> None:
                 condition_id="0xws2",
                 slug="soon",
                 question="Soon",
-                domain="weather",
+                domain="crypto",
                 active=True,
                 closed=False,
                 end_ts=now + timedelta(hours=1),
@@ -161,4 +161,4 @@ def test_window_stats_funnel(settings) -> None:
         assert stats.mid_ge_95 == 1
         assert stats.in_harvest_band == 1
         assert stats.global_quotes_total == 1
-        assert any(d.domain == "weather" for d in stats.by_domain)
+        assert any(d.domain == "crypto" for d in stats.by_domain)

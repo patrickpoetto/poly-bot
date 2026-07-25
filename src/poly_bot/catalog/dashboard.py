@@ -36,36 +36,94 @@ from poly_bot.settings import Settings
 logger: structlog.stdlib.BoundLogger = structlog.get_logger()
 
 
-async def _discovery_background(settings: Settings) -> None:
-    """Discovery scheduler — runs forever with configured intervals."""
+def _run_discovery_in_thread(settings: Settings) -> None:
+    """Run discovery scheduler in its own thread with a private event loop.
+
+    Keeps all sync SQLAlchemy calls off the uvicorn event loop so HTTP stays
+    responsive even when SQLite is under write-lock contention.
+    """
+    import asyncio as _aio
+
     from poly_bot.discovery.scheduler import DiscoveryScheduler
 
-    sched = DiscoveryScheduler(settings)
-    sched.init_database()
-    await sched.run_forever()
+    async def _inner() -> None:
+        sched = DiscoveryScheduler(settings)
+        sched.init_database()
+        await sched.run_forever()
+
+    _aio.run(_inner())
+
+
+def _run_enrich_cycle_in_thread(settings: Settings) -> None:
+    """Run one enrich cycle in a thread with a private event loop."""
+    import asyncio as _aio
+
+    from poly_bot.catalog.enricher import CatalogEnricher
+
+    async def _inner() -> None:
+        with Session(get_engine(settings)) as session:
+            enricher = CatalogEnricher(settings, session)
+            stats = await enricher.enrich_expiring_window(hours=48, force=False)
+            logger.debug("dashboard_enrich_done", **stats)
+
+    _aio.run(_inner())
+
+
+def _run_reconcile_in_thread(settings: Settings) -> None:
+    """Run reconcile loop in a thread with a private event loop."""
+    import asyncio as _aio
+
+    from poly_bot.ops.reconcile_scheduler import run_reconcile_loop
+
+    _aio.run(run_reconcile_loop(settings, interval_seconds=3600))
+
+
+async def _discovery_background(settings: Settings) -> None:
+    """Offload discovery to a thread so sync SQLAlchemy never blocks uvicorn."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _run_discovery_in_thread, settings)
 
 
 async def _enrich_background(settings: Settings) -> None:
-    """Enrich quotes for the lookahead window on a fixed interval."""
-    from poly_bot.catalog.enricher import CatalogEnricher
-
+    """Enrich quotes on a fixed interval, each cycle in its own thread."""
+    await asyncio.sleep(10)  # let discovery write its first heartbeat before competing for the lock
     interval = settings.catalog_enrich_interval_seconds
+    loop = asyncio.get_running_loop()
     while True:
         try:
-            with Session(get_engine(settings)) as session:
-                enricher = CatalogEnricher(settings, session)
-                stats = await enricher.enrich_expiring_window(hours=48, force=False)
-                logger.debug("dashboard_enrich_done", **stats)
+            await loop.run_in_executor(None, _run_enrich_cycle_in_thread, settings)
         except Exception:
             logger.exception("dashboard_enrich_failed")
         await asyncio.sleep(interval)
 
 
 async def _reconcile_background(settings: Settings) -> None:
-    """Close expired markets — runs every hour."""
-    from poly_bot.ops.reconcile_scheduler import run_reconcile_loop
+    """Offload reconcile to a thread so sync SQLAlchemy never blocks uvicorn."""
+    await asyncio.sleep(30)  # don't compete with startup writes
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _run_reconcile_in_thread, settings)
 
-    await run_reconcile_loop(get_engine(settings), interval_seconds=3600)
+
+# NearCT engine singleton — shared between the background task and the API routes
+_nearct_engine: object = None
+
+
+async def _nearct_background(settings: Settings) -> None:
+    """NearCT sequential compounding engine."""
+    global _nearct_engine
+    from poly_bot.nearct.engine import NearctEngine
+
+    await asyncio.sleep(5)  # let DB init settle
+    engine = NearctEngine(settings)
+    _nearct_engine = engine
+    while True:
+        try:
+            await engine.run()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("nearct_engine_crashed — restarting in 60s")
+            await asyncio.sleep(60)
 
 
 @contextlib.asynccontextmanager
@@ -74,6 +132,7 @@ async def _lifespan(app: FastAPI, settings: Settings):  # type: ignore[misc]
         asyncio.create_task(_discovery_background(settings), name="discovery"),
         asyncio.create_task(_enrich_background(settings), name="enrich"),
         asyncio.create_task(_reconcile_background(settings), name="reconcile"),
+        asyncio.create_task(_nearct_background(settings), name="nearct"),
     ]
     logger.info("dashboard_background_started", tasks=[t.get_name() for t in tasks])
     try:
@@ -240,40 +299,196 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
 
     @app.get("/api/orders")
     def api_orders(
-        limit: int = Query(default=50, ge=1, le=500),
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
         paper: bool | None = Query(default=None),
+        status: str = Query(default=""),
+        domain: str = Query(default=""),
     ) -> list[dict[str, object]]:
+        from sqlalchemy import text as _text2
+
         from poly_bot.persistence.schema import HarvestOrder
 
         with Session(get_engine(settings)) as session:
-            stmt = select(HarvestOrder).order_by(HarvestOrder.created_at.desc()).limit(limit)  # type: ignore[arg-type]
+            stmt = select(HarvestOrder).where(HarvestOrder.session_id.is_(None)).order_by(HarvestOrder.created_at.desc()).offset(offset).limit(limit)  # type: ignore[union-attr,arg-type]
             if paper is not None:
                 stmt = stmt.where(HarvestOrder.paper == paper)
+            if status:
+                stmt = stmt.where(HarvestOrder.status == status)
+            if domain:
+                stmt = stmt.where(HarvestOrder.domain == domain)
             rows = session.exec(stmt).all()
-        return [
+            # fetch end_ts for each order's market in one query
+            cids = list({r.condition_id for r in rows})
+            end_ts_map: dict[str, str | None] = {}
+            if cids:
+                placeholders = ",".join(f":c{i}" for i in range(len(cids)))
+                params = {f"c{i}": c for i, c in enumerate(cids)}
+                res = session.execute(
+                    _text2(f"SELECT condition_id, end_ts FROM markets WHERE condition_id IN ({placeholders})"),
+                    params,
+                ).fetchall()
+                end_ts_map = dict(res)
+        return [_order_json(r, end_ts=end_ts_map.get(r.condition_id)) for r in rows]
+
+    @app.post("/api/orders/snapshot")
+    def snapshot_session(label: str = Form(default="")) -> JSONResponse:
+        """Move all unsnapshot paper orders into a named TradingSession.
+
+        Also cancels pending chain tickets that belong to the archived orders,
+        so the executor starts clean for the next session.
+        """
+        import uuid as _uuid
+
+        from sqlalchemy import text as _text
+        from sqlmodel import Session as _Session
+
+        from poly_bot.persistence.schema import TradingSession
+
+        engine = get_engine(settings)
+        session_id = str(_uuid.uuid4())
+        ts_label = label.strip() or datetime.now(UTC).strftime("Session %Y-%m-%d %H:%M")
+        with _Session(engine) as session:
+            # aggregate in one query, then bulk-update — avoids N row-level locks
+            agg = session.execute(_text(
+                "SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0.0) "
+                "FROM harvest_orders WHERE paper = 1 AND session_id IS NULL"
+            )).one()
+            count, pnl = int(agg[0]), round(float(agg[1]), 4)
+            if count:
+                session.execute(_text(
+                    "UPDATE harvest_orders SET session_id = :sid "
+                    "WHERE paper = 1 AND session_id IS NULL"
+                ), {"sid": session_id})
+                # Cancel pending chain tickets for archived chains so the executor
+                # doesn't carry them over into the next session.
+                session.execute(_text(
+                    "UPDATE chain_tickets SET status = 'cancelled' "
+                    "WHERE status = 'pending' AND chain_id IN ("
+                    "  SELECT DISTINCT chain_id FROM harvest_orders"
+                    "  WHERE session_id = :sid AND chain_id IS NOT NULL"
+                    ")"
+                ), {"sid": session_id})
+            ts = TradingSession(
+                id=session_id,
+                label=ts_label,
+                order_count=count,
+                pnl_usd=pnl,
+            )
+            session.add(ts)
+            session.commit()
+        return JSONResponse({"session_id": session_id, "label": ts_label, "orders": count, "pnl_usd": pnl})
+
+    @app.get("/api/sessions")
+    def list_sessions() -> JSONResponse:
+        """List all trading sessions ordered newest first."""
+        from sqlmodel import Session as _Session
+        from sqlmodel import select as _select
+
+        from poly_bot.persistence.schema import TradingSession
+
+        engine = get_engine(settings)
+        with _Session(engine) as session:
+            rows = session.exec(
+                _select(TradingSession).order_by(TradingSession.created_at.desc())  # type: ignore[attr-defined]
+            ).all()
+        return JSONResponse([
             {
                 "id": r.id,
-                "condition_id": r.condition_id,
-                "token_id": r.token_id,
-                "side": r.side,
-                "domain": r.domain,
-                "question": r.question,
-                "underlying": r.underlying,
-                "duration_s": r.duration_s,
-                "price_target": r.price_target,
-                "size_usd": r.size_usd,
-                "size_shares": r.size_shares,
-                "paper": r.paper,
-                "status": r.status,
-                "net_yield_pct": round(r.net_yield_pct * 100, 3) if r.net_yield_pct else None,
-                "pnl_usd": r.pnl_usd,
-                "minutes_left_at_entry": r.minutes_left_at_entry,
-                "midpoint_at_entry": r.midpoint_at_entry,
+                "label": r.label,
                 "created_at": r.created_at.isoformat(),
-                "filled_at": r.filled_at.isoformat() if r.filled_at else None,
+                "order_count": r.order_count,
+                "pnl_usd": r.pnl_usd,
             }
             for r in rows
-        ]
+        ])
+
+    @app.get("/orders", response_class=HTMLResponse)
+    def orders_page() -> str:
+        return _ORDERS_PAGE_HTML
+
+    @app.get("/chains", response_class=HTMLResponse)
+    def chains_page() -> str:
+        return _CHAINS_PAGE_HTML
+
+    @app.get("/api/chains")
+    def api_chains() -> JSONResponse:
+        try:
+            return JSONResponse(_build_chains_payload(settings))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/api/stream/chains")
+    async def api_stream_chains() -> StreamingResponse:
+        """SSE — full chain grid every 5 s."""
+
+        async def generator() -> object:
+            while True:
+                try:
+                    payload = _build_chains_payload(settings)
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except Exception:
+                    yield f"data: {json.dumps({'error': True})}\n\n"
+                await asyncio.sleep(5)
+
+        return StreamingResponse(
+            generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/api/chains/{chain_id}/close")
+    def close_chain(chain_id: str) -> JSONResponse:
+        """Mark a chain as closing: cancel pending ticket + create sentinel."""
+        import uuid as _uuid2
+
+        from sqlmodel import Session as _Sess
+        from sqlmodel import select as _sel
+
+        from poly_bot.persistence.schema import ChainTicket, HarvestOrder
+
+        with _Sess(get_engine(settings)) as session:
+            # cancel any pending tickets for this chain
+            pending_tickets = session.exec(
+                _sel(ChainTicket).where(
+                    ChainTicket.chain_id == chain_id,  # type: ignore[arg-type]
+                    ChainTicket.status == "pending",  # type: ignore[arg-type]
+                )
+            ).all()
+            for t in pending_tickets:
+                t.status = "cancelled"
+                session.add(t)
+
+            # if there's an active order, create a closing sentinel so reconciler
+            # won't open a new ticket after this order resolves
+            active_order = session.exec(
+                _sel(HarvestOrder).where(
+                    HarvestOrder.chain_id == chain_id,  # type: ignore[arg-type]
+                    HarvestOrder.status.in_(["filled", "pending"]),  # type: ignore[arg-type]
+                )
+            ).first()
+
+            if active_order:
+                already = session.exec(
+                    _sel(ChainTicket).where(
+                        ChainTicket.chain_id == chain_id,  # type: ignore[arg-type]
+                        ChainTicket.status == "cancelled",  # type: ignore[arg-type]
+                    )
+                ).first()
+                if not already:
+                    sentinel = ChainTicket(
+                        id=str(_uuid2.uuid4()),
+                        chain_id=chain_id,
+                        chain_level=0,
+                        size_usd=0.0,
+                        parent_order_id=active_order.id,
+                        status="cancelled",
+                    )
+                    session.add(sentinel)
+
+            session.commit()
+
+        return JSONResponse({"ok": True, "chain_id": chain_id})
 
     @app.get("/api/stream/engine")
     async def api_stream_engine() -> StreamingResponse:
@@ -289,39 +504,27 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
                     now = datetime.now(UTC)
                     eng = get_engine(settings)
                     with eng.connect() as conn:
-                        total = int(conn.execute(_text("SELECT COUNT(*) FROM harvest_orders")).scalar() or 0)
-                        paper_count = int(conn.execute(_text("SELECT COUNT(*) FROM harvest_orders WHERE paper = 1")).scalar() or 0)
+                        total = int(conn.execute(_text("SELECT COUNT(*) FROM harvest_orders WHERE session_id IS NULL")).scalar() or 0)
+                        paper_count = int(conn.execute(_text("SELECT COUNT(*) FROM harvest_orders WHERE paper = 1 AND session_id IS NULL")).scalar() or 0)
                         today_date = now.strftime("%Y-%m-%d")
                         today_count = int(conn.execute(_text(
-                            "SELECT COUNT(*) FROM harvest_orders WHERE DATE(created_at) = :d"
+                            "SELECT COUNT(*) FROM harvest_orders WHERE DATE(created_at) = :d AND session_id IS NULL"
                         ), {"d": today_date}).scalar() or 0)
+                        open_count = int(conn.execute(_text(
+                            "SELECT COUNT(*) FROM harvest_orders WHERE status = 'filled' AND resolved_at IS NULL AND session_id IS NULL"
+                        )).scalar() or 0)
                         pnl_row = conn.execute(_text(
                             "SELECT COALESCE(SUM(pnl_usd), 0) FROM harvest_orders"
-                            " WHERE paper = 1 AND status = 'filled' AND DATE(created_at) = :d"
-                        ), {"d": today_date}).scalar()
+                            " WHERE paper = 1 AND status IN ('won','lost') AND session_id IS NULL"
+                        )).scalar()
                     with Session(eng) as session:
                         recent_raw = session.exec(
                             select(HarvestOrder)
+                            .where(HarvestOrder.session_id.is_(None))  # type: ignore[union-attr]
                             .order_by(HarvestOrder.created_at.desc())  # type: ignore[arg-type]
-                            .limit(20)
+                            .limit(10)
                         ).all()
-                    recent = [
-                        {
-                            "id": r.id[:8],
-                            "domain": r.domain,
-                            "side": r.side,
-                            "underlying": r.underlying or "",
-                            "price_target": r.price_target,
-                            "net_yield_pct": round(r.net_yield_pct * 100, 2) if r.net_yield_pct else None,
-                            "size_usd": r.size_usd,
-                            "status": r.status,
-                            "paper": r.paper,
-                            "minutes_left": round(r.minutes_left_at_entry or 0, 1),
-                            "question": r.question[:60],
-                            "created_at": r.created_at.isoformat(),
-                        }
-                        for r in recent_raw
-                    ]
+                    recent = [_order_json(r) for r in recent_raw]
                     last_at = recent_raw[0].created_at.isoformat() if recent_raw else None
                     payload = {
                         "ts": now.isoformat(),
@@ -329,6 +532,7 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
                         "orders_total": total,
                         "orders_paper": paper_count,
                         "orders_today": today_count,
+                        "orders_open": open_count,
                         "pnl_paper_usd": float(pnl_row or 0),
                         "last_order_at": last_at,
                         "recent_orders": recent,
@@ -344,6 +548,79 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/nearct", response_class=HTMLResponse)
+    def nearct_page() -> str:
+        return _NEARCT_PAGE_HTML
+
+    @app.get("/api/nearct/status")
+    def api_nearct_status() -> JSONResponse:
+        from poly_bot.nearct.engine import NearctEngine, NearctStatus
+        engine: NearctEngine | None = _nearct_engine  # type: ignore[assignment]
+        if engine is None:
+            return JSONResponse({"state": "starting", "capital": settings.nearct_start_capital})
+        s: NearctStatus = engine.status
+        return JSONResponse({
+            "state": s.state,
+            "capital": round(s.capital, 4),
+            "start_capital": s.start_capital,
+            "open_order": s.open_order,
+            "open_quote": s.open_quote,
+            "total_trades": s.total_trades,
+            "wins": s.wins,
+            "losses": s.losses,
+            "stuck": s.stuck,
+            "trades_today": s.trades_today,
+            "win_rate_pct": round(100.0 * s.wins / max(1, s.wins + s.losses), 2),
+            "total_pnl": round(s.total_pnl, 4),
+            "last_updated": s.last_updated.isoformat(),
+        })
+
+    @app.post("/api/nearct/reset")
+    async def api_nearct_reset() -> JSONResponse:
+        from poly_bot.nearct.engine import NearctEngine
+        engine: NearctEngine | None = _nearct_engine  # type: ignore[assignment]
+        if engine is None:
+            return JSONResponse({"ok": False, "error": "engine not started"}, status_code=503)
+        await asyncio.get_running_loop().run_in_executor(None, engine.reset)
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/nearct/scans")
+    def api_nearct_scans() -> JSONResponse:
+        from poly_bot.nearct.engine import NearctEngine
+        engine: NearctEngine | None = _nearct_engine  # type: ignore[assignment]
+        if engine is None:
+            return JSONResponse([])
+        return JSONResponse(engine.scan_log)
+
+    @app.get("/api/nearct/orders")
+    def api_nearct_orders(limit: int = Query(default=200, ge=1, le=1000)) -> JSONResponse:
+        from sqlmodel import Session, select
+
+        from poly_bot.nearct.schema import NearctOrder, get_nearct_engine
+
+        with Session(get_nearct_engine(settings)) as session:
+            orders = session.exec(
+                select(NearctOrder)
+                .order_by(NearctOrder.created_at.desc())  # type: ignore[attr-defined]
+                .limit(limit)
+            ).all()
+        return JSONResponse([{
+            "id": o.id,
+            "condition_id": o.condition_id,
+            "question": o.question,
+            "domain": o.domain,
+            "ask": o.ask,
+            "net_yield_pct": o.net_yield_pct,
+            "size_usd": o.size_usd,
+            "status": o.status,
+            "pnl_usd": o.pnl_usd,
+            "capital_before": o.capital_before,
+            "capital_after": o.capital_after,
+            "end_ts": o.end_ts.isoformat() if o.end_ts else None,
+            "created_at": o.created_at.isoformat() if o.created_at else None,
+            "resolved_at": o.resolved_at.isoformat() if o.resolved_at else None,
+        } for o in orders])
+
     @app.get("/health")
     def health() -> JSONResponse:
         return JSONResponse({"status": "ok"})
@@ -358,330 +635,6 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
         _update_gauges(settings, hours=settings.catalog_expiring_hours)
         body, content_type = render_metrics()
         return Response(content=body, media_type=content_type)
-
-    @app.get("/weather", response_class=HTMLResponse)
-    def weather_page(
-        day: str = Query(default=""),
-        city: str = Query(default=""),
-    ) -> str:
-        from datetime import date
-
-        from poly_bot.weather.dashboard_views import (
-            default_forecast_day,
-            load_city_rows,
-            load_day_summaries,
-            render_weather_page,
-            weather_horizon,
-        )
-        from poly_bot.weather.schema import WeatherDailyEvent
-
-        min_d, max_d = weather_horizon(settings)
-        import json as json_mod
-
-        from poly_bot.weather.cards_data import build_weather_cards_payload
-
-        with Session(get_engine(settings)) as session:
-            summaries = load_day_summaries(session, settings)
-            empty = session.exec(select(WeatherDailyEvent).limit(1)).first() is None
-            if day:
-                selected = date.fromisoformat(day)
-            elif summaries:
-                picked = default_forecast_day(summaries)
-                selected = picked if picked is not None else min_d
-            else:
-                selected = min_d
-            rows = load_city_rows(session, forecast_date=selected, city_q=city)
-            payload = build_weather_cards_payload(
-                session,
-                settings,
-                forecast_date=selected,
-                city_q=city,
-                refresh_quotes=False,
-            )
-            initial_json = json_mod.dumps(payload)
-        return render_weather_page(
-            settings=settings,
-            summaries=summaries,
-            rows=rows,
-            selected_day=selected,
-            city_q=city,
-            empty_catalog=empty,
-            initial_cards_json=initial_json,
-            poll_seconds=settings.weather_dashboard_poll_seconds,
-        )
-
-    @app.get("/weather/globe", response_class=HTMLResponse)
-    def weather_globe_page(day: str = Query(default="")) -> str:
-        from datetime import date
-
-        from poly_bot.weather.dashboard_views import (
-            default_forecast_day,
-            load_day_summaries,
-            load_globe_points,
-            render_weather_globe_page,
-            weather_horizon,
-        )
-
-        min_d, _max_d = weather_horizon(settings)
-        with Session(get_engine(settings)) as session:
-            summaries = load_day_summaries(session, settings)
-            if day:
-                selected = date.fromisoformat(day)
-            elif summaries:
-                picked = default_forecast_day(summaries)
-                selected = picked if picked is not None else min_d
-            else:
-                selected = min_d
-            points = load_globe_points(session, forecast_date=selected)
-        import json as json_mod
-
-        return render_weather_globe_page(
-            settings=settings,
-            summaries=summaries,
-            selected_day=selected,
-            points_json=json_mod.dumps(points),
-            point_count=len(points),
-        )
-
-    @app.get("/weather/board", response_class=HTMLResponse)
-    def weather_board_page(day: str = Query(default="")) -> str:
-        from datetime import date
-
-        from poly_bot.weather.dashboard_views import (
-            default_forecast_day,
-            load_city_rows,
-            load_day_summaries,
-            weather_horizon,
-        )
-        from poly_bot.weather.forecast_views import load_board_data, render_weather_board_page
-
-        min_d, _max_d = weather_horizon(settings)
-        with Session(get_engine(settings)) as session:
-            summaries = load_day_summaries(session, settings)
-            if day:
-                selected = date.fromisoformat(day)
-            elif summaries:
-                picked = default_forecast_day(summaries)
-                selected = picked if picked is not None else min_d
-            else:
-                selected = min_d
-            rows = load_city_rows(session, forecast_date=selected)
-            source_keys, matrix, signals = load_board_data(
-                session,
-                forecast_date=selected,
-                rows=rows,
-            )
-        return render_weather_board_page(
-            settings=settings,
-            forecast_date=selected,
-            rows=rows,
-            summaries=summaries,
-            source_keys=source_keys,
-            matrix=matrix,
-            signals=signals,
-        )
-
-    @app.get("/weather/aviation", response_class=HTMLResponse)
-    def weather_aviation_page() -> str:
-        from poly_bot.weather.forecast_schema import (
-            WeatherForecastSource,
-            WeatherStationForecastConfig,
-            WeatherTafReport,
-        )
-        from poly_bot.weather.forecast_views import render_weather_aviation_page
-        from poly_bot.weather.schema import WeatherStation
-
-        with Session(get_engine(settings)) as session:
-            stations = list(session.exec(select(WeatherStation)).all())
-            configs = list(session.exec(select(WeatherStationForecastConfig)).all())
-            sources = list(session.exec(select(WeatherForecastSource)).all())
-            tafs = list(session.exec(select(WeatherTafReport)).all())
-        return render_weather_aviation_page(
-            settings=settings,
-            stations=stations,
-            configs=configs,
-            sources=sources,
-            taf_rows=tafs,
-        )
-
-    @app.get("/api/weather/forecasts")
-    def api_weather_forecasts(day: str = Query(...)) -> list[dict[str, object]]:
-        from datetime import date
-
-        from poly_bot.weather.dashboard_views import load_city_rows
-        from poly_bot.weather.forecast_views import load_forecast_context_for_rows
-
-        forecast_date = date.fromisoformat(day)
-        with Session(get_engine(settings)) as session:
-            rows = load_city_rows(session, forecast_date=forecast_date)
-            ctx = load_forecast_context_for_rows(session, rows, forecast_date=forecast_date)
-        out: list[dict[str, object]] = []
-        for row in rows:
-            s = ctx.get(row.event.station_id)
-            out.append(
-                {
-                    "city_key": row.event.city_key,
-                    "station_id": row.event.station_id,
-                    "icao": row.station.icao if row.station else None,
-                    "taf_tmax_c": s.taf_tmax_c if s else None,
-                    "metar_run_c": s.metar_run_c if s else None,
-                    "merged_tmax_c": s.merged_tmax_c if s else None,
-                    "merged_source": s.merged_source if s else "",
-                    "edge_hint": s.edge_hint if s else "",
-                    "taf_coverage": s.taf_coverage if s else "",
-                }
-            )
-        return out
-
-    @app.get("/api/weather/globe")
-    def api_weather_globe(day: str = Query(default="")) -> list[dict[str, object]]:
-        from datetime import date
-
-        from poly_bot.weather.dashboard_views import load_globe_points, weather_horizon
-
-        min_d, _max_d = weather_horizon(settings)
-        forecast_date = date.fromisoformat(day) if day else min_d
-        with Session(get_engine(settings)) as session:
-            return load_globe_points(session, forecast_date=forecast_date)
-
-    @app.get("/weather/event", response_class=HTMLResponse)
-    def weather_event_page(
-        city: str = Query(...),
-        day: str = Query(...),
-    ) -> str:
-        from datetime import date
-
-        from poly_bot.weather.dashboard_views import (
-            load_bin_ticks,
-            load_city_row_by_keys,
-            render_weather_detail_page,
-        )
-
-        forecast_date = date.fromisoformat(day)
-        with Session(get_engine(settings)) as session:
-            row = load_city_row_by_keys(
-                session,
-                forecast_date=forecast_date,
-                city_key=city.strip().lower(),
-            )
-            if row is None:
-                return HTMLResponse(
-                    "<p>Event not found. <a href='/weather'>Back</a></p>",
-                    status_code=404,
-                )
-            ticks = load_bin_ticks(session, row.bins)
-            from poly_bot.weather.forecast_repo import WeatherForecastRepository
-            from poly_bot.weather.forecast_schema import WeatherTradingSignal
-
-            sig = session.get(WeatherTradingSignal, row.event.id)
-            taf = WeatherForecastRepository(session).get_taf(row.event.station_id)
-            taf_raw = taf.raw_taf if taf else ""
-        return render_weather_detail_page(
-            settings=settings,
-            row=row,
-            ticks=ticks,
-            signal=sig,
-            taf_raw=taf_raw,
-        )
-
-    @app.get("/api/weather/cards")
-    def api_weather_cards(
-        day: str = Query(default=""),
-        city: str = Query(default=""),
-        refresh_quotes: bool = Query(default=False),
-    ) -> dict[str, object]:
-        from datetime import date
-
-        from poly_bot.weather.cards_data import build_weather_cards_payload
-        from poly_bot.weather.dashboard_views import weather_horizon
-
-        min_d, _max_d = weather_horizon(settings)
-        forecast_date = date.fromisoformat(day) if day else min_d
-        with Session(get_engine(settings)) as session:
-            return build_weather_cards_payload(
-                session,
-                settings,
-                forecast_date=forecast_date,
-                city_q=city,
-                refresh_quotes=refresh_quotes,
-            )
-
-    @app.get("/api/weather")
-    def api_weather(
-        day: str = Query(default=""),
-    ) -> list[dict[str, object]]:
-        from datetime import date
-
-        from poly_bot.weather.dashboard_views import load_city_rows, weather_horizon
-
-        min_d, _max_d = weather_horizon(settings)
-        forecast_date = date.fromisoformat(day) if day else min_d
-        with Session(get_engine(settings)) as session:
-            rows = load_city_rows(session, forecast_date=forecast_date)
-        return [
-            {
-                "event_id": r.event.id,
-                "city_key": r.event.city_key,
-                "forecast_date": r.event.forecast_date.isoformat(),
-                "title": r.event.title,
-                "bin_count": len(r.bins),
-                "station_icao": r.station.icao if r.station else None,
-                "latitude": r.station.latitude if r.station else None,
-                "longitude": r.station.longitude if r.station else None,
-                "timezone": r.station.timezone if r.station else None,
-            }
-            for r in rows
-        ]
-
-    @app.get("/api/weather/event/{event_id}")
-    def api_weather_event(event_id: str) -> dict[str, object]:
-        from poly_bot.weather.dashboard_views import (
-            load_bin_ticks,
-            load_city_row_by_keys,
-            weather_event_json,
-        )
-        from poly_bot.weather.schema import WeatherDailyEvent
-
-        with Session(get_engine(settings)) as session:
-            ev = session.get(WeatherDailyEvent, event_id)
-            if ev is None:
-                raise HTTPException(status_code=404, detail="not found")
-            row = load_city_row_by_keys(
-                session,
-                forecast_date=ev.forecast_date,
-                city_key=ev.city_key,
-            )
-            if row is None:
-                raise HTTPException(status_code=404, detail="not found")
-            ticks = load_bin_ticks(session, row.bins)
-        return weather_event_json(row, ticks)
-
-    @app.get("/api/weather/stream")
-    async def api_weather_stream(
-        event_id: str = Query(...),
-    ) -> StreamingResponse:
-        """SSE — REST CLOB refresh + DB quotes for one weather event (5s)."""
-
-        async def event_generator() -> object:
-            from poly_bot.weather.dashboard_views import weather_event_live_snapshot
-            from poly_bot.weather.quotes import refresh_event_quotes_from_clob
-
-            while True:
-                payload: dict[str, object]
-                with Session(get_engine(settings)) as session:
-                    try:
-                        await refresh_event_quotes_from_clob(session, settings, event_id=event_id)
-                    except Exception:
-                        pass
-                    payload = weather_event_live_snapshot(session, event_id=event_id)
-                yield f"data: {json.dumps(payload)}\n\n"
-                await asyncio.sleep(5)
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
 
     @app.get("/taxonomy", response_class=HTMLResponse)
     def taxonomy_page(
@@ -801,6 +754,101 @@ def create_app(settings: Settings, *, background: bool = False) -> FastAPI:
         )
 
     return app
+
+
+def _build_chains_payload(settings: Settings) -> list[dict[str, object]]:
+    """Single-pass chain aggregation — two SQL queries, zero N+1."""
+    from collections import defaultdict
+
+    from sqlalchemy import text as _text
+
+    eng = get_engine(settings)
+    with eng.connect() as conn:
+        order_rows = conn.execute(_text("""
+            SELECT chain_id, chain_level, status, size_usd, pnl_usd,
+                   question, price_target, created_at, domain, net_yield_pct
+            FROM harvest_orders
+            WHERE chain_id IS NOT NULL AND session_id IS NULL
+            ORDER BY chain_id, chain_level ASC
+        """)).fetchall()
+
+        ticket_rows = conn.execute(_text("""
+            SELECT ct.chain_id, ct.chain_level, ct.size_usd, ct.status
+            FROM chain_tickets ct
+            WHERE ct.chain_id IN (
+                SELECT DISTINCT chain_id FROM harvest_orders
+                WHERE chain_id IS NOT NULL AND session_id IS NULL
+            )
+        """)).fetchall()
+
+    orders_by_chain: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in order_rows:
+        cid, level, status, size, pnl, q, price, created, domain, yield_ = row
+        orders_by_chain[cid].append({
+            "level": level,
+            "status": status,
+            "size_usd": size,
+            "pnl_usd": pnl,
+            "question": q or "",
+            "price_target": price,
+            "created_at": str(created) if created else None,
+            "domain": domain or "",
+            "net_yield_pct": yield_,
+        })
+
+    pending_by_chain: dict[str, dict[str, object]] = {}
+    closing_chains: set[str] = set()
+    for row in ticket_rows:
+        cid, level, size, status = row
+        if status == "cancelled":
+            closing_chains.add(cid)
+        elif status == "pending" and cid not in pending_by_chain:
+            pending_by_chain[cid] = {"level": level, "size_usd": size}
+
+    result: list[dict[str, object]] = []
+    for cid, levels in orders_by_chain.items():
+        has_active = any(lv["status"] in ("filled", "pending") for lv in levels)
+        is_closing = cid in closing_chains
+        pending = pending_by_chain.get(cid)
+
+        resolved = [lv for lv in levels if lv["status"] in ("won", "lost", "stopped_out")]
+        last_resolved = resolved[-1] if resolved else None
+
+        if has_active and is_closing:
+            chain_status: str = "closing"
+        elif has_active:
+            chain_status = "active"
+        elif last_resolved and last_resolved["status"] in ("lost", "stopped_out"):
+            chain_status = "dead"  # last outcome was a loss — dead regardless of stale tickets
+        elif pending:
+            chain_status = "pending"
+        elif is_closing:
+            chain_status = "closed"
+        else:
+            chain_status = "idle"
+
+        active_order = next(
+            (lv for lv in levels if lv["status"] in ("filled", "pending")), None
+        )
+        total_pnl = sum(
+            float(lv["pnl_usd"] or 0) for lv in levels
+            if lv["status"] in ("won", "lost", "stopped_out")
+        )
+
+        result.append({
+            "chain_id": cid,
+            "short_id": cid[:8],
+            "status": chain_status,
+            "levels": levels,
+            "pending_ticket": pending,
+            "total_pnl_usd": round(total_pnl, 4),
+            "active_order": active_order,
+            "max_level": max(int(lv["level"]) for lv in levels),
+        })
+
+    _STATUS_PRIORITY = {"active": 0, "closing": 1, "pending": 2, "idle": 3, "dead": 4, "closed": 5}
+    result.sort(key=lambda c: (_STATUS_PRIORITY.get(str(c["status"]), 9), str(c["chain_id"])))
+    return result
 
 
 def _update_gauges(settings: Settings, *, hours: float) -> None:
@@ -1156,7 +1204,9 @@ footer {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
     <a href="/?{query}" class="{"active" if tab == "markets" else ""}">Markets</a>
     <a href="/events?hours={hours}" class="{"active" if tab == "events" else ""}">Events & fees</a>
     <a href="/harvest">Harvest</a>
-    <a href="/weather">Weather</a>
+    <a href="/orders">Orders</a>
+    <a href="/chains">Chains</a>
+    <a href="/nearct">NearCT</a>
     <a href="/taxonomy">Taxonomy</a>
   </nav>
   <form class="filters" method="get" action="/">
@@ -1526,8 +1576,9 @@ form.inline {{ display:inline; }}
 <nav class="tabs">
   <a href="/">Markets</a>
   <a href="/events">Events &amp; fees</a>
-  <a href="/weather">Weather</a>
-  <a href="/weather/globe">Globe</a>
+  <a href="/orders">Orders</a>
+  <a href="/chains">Chains</a>
+    <a href="/nearct">NearCT</a>
   <a href="/taxonomy" class="active">Taxonomy</a>
 </nav>
 
@@ -1627,12 +1678,13 @@ def _query_live_markets(
 
     dialect = session.get_bind().dialect.name  # type: ignore[union-attr]
     active = sql_dialect.active_market_filter(dialect)
+    # Use m.end_ts directly (no datetime() wrapper, no COALESCE) so the composite
+    # index (active, closed, end_ts) can satisfy both the filter and the ORDER BY
+    # without a full table sort. Markets with NULL end_ts are excluded.
     if sql_dialect.is_sqlite(dialect):
-        future = "datetime(COALESCE(m.end_ts, e.end_ts)) > datetime('now')"
-        order = "datetime(COALESCE(m.end_ts, e.end_ts)) ASC"
+        future = "m.end_ts > datetime('now')"
     else:
-        future = "COALESCE(m.end_ts, e.end_ts) > NOW()"
-        order = "COALESCE(m.end_ts, e.end_ts) ASC"
+        future = "m.end_ts > NOW()"
 
     domain_filter = "AND m.domain = :domain" if domain else ""
     q_filter = "AND (LOWER(m.question) LIKE :q OR LOWER(m.slug) LIKE :q)" if q else ""
@@ -1642,7 +1694,7 @@ def _query_live_markets(
             f"""
             SELECT
                 m.condition_id, m.slug, m.question, m.domain,
-                COALESCE(m.end_ts, e.end_ts) AS end_ts,
+                m.end_ts,
                 m.game_start_ts,
                 t0.token_id AS yes_token_id, t1.token_id AS no_token_id,
                 q0.mid AS yes_mid, q1.mid AS no_mid,
@@ -1657,11 +1709,11 @@ def _query_live_markets(
             LEFT JOIN token_quotes q1 ON q1.token_id = t1.token_id
             LEFT JOIN market_enrichment en ON en.condition_id = m.condition_id
             WHERE {active}
-              AND COALESCE(m.end_ts, e.end_ts) IS NOT NULL
+              AND m.end_ts IS NOT NULL
               AND {future}
               {domain_filter}
               {q_filter}
-            ORDER BY {order}
+            ORDER BY m.end_ts ASC
             LIMIT :limit
             """
         ),
@@ -1700,6 +1752,693 @@ def _query_live_markets(
             }
         )
     return out
+
+
+def _utc_iso(dt: object) -> str | None:
+    """Return ISO string with Z suffix, treating naive datetimes as UTC."""
+    from datetime import datetime as _dt
+    if not isinstance(dt, _dt):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
+
+
+def _order_json(r: object, *, end_ts: str | None = None) -> dict[str, object]:
+    from poly_bot.persistence.schema import HarvestOrder
+    assert isinstance(r, HarvestOrder)
+    return {
+        "id": r.id,
+        "condition_id": r.condition_id,
+        "token_id": r.token_id,
+        "side": r.side,
+        "domain": r.domain,
+        "question": r.question,
+        "underlying": r.underlying,
+        "duration_s": r.duration_s,
+        "price_target": r.price_target,
+        "size_usd": r.size_usd,
+        "size_shares": r.size_shares,
+        "paper": r.paper,
+        "status": r.status,
+        "net_yield_pct": round(r.net_yield_pct * 100, 3) if r.net_yield_pct else None,
+        "pnl_usd": r.pnl_usd,
+        "chain_id": r.chain_id,
+        "chain_level": r.chain_level,
+        "minutes_left_at_entry": r.minutes_left_at_entry,
+        "midpoint_at_entry": r.midpoint_at_entry,
+        "created_at": _utc_iso(r.created_at),
+        "filled_at": _utc_iso(r.filled_at),
+        "resolved_at": _utc_iso(r.resolved_at),
+        "end_ts": end_ts,
+    }
+
+
+_ORDERS_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>poly_bot · orders</title>
+<style>
+:root {
+  --bg: #080c10; --surface: #0f1620; --surface2: #141e2c;
+  --border: #1a2535; --border2: #243044; --text: #dde6f0;
+  --muted: #4d6380; --accent: #3b7ef8; --green: #22c55e;
+  --amber: #f59e0b; --red: #ef4444;
+  --font: "SF Pro Text","Inter",system-ui,-apple-system,sans-serif;
+  --font-mono: "SF Mono","Fira Code",ui-monospace,monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; line-height: 1.5; min-height: 100vh; }
+.topbar {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: 0 1.25rem; height: 48px;
+  background: rgba(8,12,16,.92); backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; font-size: 15px; letter-spacing: -0.3px; color: var(--text); }
+.brand span { color: var(--accent); }
+.topbar-nav { display: flex; gap: 2px; margin-left: auto; }
+.topbar-nav a {
+  color: var(--muted); text-decoration: none; font-size: 12.5px;
+  padding: 4px 10px; border-radius: 6px; transition: color .15s, background .15s;
+}
+.topbar-nav a:hover, .topbar-nav a.active { color: var(--text); background: var(--surface2); }
+.filter-bar {
+  position: sticky; top: 48px; z-index: 50;
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface);
+}
+.chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.chip {
+  padding: 3px 10px; border-radius: 20px; font-size: 11.5px; font-weight: 500;
+  border: 1px solid var(--border2); background: transparent; color: var(--muted);
+  cursor: pointer; transition: all .15s; letter-spacing: .3px;
+}
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+.chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.chip.s-won  { background: #15803d; border-color: #15803d; color: #fff; }
+.chip.s-lost { background: #991b1b; border-color: #991b1b; color: #fff; }
+.chip.s-open { background: #b45309; border-color: #b45309; color: #fff; }
+.stats-bar {
+  display: flex; gap: 1.5rem; padding: 12px 1.25rem;
+  border-bottom: 1px solid var(--border); background: var(--surface2);
+}
+.s-item { display: flex; flex-direction: column; gap: 2px; }
+.s-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+.s-val { font-size: 16px; font-weight: 700; color: var(--text); }
+.s-val.pos { color: var(--green); }
+.s-val.neg { color: var(--red); }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  position: sticky; top: 0; z-index: 10;
+  background: var(--surface); border-bottom: 1px solid var(--border2);
+  padding: 7px 8px; font-size: 10.5px; font-weight: 600;
+  letter-spacing: .6px; color: var(--muted); text-transform: uppercase;
+  text-align: right; white-space: nowrap; user-select: none;
+}
+thead th:first-child, thead th.th-l { text-align: left; }
+tbody td {
+  padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 12px;
+  text-align: right; color: var(--text); white-space: nowrap;
+}
+tbody td.td-l { text-align: left; }
+tbody td.td-q { text-align: left; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+tbody tr:hover td { background: rgba(59,126,248,.04); }
+.s-won     { color: var(--green); font-weight: 600; }
+.s-lost    { color: var(--red); font-weight: 600; }
+.s-stopped { color: #f97316; font-weight: 600; }
+.s-open  { color: var(--amber); }
+.s-fail  { color: var(--muted); }
+.pnl-pos { color: var(--green); }
+.pnl-neg { color: var(--red); }
+.chain-lvl { color: var(--accent); font-weight: 600; font-size: 11px; }
+.mode-paper { color: var(--muted); font-size: 11px; }
+.mode-live  { color: var(--accent); font-size: 11px; font-weight: 600; }
+.load-more {
+  display: block; margin: 1.5rem auto; padding: 8px 24px;
+  background: var(--surface2); border: 1px solid var(--border2);
+  color: var(--muted); border-radius: 8px; cursor: pointer; font-size: 13px;
+  transition: all .15s;
+}
+.load-more:hover { color: var(--text); border-color: var(--accent); }
+.empty { padding: 3rem 1.25rem; text-align: center; color: var(--muted); }
+.clear-btn {
+  margin-left: auto; padding: 5px 14px;
+  background: transparent; border: 1px solid #7f1d1d; color: #f87171;
+  border-radius: 7px; cursor: pointer; font-size: 12px; transition: all .15s;
+}
+.clear-btn:hover { background: rgba(239,68,68,.1); border-color: var(--red); color: var(--red); }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">poly<span>_bot</span></span>
+  <nav class="topbar-nav">
+    <a href="/">Markets</a>
+    <a href="/harvest">Harvest</a>
+    <a href="/events">Events</a>
+    <a href="/orders" class="active">Orders</a>
+    <a href="/chains">Chains</a>
+    <a href="/nearct">NearCT</a>
+    <a href="/taxonomy">Taxonomy</a>
+  </nav>
+</header>
+
+<div class="stats-bar" id="stats-bar">
+  <div class="s-item"><span class="s-label">Total</span><span class="s-val" id="st-total">—</span></div>
+  <div class="s-item"><span class="s-label">Open</span><span class="s-val s-open" id="st-open">—</span></div>
+  <div class="s-item"><span class="s-label">Won</span><span class="s-val s-won" id="st-won">—</span></div>
+  <div class="s-item"><span class="s-label">Lost</span><span class="s-val s-lost" id="st-lost">—</span></div>
+  <div class="s-item"><span class="s-label">Win rate</span><span class="s-val" id="st-wr">—</span></div>
+  <div class="s-item"><span class="s-label">Realized P&amp;L</span><span class="s-val" id="st-pnl">—</span></div>
+  <div class="s-item"><span class="s-label">Est. pending</span><span class="s-val" id="st-est">—</span></div>
+  <button class="clear-btn" id="snapshot-session-btn" title="Archive current paper orders as a named session">📦 Snapshot session</button>
+</div>
+
+<div class="filter-bar">
+  <div class="chips" id="domain-chips">
+    <button class="chip active" data-domain="">All</button>
+    <button class="chip" data-domain="crypto">Crypto</button>
+    <button class="chip" data-domain="sports">Sports</button>
+  </div>
+  <div style="width:1px;background:var(--border2);height:18px;margin:0 4px;flex-shrink:0"></div>
+  <div class="chips" id="chips">
+    <button class="chip active" data-status="">ALL</button>
+    <button class="chip" data-status="filled">Open</button>
+    <button class="chip" data-status="won">Won</button>
+    <button class="chip" data-status="lost">Lost</button>
+    <button class="chip" data-status="failed">Failed</button>
+  </div>
+</div>
+
+<div class="table-wrap">
+  <table id="orders-table">
+    <thead>
+      <tr>
+        <th class="th-l">Time (UTC)</th>
+        <th class="th-l">Domain</th>
+        <th class="th-l">Side</th>
+        <th>Ask</th>
+        <th>Yield%</th>
+        <th>$Size</th>
+        <th>Lvl</th>
+        <th>Min@entry</th>
+        <th>Expiry (UTC)</th>
+        <th>Mode</th>
+        <th>Status</th>
+        <th>P&amp;L $</th>
+        <th class="th-l">Question</th>
+      </tr>
+    </thead>
+    <tbody id="orders-tbody">
+      <tr><td colspan="13" class="empty">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+<button class="load-more" id="load-more" style="display:none">Load more</button>
+
+<script>
+'use strict';
+(function() {
+  const PAGE = 100;
+  let currentStatus = '';
+  let currentDomain = '';
+  let offset = 0;
+  let allLoaded = false;
+
+  const tbody = document.getElementById('orders-tbody');
+  const loadMore = document.getElementById('load-more');
+
+  // ── stats ────────────────────────────────────────────────
+  async function loadStats(domain) {
+    try {
+      const params = new URLSearchParams({ limit: 1000, paper: 'true' });
+      if (domain) params.set('domain', domain);
+      const r = await fetch('/api/orders?' + params);
+      const rows = await r.json();
+      let total = rows.length, won = 0, lost = 0, open = 0;
+      let pnl = 0, est = 0;
+      for (const o of rows) {
+        if (o.status === 'won')         { won++;  pnl += (o.pnl_usd || 0); }
+        if (o.status === 'lost')        { lost++; pnl += (o.pnl_usd || 0); }
+        if (o.status === 'stopped_out') {         pnl += (o.pnl_usd || 0); }
+        if (o.status === 'filled')      { open++; est += (o.pnl_usd || 0); }
+      }
+      const resolved = won + lost;
+      document.getElementById('st-total').textContent = total;
+      document.getElementById('st-open').textContent  = open;
+      document.getElementById('st-won').textContent   = won;
+      document.getElementById('st-lost').textContent  = lost;
+      document.getElementById('st-wr').textContent    = resolved ? (won/resolved*100).toFixed(1)+'%' : '—';
+      const pnlEl = document.getElementById('st-pnl');
+      pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' $';
+      pnlEl.className = 's-val ' + (pnl >= 0 ? 'pos' : 'neg');
+      const estEl = document.getElementById('st-est');
+      estEl.textContent = (est >= 0 ? '+' : '') + est.toFixed(2) + ' $';
+      estEl.className = 's-val ' + (est >= 0 ? 'pos' : 'neg');
+    } catch(_) {}
+  }
+
+  // ── table ─────────────────────────────────────────────────
+  async function loadOrders(reset) {
+    if (reset) { offset = 0; allLoaded = false; }
+    const params = new URLSearchParams({ limit: PAGE, offset, paper: 'true' });
+    if (currentStatus) params.set('status', currentStatus);
+    if (currentDomain) params.set('domain', currentDomain);
+    const r = await fetch('/api/orders?' + params);
+    const rows = await r.json();
+
+    if (reset) tbody.innerHTML = '';
+    if (!rows.length && reset) {
+      tbody.innerHTML = '<tr><td colspan="13" class="empty">No orders found.</td></tr>';
+      loadMore.style.display = 'none';
+      return;
+    }
+    if (rows.length < PAGE) { allLoaded = true; loadMore.style.display = 'none'; }
+    else loadMore.style.display = 'block';
+
+    const frag = document.createDocumentFragment();
+    for (const o of rows) {
+      const tr = document.createElement('tr');
+      const sc = statusCls(o.status);
+      const sl = statusLabel(o.status);
+      const yield_ = o.net_yield_pct != null ? o.net_yield_pct.toFixed(2)+'%' : '—';
+      const pnl = o.pnl_usd;
+      const pnlStr = pnl != null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(2) : '—';
+      const pnlCls = pnl != null ? (pnl >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
+      const lvl = o.chain_level != null && o.chain_level > 0 ? 'L'+o.chain_level : (o.chain_id ? 'L0' : '—');
+      const lvlCls = o.chain_level > 0 ? 'chain-lvl' : '';
+      tr.innerHTML =
+        '<td class="td-l">' + fmtTime(o.created_at) + '</td>' +
+        '<td class="td-l">' + (o.domain || '—') + '</td>' +
+        '<td class="td-l">' + (o.underlying ? esc(o.underlying).toUpperCase() + ' ' : '') + (o.side||'').toUpperCase() + '</td>' +
+        '<td>' + (o.price_target != null ? o.price_target.toFixed(4) : '—') + '</td>' +
+        '<td>' + yield_ + '</td>' +
+        '<td>' + (o.size_usd != null ? o.size_usd.toFixed(0) : '—') + '</td>' +
+        '<td class="' + lvlCls + '">' + lvl + '</td>' +
+        '<td>' + (o.minutes_left_at_entry != null ? o.minutes_left_at_entry.toFixed(1)+'m' : '—') + '</td>' +
+        '<td>' + fmtEndTs(o.end_ts) + '</td>' +
+        '<td class="' + (o.paper ? 'mode-paper' : 'mode-live') + '">' + (o.paper ? 'paper' : 'live') + '</td>' +
+        '<td class="' + sc + '">' + sl + '</td>' +
+        '<td class="' + pnlCls + '">' + pnlStr + '</td>' +
+        '<td class="td-q" title="' + esc(o.question||'') + '">' + esc(o.question||'') + '</td>';
+      frag.appendChild(tr);
+    }
+    tbody.appendChild(frag);
+    offset += rows.length;
+  }
+
+  // ── chips ─────────────────────────────────────────────────
+  document.getElementById('domain-chips').addEventListener('click', (e) => {
+    const btn = e.target.closest('.chip');
+    if (!btn) return;
+    document.querySelectorAll('#domain-chips .chip').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    currentDomain = btn.dataset.domain || '';
+    loadOrders(true);
+    loadStats(currentDomain);
+  });
+
+  document.getElementById('chips').addEventListener('click', (e) => {
+    const btn = e.target.closest('.chip');
+    if (!btn) return;
+    document.querySelectorAll('#chips .chip').forEach(c => c.classList.remove('active','s-won','s-lost','s-open'));
+    currentStatus = btn.dataset.status || '';
+    const statusMap = { won: 's-won', lost: 's-lost', filled: 's-open' };
+    btn.classList.add('active');
+    if (statusMap[currentStatus]) btn.classList.add(statusMap[currentStatus]);
+    loadOrders(true);
+  });
+
+  loadMore.addEventListener('click', () => { if (!allLoaded) loadOrders(false); });
+
+  // ── helpers ───────────────────────────────────────────────
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toISOString().replace('T', ' ').slice(0, 19);
+  }
+  function fmtEndTs(s) {
+    if (!s) return '—';
+    // SQLite stores as 'YYYY-MM-DD HH:MM:SS' — replace space with T for Date parsing
+    return s.replace(' ', 'T').slice(0, 16).replace('T', ' ');
+  }
+  function statusCls(s) {
+    if (s === 'won')          return 's-won';
+    if (s === 'lost')         return 's-lost';
+    if (s === 'filled')       return 's-open';
+    if (s === 'stopped_out')  return 's-stopped';
+    if (s === 'failed')       return 's-fail';
+    return '';
+  }
+  function statusLabel(s) {
+    if (s === 'filled')       return 'open';
+    if (s === 'stopped_out')  return 'SL';
+    return s || '—';
+  }
+  function esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ── snapshot session ──────────────────────────────────
+  document.getElementById('snapshot-session-btn').addEventListener('click', async () => {
+    const n = document.getElementById('st-total').textContent;
+    if (!n || n === '0') { alert('No unsnapshot paper orders to archive.'); return; }
+    const label = prompt(`Archive ${n} order(s) as a session.\nSession label (leave blank for auto):`, '');
+    if (label === null) return;
+    const fd = new FormData();
+    fd.append('label', label);
+    const r = await fetch('/api/orders/snapshot', { method: 'POST', body: fd });
+    const d = await r.json();
+    alert(`Archived ${d.orders} order(s) as "${d.label}"\nP&L: ${d.pnl_usd >= 0 ? '+' : ''}${d.pnl_usd.toFixed(4)} USD`);
+    loadStats(currentDomain);
+    loadOrders(true);
+  });
+
+  loadStats(currentDomain);
+  loadOrders(true);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+_CHAINS_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>poly_bot · chains</title>
+<style>
+:root {
+  --bg: #080c10; --surface: #0f1620; --surface2: #141e2c;
+  --border: #1a2535; --border2: #243044; --text: #dde6f0;
+  --muted: #4d6380; --accent: #3b7ef8; --green: #22c55e;
+  --amber: #f59e0b; --red: #ef4444; --orange: #f97316; --purple: #a855f7;
+  --font: "SF Pro Text","Inter",system-ui,-apple-system,sans-serif;
+  --font-mono: "SF Mono","Fira Code",ui-monospace,monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; line-height: 1.5; min-height: 100vh; }
+.topbar {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: 0 1.25rem; height: 48px;
+  background: rgba(8,12,16,.92); backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; font-size: 15px; letter-spacing: -0.3px; color: var(--text); }
+.brand span { color: var(--accent); }
+.topbar-nav { display: flex; gap: 2px; margin-left: auto; }
+.topbar-nav a {
+  color: var(--muted); text-decoration: none; font-size: 12.5px;
+  padding: 4px 10px; border-radius: 6px; transition: color .15s, background .15s;
+}
+.topbar-nav a:hover, .topbar-nav a.active { color: var(--text); background: var(--surface2); }
+.summary-bar {
+  display: flex; gap: 2rem; align-items: center;
+  padding: 10px 1.25rem; border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+}
+.s-item { display: flex; flex-direction: column; gap: 1px; }
+.s-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+.s-val { font-size: 17px; font-weight: 700; }
+.s-val.pos { color: var(--green); }
+.s-val.neg { color: var(--red); }
+.s-val.neutral { color: var(--text); }
+.conn-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-left: auto; transition: background .3s; }
+.conn-dot.live { background: var(--green); }
+.conn-dot.err  { background: var(--red); }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+  gap: 12px;
+  padding: 16px 1.25rem;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 10px;
+  overflow: hidden;
+  transition: border-color .2s;
+}
+.card.st-active  { border-color: #92400e; }
+.card.st-closing { border-color: var(--orange); }
+.card.st-pending { border-color: #1e3a6e; }
+.card.st-dead    { border-color: #4c0519; }
+.card.st-closed  { border-color: var(--border); opacity: .7; }
+.card.st-idle    { border-color: var(--border); opacity: .6; }
+.card-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 12px 7px; border-bottom: 1px solid var(--border);
+}
+.chain-short { font-family: var(--font-mono); font-size: 11px; color: var(--muted); letter-spacing: .5px; }
+.dot-track { display: flex; gap: 4px; align-items: center; flex: 1; }
+.dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot-won    { background: var(--green); }
+.dot-active { background: var(--amber); box-shadow: 0 0 0 3px rgba(245,158,11,.2); }
+.dot-ticket { background: transparent; border: 1.5px solid var(--accent); }
+.dot-lost   { background: var(--red); }
+.dot-sl     { background: var(--orange); }
+.dot-empty  { background: transparent; border: 1.5px dashed var(--border2); }
+.badge {
+  font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 4px;
+  text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
+}
+.badge-active  { background: rgba(245,158,11,.15); color: var(--amber); }
+.badge-closing { background: rgba(249,115,22,.15); color: var(--orange); }
+.badge-pending { background: rgba(59,126,248,.15); color: var(--accent); }
+.badge-dead    { background: rgba(239,68,68,.1);   color: var(--red); }
+.badge-closed  { background: rgba(77,99,128,.15);  color: var(--muted); }
+.badge-idle    { background: rgba(77,99,128,.1);   color: var(--muted); }
+.card-body { padding: 10px 12px 8px; }
+.question {
+  font-size: 12.5px; color: var(--text); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-bottom: 5px;
+}
+.question.muted { color: var(--muted); font-style: italic; }
+.meta { font-size: 11.5px; color: var(--muted); display: flex; gap: 6px; flex-wrap: wrap; }
+.meta-val { color: var(--text); }
+.card-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 12px 9px; border-top: 1px solid var(--border); background: var(--surface2);
+}
+.pnl { font-size: 12px; font-weight: 600; }
+.pnl.pos { color: var(--green); }
+.pnl.neg { color: var(--red); }
+.pnl.zero { color: var(--muted); }
+.close-btn {
+  font-size: 11px; font-weight: 500;
+  padding: 4px 10px; border-radius: 6px;
+  background: transparent; border: 1px solid #4c0519;
+  color: #f87171; cursor: pointer; transition: all .15s;
+}
+.close-btn:hover:not(:disabled) { background: rgba(239,68,68,.1); border-color: var(--red); color: var(--red); }
+.close-btn:disabled { opacity: .4; cursor: default; }
+.empty-state { padding: 4rem 1.25rem; text-align: center; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">poly<span>_bot</span></span>
+  <nav class="topbar-nav">
+    <a href="/">Markets</a>
+    <a href="/harvest">Harvest</a>
+    <a href="/events">Events</a>
+    <a href="/orders">Orders</a>
+    <a href="/chains" class="active">Chains</a>
+    <a href="/taxonomy">Taxonomy</a>
+  </nav>
+</header>
+
+<div class="summary-bar">
+  <div class="s-item"><span class="s-label">Active</span><span class="s-val neutral" id="sum-active">—</span></div>
+  <div class="s-item"><span class="s-label">Pending ticket</span><span class="s-val neutral" id="sum-pending">—</span></div>
+  <div class="s-item"><span class="s-label">Total chains</span><span class="s-val neutral" id="sum-total">—</span></div>
+  <div class="s-item"><span class="s-label">Realized P&amp;L</span><span class="s-val" id="sum-pnl">—</span></div>
+  <div class="conn-dot" id="conn-dot" title="SSE connection"></div>
+</div>
+
+<div class="grid" id="chain-grid">
+  <div class="empty-state">Connecting…</div>
+</div>
+
+<script>
+'use strict';
+(function() {
+  const grid = document.getElementById('chain-grid');
+  const dot  = document.getElementById('conn-dot');
+  let es = null;
+  let retryMs = 2000;
+
+  function connect() {
+    if (es) { es.close(); }
+    es = new EventSource('/api/stream/chains');
+    es.onopen = () => { dot.className = 'conn-dot live'; retryMs = 2000; };
+    es.onerror = () => {
+      dot.className = 'conn-dot err';
+      es.close();
+      setTimeout(connect, retryMs);
+      retryMs = Math.min(retryMs * 2, 30000);
+    };
+    es.onmessage = (e) => {
+      let chains;
+      try { chains = JSON.parse(e.data); } catch(_) { return; }
+      if (chains && chains.error) { grid.innerHTML = '<div class="empty-state">Error loading chain data.</div>'; return; }
+      renderGrid(chains);
+    };
+  }
+
+  function renderGrid(chains) {
+    updateSummary(chains);
+    if (!chains || !chains.length) {
+      grid.innerHTML = '<div class="empty-state">No chains yet. Base orders will start chains automatically.</div>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const c of chains) frag.appendChild(buildCard(c));
+    grid.replaceChildren(frag);
+  }
+
+  function updateSummary(chains) {
+    const active  = chains.filter(c => c.status === 'active' || c.status === 'closing').length;
+    const pending = chains.filter(c => c.status === 'pending').length;
+    const total   = chains.length;
+    const pnl     = chains.reduce((s, c) => s + (c.total_pnl_usd || 0), 0);
+    document.getElementById('sum-active').textContent  = active;
+    document.getElementById('sum-pending').textContent = pending;
+    document.getElementById('sum-total').textContent   = total;
+    const pnlEl = document.getElementById('sum-pnl');
+    pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' $';
+    pnlEl.className = 's-val ' + (pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'zero');
+  }
+
+  function buildCard(c) {
+    const div = document.createElement('div');
+    div.className = 'card st-' + c.status;
+    div.innerHTML = cardHeader(c) + cardBody(c) + cardFooter(c);
+    const btn = div.querySelector('.close-btn');
+    if (btn) {
+      btn.addEventListener('click', () => doClose(c.chain_id, btn));
+    }
+    return div;
+  }
+
+  function cardHeader(c) {
+    return `<div class="card-header">
+      <span class="chain-short">${esc(c.short_id)}</span>
+      <div class="dot-track">${buildDots(c)}</div>
+      <span class="badge badge-${c.status}">${c.status}</span>
+    </div>`;
+  }
+
+  function buildDots(c) {
+    const dots = [];
+    // one dot per known level (from orders)
+    for (const lv of (c.levels || [])) {
+      const s = lv.status;
+      if (s === 'won')                           dots.push('<span class="dot dot-won" title="won L' + lv.level + '"></span>');
+      else if (s === 'filled' || s === 'pending') dots.push('<span class="dot dot-active" title="open L' + lv.level + '"></span>');
+      else if (s === 'lost')                     dots.push('<span class="dot dot-lost" title="lost L' + lv.level + '"></span>');
+      else if (s === 'stopped_out')              dots.push('<span class="dot dot-sl" title="SL L' + lv.level + '"></span>');
+      else                                       dots.push('<span class="dot dot-empty"></span>');
+    }
+    // pending ticket dot
+    if (c.pending_ticket) {
+      dots.push('<span class="dot dot-ticket" title="next: $' + (c.pending_ticket.size_usd || 0).toFixed(2) + ' ready"></span>');
+    }
+    return dots.join('');
+  }
+
+  function cardBody(c) {
+    const ao = c.active_order;
+    let qHtml, metaHtml;
+    if (ao) {
+      qHtml = `<div class="question" title="${esc(ao.question)}">${esc(ao.question)}</div>`;
+      const age = ao.created_at ? relTime(ao.created_at) : '—';
+      const lvl = 'L' + ao.level;
+      const dom = ao.domain || '—';
+      const sz  = ao.size_usd != null ? '$' + ao.size_usd.toFixed(2) : '—';
+      const ask = ao.price_target != null ? 'ask ' + ao.price_target.toFixed(4) : '—';
+      metaHtml = `<div class="meta">
+        <span><span class="meta-val">${sz}</span></span>
+        <span>·</span>
+        <span><span class="meta-val">${ask}</span></span>
+        <span>·</span>
+        <span>${dom} <span class="meta-val">${lvl}</span></span>
+        <span>·</span>
+        <span><span class="meta-val">${age}</span></span>
+      </div>`;
+    } else if (c.pending_ticket) {
+      const t = c.pending_ticket;
+      const sz = t.size_usd != null ? '$' + t.size_usd.toFixed(4) : '—';
+      qHtml = `<div class="question muted">Waiting for next opportunity…</div>`;
+      metaHtml = `<div class="meta">Next: <span class="meta-val">${sz}</span> · Level ${t.level}</div>`;
+    } else {
+      const last = c.levels && c.levels.length ? c.levels[c.levels.length - 1] : null;
+      const lastQ = last ? last.question : '';
+      qHtml = `<div class="question muted">${esc(lastQ) || 'Chain ended'}</div>`;
+      metaHtml = `<div class="meta">No active order or pending ticket</div>`;
+    }
+    return `<div class="card-body">${qHtml}${metaHtml}</div>`;
+  }
+
+  function cardFooter(c) {
+    const pnl = c.total_pnl_usd || 0;
+    const pnlCls  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'zero';
+    const pnlText = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' $ realized';
+    const canClose = c.status === 'active' || c.status === 'pending';
+    const btnHtml = canClose
+      ? `<button class="close-btn" data-chain="${esc(c.chain_id)}">Close ×</button>`
+      : (c.status === 'closing' ? `<button class="close-btn" disabled>closing…</button>` : '');
+    return `<div class="card-footer">
+      <span class="pnl ${pnlCls}">${pnlText}</span>
+      ${btnHtml}
+    </div>`;
+  }
+
+  async function doClose(chainId, btn) {
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      const r = await fetch('/api/chains/' + encodeURIComponent(chainId) + '/close', { method: 'POST' });
+      if (!r.ok) { const d = await r.json(); alert('Error: ' + (d.detail || r.status)); btn.disabled = false; btn.textContent = 'Close ×'; }
+      // SSE will refresh within 5s — no manual DOM update needed
+    } catch(err) {
+      alert('Network error: ' + err);
+      btn.disabled = false;
+      btn.textContent = 'Close ×';
+    }
+  }
+
+  function relTime(isoOrSqlite) {
+    const s = String(isoOrSqlite).replace(' ', 'T');
+    const dt = new Date(s.includes('Z') || s.includes('+') ? s : s + 'Z');
+    if (isNaN(dt)) return '—';
+    const diff = Math.floor((Date.now() - dt) / 1000);
+    if (diff < 60)   return diff + 's ago';
+    if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+    return Math.floor(diff/3600) + 'h ago';
+  }
+
+  function esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>
+"""
 
 
 _MAIN_PAGE_HTML = r"""<!DOCTYPE html>
@@ -1923,8 +2662,11 @@ th[data-sort="desc"]::after { content: " ↓"; color: var(--accent); }
 .engine-table tr:hover td { background: rgba(59,126,248,.04); }
 .s-paper  { color: #fbbf24; }
 .s-live   { color: #4ade80; }
-.s-filled { color: var(--green); }
-.s-failed { color: var(--red); }
+.s-won     { color: var(--green); font-weight: 600; }
+.s-lost    { color: var(--red); font-weight: 600; }
+.s-filled  { color: var(--amber); }
+.s-stopped { color: #f97316; font-weight: 600; }
+.s-failed { color: var(--muted); }
 .s-pending{ color: var(--muted); }
 .toggle-icon { margin-left: auto; color: var(--muted); font-size: 11px; transition: transform .2s; }
 .toggle-icon.open { transform: rotate(180deg); }
@@ -1948,7 +2690,9 @@ th[data-sort="desc"]::after { content: " ↓"; color: var(--accent); }
   <nav class="topbar-nav">
     <a href="/harvest">Harvest</a>
     <a href="/events">Events</a>
-    <a href="/weather">Weather</a>
+    <a href="/orders">Orders</a>
+    <a href="/chains">Chains</a>
+    <a href="/nearct">NearCT</a>
     <a href="/taxonomy">Taxonomy</a>
   </nav>
 </header>
@@ -2364,10 +3108,12 @@ boot();
     <span class="engine-title">⚡ Harvest Engine</span>
     <div class="engine-pills">
       <span class="e-pill off" id="e-mode">OFF</span>
-      <span class="e-stat">Orders today <strong id="e-today">—</strong></span>
+      <span class="e-stat">Today <strong id="e-today">—</strong></span>
+      <span class="e-stat">Open <strong id="e-open">—</strong></span>
       <span class="e-stat">Total <strong id="e-total">—</strong></span>
-      <span class="e-stat">P&amp;L (paper) <strong id="e-pnl">—</strong></span>
+      <span class="e-stat">P&amp;L realized <strong id="e-pnl">—</strong></span>
       <span class="e-stat">Last <strong id="e-last">—</strong></span>
+      <a href="/orders" style="font-size:11.5px;color:var(--accent);text-decoration:none;margin-left:4px">All orders →</a>
     </div>
     <span class="toggle-icon" id="engine-toggle">▾</span>
   </div>
@@ -2413,6 +3159,7 @@ boot();
   // ── SSE stream ───────────────────────────────────────
   const modeEl  = document.getElementById('e-mode');
   const todayEl = document.getElementById('e-today');
+  const openEl  = document.getElementById('e-open');
   const totalEl = document.getElementById('e-total');
   const pnlEl   = document.getElementById('e-pnl');
   const lastEl  = document.getElementById('e-last');
@@ -2420,8 +3167,7 @@ boot();
 
   function fmtTime(iso) {
     if (!iso) return '—';
-    const d = new Date(iso);
-    return d.toISOString().slice(11, 19);
+    return new Date(iso).toISOString().slice(11, 19);
   }
 
   function fmtAge(iso) {
@@ -2433,9 +3179,18 @@ boot();
   }
 
   function statusCls(s) {
-    if (s === 'filled') return 's-filled';
-    if (s === 'failed') return 's-failed';
+    if (s === 'won')          return 's-won';
+    if (s === 'lost')         return 's-lost';
+    if (s === 'filled')       return 's-filled';
+    if (s === 'stopped_out')  return 's-stopped';
+    if (s === 'failed')       return 's-failed';
     return 's-pending';
+  }
+
+  function statusLabel(s) {
+    if (s === 'filled')       return 'open';
+    if (s === 'stopped_out')  return 'SL';
+    return s || '—';
   }
 
   function apply(d) {
@@ -2451,6 +3206,7 @@ boot();
     }
 
     todayEl.textContent = d.orders_today ?? '—';
+    openEl.textContent  = d.orders_open ?? '—';
     totalEl.textContent = d.orders_total ?? '—';
     const pnl = d.pnl_paper_usd;
     pnlEl.textContent = pnl != null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '$' : '—';
@@ -2470,14 +3226,14 @@ boot();
       tr.innerHTML =
         '<td class="td-l">' + fmtTime(o.created_at) + '</td>' +
         '<td class="td-l">' + (o.domain || '—') + '</td>' +
-        '<td class="td-l">' + (o.underlying ? o.underlying.toUpperCase() + ' ' : '') + o.side.toUpperCase() + '</td>' +
-        '<td>' + o.price_target.toFixed(4) + '</td>' +
+        '<td class="td-l">' + (o.underlying ? o.underlying.toUpperCase() + ' ' : '') + (o.side||'').toUpperCase() + '</td>' +
+        '<td>' + (o.price_target != null ? o.price_target.toFixed(4) : '—') + '</td>' +
         '<td>' + yield_ + '</td>' +
-        '<td>' + o.size_usd.toFixed(0) + '</td>' +
-        '<td>' + (o.minutes_left != null ? o.minutes_left.toFixed(1) + 'm' : '—') + '</td>' +
+        '<td>' + (o.size_usd != null ? o.size_usd.toFixed(0) : '—') + '</td>' +
+        '<td>' + (o.minutes_left_at_entry != null ? o.minutes_left_at_entry.toFixed(1)+'m' : '—') + '</td>' +
         '<td class="' + modeCls + '">' + modeLabel + '</td>' +
-        '<td class="' + statusCls(o.status) + '">' + o.status + '</td>' +
-        '<td class="td-q" title="' + o.question.replace(/"/g,'&quot;') + '">' + o.question + '</td>';
+        '<td class="' + statusCls(o.status) + '">' + statusLabel(o.status) + '</td>' +
+        '<td class="td-q" title="' + (o.question||'').replace(/"/g,'&quot;') + '">' + (o.question||'') + '</td>';
       frag.appendChild(tr);
     }
     tbody.innerHTML = '';
@@ -2490,6 +3246,351 @@ boot();
     es.onerror = () => { es.close(); setTimeout(connect, 6000); };
   }
   connect();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+_NEARCT_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>poly_bot – NearCT</title>
+<style>
+:root{--bg:#0b1017;--surface:#111820;--surface2:#161f2b;--border:#1e2d3d;--border2:#243044;
+--text:#e8eef7;--muted:#8b9cb3;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--blue:#3b82f6;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:'SF Mono',ui-monospace,monospace;font-size:13px;}
+.topbar{display:flex;align-items:center;gap:12px;padding:10px 20px;
+background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;}
+.brand{font-size:16px;font-weight:700;letter-spacing:-0.5px;}
+.brand span{color:var(--blue);}
+.topbar-nav{display:flex;gap:2px;margin-left:auto;}
+.topbar-nav a{color:var(--muted);text-decoration:none;padding:.35rem .7rem;border-radius:5px;
+border:1px solid transparent;font-size:12px;}
+.topbar-nav a:hover,.topbar-nav a.active{color:var(--text);background:var(--surface2);border-color:var(--border2);}
+.stats-bar{display:flex;gap:0;border-bottom:1px solid var(--border);flex-wrap:wrap;}
+.s-item{padding:10px 20px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:2px;}
+.s-label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;}
+.s-val{font-size:18px;font-weight:600;}
+.s-won{color:var(--green);} .s-lost{color:var(--red);} .s-hold{color:var(--yellow);}
+.s-scanning{color:var(--blue);}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+padding:16px 20px;margin:16px 20px;}
+.card-title{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;}
+.card-body{display:flex;gap:24px;flex-wrap:wrap;}
+.card-field{display:flex;flex-direction:column;gap:3px;}
+.card-field .label{color:var(--muted);font-size:11px;}
+.card-field .val{font-size:14px;font-weight:600;}
+.countdown{color:var(--yellow);}
+.table-wrap{overflow-x:auto;padding:0 20px 40px;}
+table{width:100%;border-collapse:collapse;margin-top:4px;}
+th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;
+border-bottom:1px solid var(--border2);padding:7px 10px;text-align:right;white-space:nowrap;}
+th.th-l{text-align:left;}
+td{padding:7px 10px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap;}
+td.td-l{text-align:left;}
+td.td-q{text-align:left;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.won{color:var(--green);} .lost{color:var(--red);} .pending{color:var(--yellow);}
+.empty{text-align:center;color:var(--muted);padding:40px;}
+.section-label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:16px 0 6px;}
+.act-placed{color:var(--green);} .act-filtered{color:var(--yellow);} .act-error{color:var(--red);}
+.act-none{color:var(--muted);}
+tr.scan-row{cursor:pointer;} tr.scan-row:hover td{background:var(--surface2);}
+tr.detail-row td{padding:0;background:var(--surface2);}
+.detail-inner{padding:8px 16px 12px;}
+.detail-inner table{width:auto;margin:0;font-size:12px;}
+.detail-inner th{font-size:10px;padding:3px 8px;}
+.detail-inner td{padding:3px 8px;border-bottom:1px solid var(--border);}
+.r-mid_low{color:var(--muted);} .r-depth_low{color:var(--yellow);}
+.r-complement_fail{color:var(--red);} .r-no_book{color:var(--red);}
+.r-ask_low{color:var(--muted);} .r-bad_ts{color:var(--red);}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <span class="brand">poly<span>_bot</span></span>
+  <nav class="topbar-nav">
+    <a href="/">Markets</a>
+    <a href="/harvest">Harvest</a>
+    <a href="/events">Events</a>
+    <a href="/orders">Orders</a>
+    <a href="/chains">Chains</a>
+    <a href="/nearct" class="active">NearCT</a>
+    <a href="/taxonomy">Taxonomy</a>
+  </nav>
+</header>
+
+<div class="stats-bar">
+  <div class="s-item"><span class="s-label">Status</span><span class="s-val" id="st-state">—</span></div>
+  <div class="s-item"><span class="s-label">Capital</span><span class="s-val" id="st-capital">—</span></div>
+  <div class="s-item"><span class="s-label">Trades</span><span class="s-val" id="st-trades">—</span></div>
+  <div class="s-item"><span class="s-label">Today</span><span class="s-val" id="st-today">—</span></div>
+  <div class="s-item"><span class="s-label">Wins</span><span class="s-val s-won" id="st-wins">—</span></div>
+  <div class="s-item"><span class="s-label">Losses</span><span class="s-val s-lost" id="st-losses">—</span></div>
+  <div class="s-item"><span class="s-label">Stuck</span><span class="s-val" id="st-stuck">—</span></div>
+  <div class="s-item"><span class="s-label">Win rate</span><span class="s-val" id="st-wr">—</span></div>
+  <div class="s-item"><span class="s-label">Total P&amp;L</span><span class="s-val" id="st-pnl">—</span></div>
+  <div class="s-item" style="margin-left:auto;align-self:center;padding-right:20px;">
+    <button id="btn-reset" onclick="doReset()"
+      style="background:transparent;border:1px solid var(--red);color:var(--red);
+             padding:.35rem .8rem;border-radius:5px;font-size:12px;cursor:pointer;
+             font-family:inherit;opacity:.7;" title="Delete all orders and reset capital to $10">
+      Reset session
+    </button>
+  </div>
+</div>
+
+<div class="card" id="open-card" style="display:none">
+  <div class="card-title">Open position</div>
+  <div class="card-body">
+    <div class="card-field"><span class="label">Market</span><span class="val" id="op-question">—</span></div>
+    <div class="card-field"><span class="label">Ask</span><span class="val" id="op-ask">—</span></div>
+    <div class="card-field"><span class="label">Yield</span><span class="val" id="op-yield">—</span></div>
+    <div class="card-field"><span class="label">Size</span><span class="val" id="op-size">—</span></div>
+    <div class="card-field"><span class="label">Expires</span><span class="val countdown" id="op-expires">—</span></div>
+  </div>
+</div>
+
+<div class="table-wrap">
+<div class="section-label">Recent scans</div>
+<table id="scans-table">
+  <thead>
+    <tr>
+      <th class="th-l">Time (UTC)</th>
+      <th>Window</th>
+      <th>Mid✓</th>
+      <th>Book</th>
+      <th>Candidates</th>
+      <th>Best ask</th>
+      <th>Best yield</th>
+      <th>Mins left</th>
+      <th class="th-l">Action</th>
+    </tr>
+  </thead>
+  <tbody id="scans-tbody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody>
+</table>
+</div>
+
+<div class="table-wrap">
+<div class="section-label">Trade history</div>
+<table id="orders-table">
+  <thead>
+    <tr>
+      <th class="th-l">Time (UTC)</th>
+      <th class="th-l">Domain</th>
+      <th>Ask</th>
+      <th>Yield%</th>
+      <th>Size $</th>
+      <th>Capital before</th>
+      <th>Capital after</th>
+      <th>Status</th>
+      <th>P&amp;L $</th>
+      <th class="th-l">Market</th>
+    </tr>
+  </thead>
+  <tbody id="orders-tbody"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody>
+</table>
+</div>
+
+<script>
+'use strict';
+(function() {
+  let _orders = [];
+
+  function fmt$(v) { return v == null ? '—' : '$' + parseFloat(v).toFixed(4); }
+  function fmtPct(v) { return v == null ? '—' : (v*100).toFixed(2)+'%'; }
+  function fmtDt(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toISOString().replace('T',' ').substring(0,19);
+  }
+  function countdown(iso) {
+    if (!iso) return '—';
+    const diff = Math.round((new Date(iso) - Date.now()) / 1000);
+    if (diff <= 0) return 'resolving…';
+    const m = Math.floor(diff/60), s = diff%60;
+    return m > 0 ? m+'m '+s+'s' : s+'s';
+  }
+
+  async function loadStatus() {
+    try {
+      const r = await fetch('/api/nearct/status');
+      const s = await r.json();
+      const stateEl = document.getElementById('st-state');
+      stateEl.textContent = s.state || '—';
+      stateEl.className = 's-val ' + (
+        s.state === 'holding' ? 's-hold' :
+        s.state === 'quoting' ? 's-hold' :
+        s.state === 'scanning' ? 's-scanning' : '');
+      document.getElementById('st-capital').textContent = fmt$(s.capital);
+      document.getElementById('st-trades').textContent = s.total_trades ?? '—';
+      document.getElementById('st-today').textContent = s.trades_today ?? '—';
+      document.getElementById('st-wins').textContent = s.wins ?? '—';
+      document.getElementById('st-losses').textContent = s.losses ?? '—';
+      document.getElementById('st-stuck').textContent = s.stuck ?? '—';
+      const wr = s.total_trades ? ((s.wins/s.total_trades)*100).toFixed(1)+'%' : '—';
+      document.getElementById('st-wr').textContent = wr;
+      const pnlEl = document.getElementById('st-pnl');
+      pnlEl.textContent = s.total_pnl != null ? (s.total_pnl >= 0 ? '+' : '') + '$'+s.total_pnl.toFixed(4) : '—';
+      pnlEl.className = 's-val ' + (s.total_pnl > 0 ? 's-won' : s.total_pnl < 0 ? 's-lost' : '');
+
+      const card = document.getElementById('open-card');
+      if (s.open_order) {
+        card.style.display = '';
+        const o = s.open_order;
+        document.querySelector('#open-card .card-title').textContent = 'Open position';
+        document.getElementById('op-question').textContent = o.question || '—';
+        document.getElementById('op-ask').textContent = o.ask != null ? o.ask.toFixed(4) : '—';
+        document.getElementById('op-yield').textContent = fmtPct(o.net_yield_pct);
+        document.getElementById('op-size').textContent = fmt$(o.size_usd);
+        document.getElementById('op-expires').textContent = countdown(o.end_ts);
+      } else if (s.open_quote) {
+        card.style.display = '';
+        const q = s.open_quote;
+        document.querySelector('#open-card .card-title').textContent =
+          'Resting bid (maker) — ' + (q.n_sigma != null ? q.n_sigma + 'σ' : '');
+        document.getElementById('op-question').textContent = q.question || '—';
+        document.getElementById('op-ask').textContent = q.bid != null ? q.bid.toFixed(4) : '—';
+        document.getElementById('op-yield').textContent = fmtPct(q.net_yield_pct);
+        document.getElementById('op-size').textContent = '—';
+        document.getElementById('op-expires').textContent = countdown(q.end_ts);
+      } else {
+        card.style.display = 'none';
+      }
+    } catch(e) { console.warn('status fetch failed', e); }
+  }
+
+  function buildDetailRow(rejected, ncols) {
+    const dr = document.createElement('tr');
+    dr.className = 'detail-row';
+    dr.style.display = 'none';
+    const td = document.createElement('td');
+    td.colSpan = ncols;
+    if (!rejected || !rejected.length) {
+      td.innerHTML = '<div class="detail-inner"><span style="color:var(--muted)">No rejected markets this scan.</span></div>';
+    } else {
+      const rows = rejected.map(r => {
+        const rCls = 'r-' + r.reason;
+        const q = (r.question || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        return '<tr>' +
+          '<td class="td-q" style="max-width:320px" title="' + q + '">' + (q || '—') + '</td>' +
+          '<td>' + (r.domain || '—') + '</td>' +
+          '<td>' + r.minutes_left + 'm</td>' +
+          '<td>' + (r.mid != null ? r.mid.toFixed(4) : '—') + '</td>' +
+          '<td>' + (r.ask != null ? r.ask.toFixed(4) : '—') + '</td>' +
+          '<td>' + (r.depth != null ? '$'+r.depth.toFixed(1) : '—') + '</td>' +
+          '<td class="' + rCls + '">' + r.reason + '</td>' +
+          '</tr>';
+      }).join('');
+      td.innerHTML = '<div class="detail-inner"><table>' +
+        '<thead><tr><th class="th-l">Market</th><th class="th-l">Domain</th>' +
+        '<th>Mins</th><th>Mid</th><th>Ask</th><th>Depth</th><th class="th-l">Reason</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table></div>';
+    }
+    dr.appendChild(td);
+    return dr;
+  }
+
+  async function loadScans() {
+    try {
+      const r = await fetch('/api/nearct/scans');
+      const scans = await r.json();
+      const tbody = document.getElementById('scans-tbody');
+      if (!scans.length) {
+        tbody.innerHTML = '<tr><td colspan="9" class="empty">No scans yet</td></tr>';
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      for (const s of scans) {
+        const tr = document.createElement('tr');
+        tr.className = 'scan-row';
+        const actCls = s.action === 'placed' ? 'act-placed' :
+                       s.action === 'filtered_out' ? 'act-filtered' :
+                       s.action === 'error' ? 'act-error' : 'act-none';
+        const actLbl = s.action === 'no_markets' ? 'no markets' : s.action;
+        const hasDetail = s.rejected && s.rejected.length > 0;
+        const expandIcon = hasDetail ? ' ▶' : '';
+        tr.innerHTML =
+          '<td class="td-l">' + fmtDt(s.ts) + '</td>' +
+          '<td>' + s.markets_in_window + '</td>' +
+          '<td>' + s.mid_passed + '</td>' +
+          '<td>' + s.book_checked + '</td>' +
+          '<td>' + s.candidates + '</td>' +
+          '<td>' + (s.best_ask != null ? s.best_ask.toFixed(4) : '—') + '</td>' +
+          '<td>' + (s.best_yield_pct != null ? (s.best_yield_pct*100).toFixed(2)+'%' : '—') + '</td>' +
+          '<td>' + (s.best_minutes_left != null ? s.best_minutes_left+'m' : '—') + '</td>' +
+          '<td class="td-l ' + actCls + '">' + actLbl + expandIcon + '</td>';
+        const detailRow = buildDetailRow(s.rejected, 9);
+        tr.addEventListener('click', () => {
+          const vis = detailRow.style.display !== 'none';
+          detailRow.style.display = vis ? 'none' : '';
+          const last = tr.querySelector('td:last-child');
+          if (last) last.textContent = actLbl + (vis ? expandIcon : ' ▼');
+        });
+        frag.appendChild(tr);
+        frag.appendChild(detailRow);
+      }
+      tbody.innerHTML = '';
+      tbody.appendChild(frag);
+    } catch(e) { console.warn('scans fetch failed', e); }
+  }
+
+  async function loadOrders() {
+    try {
+      const r = await fetch('/api/nearct/orders?limit=200');
+      _orders = await r.json();
+      renderOrders();
+    } catch(e) { console.warn('orders fetch failed', e); }
+  }
+
+  function renderOrders() {
+    const tbody = document.getElementById('orders-tbody');
+    if (!_orders.length) {
+      tbody.innerHTML = '<tr><td colspan="10" class="empty">No trades yet</td></tr>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const o of _orders) {
+      const tr = document.createElement('tr');
+      const sc = o.status === 'won' ? 'won' : o.status === 'lost' ? 'lost' : 'pending';
+      const pnlFmt = o.pnl_usd != null
+        ? (o.pnl_usd >= 0 ? '+' : '') + '$' + o.pnl_usd.toFixed(4) : '—';
+      tr.innerHTML =
+        '<td class="td-l">' + fmtDt(o.created_at) + '</td>' +
+        '<td class="td-l">' + (o.domain||'—') + '</td>' +
+        '<td>' + (o.ask != null ? o.ask.toFixed(4) : '—') + '</td>' +
+        '<td>' + fmtPct(o.net_yield_pct) + '</td>' +
+        '<td>' + fmt$(o.size_usd) + '</td>' +
+        '<td>' + fmt$(o.capital_before) + '</td>' +
+        '<td>' + (o.capital_after != null ? fmt$(o.capital_after) : '—') + '</td>' +
+        '<td class="' + sc + '">' + o.status + '</td>' +
+        '<td class="' + sc + '">' + pnlFmt + '</td>' +
+        '<td class="td-q" title="' + (o.question||'').replace(/"/g,'&quot;') + '">' + (o.question||'—') + '</td>';
+      frag.appendChild(tr);
+    }
+    tbody.innerHTML = '';
+    tbody.appendChild(frag);
+  }
+
+  window.doReset = async function() {
+    if (!confirm('Reset session?\\n\\nCancella tutti gli ordini e riporta il capitale a $10.\\nAzione irreversibile.')) return;
+    try {
+      const r = await fetch('/api/nearct/reset', {method:'POST'});
+      const d = await r.json();
+      if (d.ok) { loadStatus(); loadScans(); loadOrders(); }
+      else alert('Reset failed: ' + (d.error || 'unknown error'));
+    } catch(e) { alert('Reset failed: ' + e); }
+  };
+
+  // initial load
+  loadStatus(); loadScans(); loadOrders();
+  // poll
+  setInterval(loadStatus, 4000);
+  setInterval(loadScans, 5000);
+  setInterval(loadOrders, 15000);
 })();
 </script>
 </body>
