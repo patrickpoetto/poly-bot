@@ -79,3 +79,6 @@ docker-compose.override.yml
 # Research scratch (notebooks, exported datasets)
 *.ipynb
 *.parquet
+btc_5m_paper_state.json
+btc_5m_paper_trades.jsonl
+btc_5m_dashboard.html
