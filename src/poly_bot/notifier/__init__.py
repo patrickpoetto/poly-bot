@@ -1,1 +1,0 @@
-"""Outbound notifier integrations (Telegram, …)."""

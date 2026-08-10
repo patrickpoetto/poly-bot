@@ -1,50 +1,52 @@
 # poly_bot — Claude session primer
 
-**Start every session by reading `docs/LLM_CONTEXT.md`** — it covers strategy, architecture, pipeline, parameters, known traps, and Phase 2 roadmap.
+Standalone research + paper-trading scripts for a Polymarket BTC 5m
+("Bitcoin Up or Down") strategy. No package, no DB, no dashboard server —
+everything is a self-contained script in the repo root, data lives in
+gitignored parquet/JSON/JSONL files next to it.
+
+## Strategy (current, live-validated as of 2026-08)
+
+Watch `btc-updown-5m` markets. When a side's price is first confirmed by a
+**real trade** (not just a resting book quote) at >=0.80, with 30-120s left
+before close, enter a fixed $50 paper position on that side. Confirmation
+must be a genuine trade print (`data-api.polymarket.com/trades`), not a WS
+book/ask level — a resting quote costs nothing to leave stale; a trade
+risks real capital. See `btc_5m_paper_trader.py` module docstring for the
+full bug history (Cloudflare cache, stale connections, WS book != trade
+signal, `limit=300` trade-fetch truncation).
+
+**Known backtest trap**: fetching trades with a small `limit` on an
+already-resolved market silently truncates the 30-120s entry window for
+busy candles (resolution bursts commonly print hundreds of trades in
+15-30s) — this made an early backtest look ~100x better than reality.
+Always use `limit>=2000` and check for residual truncation
+(`still_truncated` in `btc_5m_multithreshold_v2_scrape.py`) before trusting
+a historical loss-rate number.
 
 ## Quick commands
 
 ```bash
 source .venv/bin/activate
 
-# Tests
-python -m pytest -q
+# Lint / format / type-check
+ruff check *.py
+ruff format *.py
+mypy *.py
 
-# Type check (exclude known-ignored files)
-mypy src --exclude "catalog/dashboard|metrics"
+# Live paper trader (PAPER ONLY — no real orders, no real money)
+python btc_5m_paper_trader.py
+# then open btc_5m_dashboard.html in a browser (auto-refreshes every 5s)
+# run detached so it survives the session:
+#   nohup python btc_5m_paper_trader.py > btc_5m_paper_trader.log 2>&1 & disown
 
-# Lint / format
-ruff check src tests
-ruff format src tests
-
-# CLI entry point
-poly-bot --help
-
-# Key harvest commands
-poly-bot harvest scan             # live CLOB scan (HOT window markets)
-poly-bot harvest scan --db-only   # DB quotes only, no live CLOB calls
-poly-bot harvest diagnose         # funnel diagnostics — why 0 opportunities?
-poly-bot harvest paper            # dry-run paper log
-
-# Key catalog commands
-poly-bot catalog window-stats     # HOT/WARM/ALL market funnel counts
-poly-bot catalog expiring         # markets resolving soon
+# Historical backtests (data-api.polymarket.com trade tape, not book/ask)
+python btc_5m_multithreshold_v2_scrape.py   # full-history, limit=2000, truncation-flagged
+python btc_5m_recent2000_scrape.py          # most recent ~2000 markets (regime check)
 ```
 
-## Dashboard
+## Data files (gitignored, not in git)
 
-```bash
-poly-bot catalog dashboard   # starts on http://localhost:8765
-# auto-starts: discovery (delta every ~60s), enrich (every 60s), reconcile (hourly)
-# kill: kill -9 $(lsof -ti :8765)
-```
-
-**Architecture**: markets sorted by `end_ts ASC` (top 100), live CLOB prices via SSE every 3s for top 20 markets. DB quotes = seed only; live prices override via `applyPrices()`. "Quotes stale" in topbar = DB enrich lag (harmless — live prices bypass DB).
-
-**Known issue**: SQLite `database is locked` when discovery + enrich write concurrently → `busy_timeout=30000` in `db.py` mitigates but doesn't eliminate. CLOB `ConnectError` causes enrich to fail with tenacity RetryError — transient, recovers next cycle.
-
-## Phase status
-
-- **Phase 1 (infra / catalog)** — complete. DB, discovery, weather, harvest scan, book sanity, diagnostics.
-- **Phase 1.5 (dashboard)** — complete. Live SSE dashboard, auto-background tasks, sticky header, price flash.
-- **Phase 2 (execution)** — **next**. See `docs/LLM_CONTEXT.md` § "Phase 2 roadmap".
+- `btc_5m_paper_state.json` / `btc_5m_paper_trades.jsonl` — live paper trader state/log
+- `btc_5m_dashboard.html` — self-refreshing local dashboard, written by the paper trader
+- `btc_5m_*.parquet` — cached historical crawls (events + trade tapes)
