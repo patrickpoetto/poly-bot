@@ -102,6 +102,7 @@ class OpenPosition:
     seconds_left_at_entry: int
     stake: float = STAKE_USD
     confirm_size: float = 0.0
+    n_trades_pre_entry: int = 0
 
 
 @dataclass
@@ -115,6 +116,7 @@ class ClosedTrade:
     pnl: float
     closed_at: str
     confirm_size: float = 0.0
+    n_trades_pre_entry: int = 0
 
 
 @dataclass
@@ -342,6 +344,7 @@ def render_dashboard(state: PaperState, ws_connected: bool) -> None:
             f"<tr class='{css_class}'>"
             f"<td>{t.closed_at[11:19]}</td><td>{t.slug}</td><td>{t.side}</td>"
             f"<td>{t.entry_price:.3f}</td><td>{t.seconds_left_at_entry}s</td>"
+            f"<td>{t.n_trades_pre_entry}</td>"
             f"<td>{esito}</td><td>{t.pnl:+.2f}</td></tr>"
         )
     rows = "".join(row_parts)
@@ -385,7 +388,7 @@ tr.loss td:last-child {{ color: #c0392b; font-weight: 600; }}
 </div>
 {open_html}
 <table>
-<tr><th>Ora</th><th>Mercato</th><th>Lato</th><th>Prezzo</th><th>Secondi rimasti</th><th>Esito</th><th>P&amp;L</th></tr>
+<tr><th>Ora</th><th>Mercato</th><th>Lato</th><th>Prezzo</th><th>Secondi rimasti</th><th>N pre-entry</th><th>Esito</th><th>P&amp;L</th></tr>
 {rows}
 </table>
 </body></html>"""
@@ -484,6 +487,7 @@ async def _check_resolution(
             pnl=pnl,
             closed_at=now.isoformat(),
             confirm_size=p.confirm_size,
+            n_trades_pre_entry=p.n_trades_pre_entry,
         )
         state.trades.append(trade)
         append_trade_log(trade)
@@ -539,13 +543,24 @@ async def confirm_recent_trade(
     Deliberately uses a fresh one-off client, not a shared/pooled one:
     the same class of stale-connection bug hit both the old REST-polling
     version (long-lived httpx client) and the WS feed (long-lived
-    subscription) — a fresh connection per call sidesteps it."""
+    subscription) — a fresh connection per call sidesteps it.
+
+    limit=2000, not 300: found live (2026-08-11) that limit=300 truncates
+    exactly like the old limit=30 bug it replaced — a market with 350+
+    trades before the confirming one returns only the 300 MOST RECENT,
+    which can exclude the true earliest qualifying trade entirely (direct
+    repro: limit=300 found no candidate at all for a market where
+    limit=2000 found one 55s earlier) and silently undercounts
+    n_trades_pre_entry for the activity filter below (it can only count
+    what's in this same response). Backtest scripts already used
+    limit=2000 for exactly this reason; this call had drifted out of sync
+    with them."""
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
                 f"{DATA_API}/trades",
-                params={"market": condition_id, "limit": 300, "_": int(time.time() * 1000)},
-                timeout=8.0,
+                params={"market": condition_id, "limit": 2000, "_": int(time.time() * 1000)},
+                timeout=10.0,
             )
             r.raise_for_status()
             trades = r.json()
@@ -626,12 +641,14 @@ async def _check_entry(
                 entry_ts=now_ts,
                 seconds_left_at_entry=seconds_left,
                 confirm_size=confirm_size,
+                n_trades_pre_entry=n_trades_pre_entry,
             )
         )
         entered_conditions.add(t.condition_id)
         print(
             f"[{now:%H:%M:%S}] ENTRATA {t.slug} {t.outcome} @ {entry_price:.3f} "
-            f"(confermata da trade reale size={confirm_size:.1f}, {seconds_left}s dalla chiusura) — ${STAKE_USD} paper",
+            f"(confermata da trade reale size={confirm_size:.1f}, n_pre_entry={n_trades_pre_entry}, "
+            f"{seconds_left}s dalla chiusura) — ${STAKE_USD} paper",
             flush=True,
         )
         save_state(state)
