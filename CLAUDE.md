@@ -43,6 +43,11 @@ python btc_5m_paper_trader.py
 # Historical backtests (data-api.polymarket.com trade tape, not book/ask)
 python btc_5m_multithreshold_v2_scrape.py   # full-history, limit=2000, truncation-flagged
 python btc_5m_recent2000_scrape.py          # most recent ~2000 markets (regime check)
+
+# WS book/price_change recorder (raw, going forward — no historical book data exists)
+python btc_5m_ws_recorder.py
+#   nohup python btc_5m_ws_recorder.py > btc_5m_ws_recorder.log 2>&1 & disown
+# ~2.4GB/day zstd-compressed (measured, one market tracked at a time) — watch disk.
 ```
 
 ## Data files (gitignored, not in git)

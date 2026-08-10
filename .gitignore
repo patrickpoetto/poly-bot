@@ -82,3 +82,4 @@ docker-compose.override.yml
 btc_5m_paper_state.json
 btc_5m_paper_trades.jsonl
 btc_5m_dashboard.html
+ws_data/
