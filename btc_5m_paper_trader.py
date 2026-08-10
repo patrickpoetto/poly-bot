@@ -120,7 +120,7 @@ class ClosedTrade:
 @dataclass
 class PaperState:
     trades: list[ClosedTrade] = field(default_factory=list)
-    open_position: OpenPosition | None = None
+    open_positions: list[OpenPosition] = field(default_factory=list)
     watching: list[str] = field(default_factory=list)
     started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -140,7 +140,7 @@ class PaperState:
 def save_state(state: PaperState) -> None:
     payload = {
         "trades": [asdict(t) for t in state.trades],
-        "open_position": asdict(state.open_position) if state.open_position else None,
+        "open_positions": [asdict(p) for p in state.open_positions],
         "started_at": state.started_at,
     }
     STATE_FILE.write_text(json.dumps(payload, indent=2))
@@ -152,8 +152,10 @@ def load_state() -> PaperState:
     payload = json.loads(STATE_FILE.read_text())
     state = PaperState(started_at=payload.get("started_at", datetime.now(UTC).isoformat()))
     state.trades = [ClosedTrade(**t) for t in payload.get("trades", [])]
-    if payload.get("open_position"):
-        state.open_position = OpenPosition(**payload["open_position"])
+    if "open_positions" in payload:
+        state.open_positions = [OpenPosition(**p) for p in payload["open_positions"]]
+    elif payload.get("open_position"):  # formato precedente, singola posizione
+        state.open_positions = [OpenPosition(**payload["open_position"])]
     return state
 
 
@@ -343,13 +345,11 @@ def render_dashboard(state: PaperState, ws_connected: bool) -> None:
             f"<td>{esito}</td><td>{t.pnl:+.2f}</td></tr>"
         )
     rows = "".join(row_parts)
-    open_html = ""
-    if state.open_position:
-        p = state.open_position
-        open_html = (
-            f"<div class='open'>Posizione aperta: {p.slug} — {p.side} @ {p.entry_price:.3f} "
-            f"(entrata a {p.seconds_left_at_entry}s dalla chiusura) — ${p.stake:.0f} in gioco</div>"
-        )
+    open_html = "".join(
+        f"<div class='open'>Posizione aperta: {p.slug} — {p.side} @ {p.entry_price:.3f} "
+        f"(entrata a {p.seconds_left_at_entry}s dalla chiusura) — ${p.stake:.0f} in gioco</div>"
+        for p in state.open_positions
+    )
     pnl = state.cumulative_pnl
     pnl_color = "#2f8c77" if pnl >= 0 else "#c0392b"
     ws_html = (
@@ -458,36 +458,45 @@ async def _discover(client: httpx.AsyncClient, feed: PriceFeed, tracked: dict[st
 async def _check_resolution(
     client: httpx.AsyncClient, state: PaperState
 ) -> None:
-    p = state.open_position
-    if not p:
+    """Checks every open position, not just one — positions are independent
+    5-min markets, no reason a slow-to-resolve one should block checking the
+    rest (see _check_entry docstring: this used to be exactly the reason
+    ~4.7x of the theoretical entry rate was being silently skipped)."""
+    if not state.open_positions:
         return
-    res = await check_resolution(client, p.condition_id)
-    if res is None or p.side not in res:
-        return
-    now = datetime.now(UTC)
-    won = res[p.side]
-    pnl = STAKE_USD * _net_yield(p.entry_price) if won else -STAKE_USD
-    trade = ClosedTrade(
-        slug=p.slug,
-        side=p.side,
-        entry_price=p.entry_price,
-        seconds_left_at_entry=p.seconds_left_at_entry,
-        stake=p.stake,
-        won=won,
-        pnl=pnl,
-        closed_at=now.isoformat(),
-        confirm_size=p.confirm_size,
-    )
-    state.trades.append(trade)
-    append_trade_log(trade)
-    state.open_position = None
-    print(
-        f"[{now:%H:%M:%S}] CHIUSA {trade.slug} {trade.side} "
-        f"-> {'VINTA' if won else 'PERSA'} pnl={pnl:+.2f} "
-        f"(cumulato {state.cumulative_pnl:+.2f})",
-        flush=True,
-    )
-    save_state(state)
+    still_open: list[OpenPosition] = []
+    closed_any = False
+    for p in state.open_positions:
+        res = await check_resolution(client, p.condition_id)
+        if res is None or p.side not in res:
+            still_open.append(p)
+            continue
+        now = datetime.now(UTC)
+        won = res[p.side]
+        pnl = STAKE_USD * _net_yield(p.entry_price) if won else -STAKE_USD
+        trade = ClosedTrade(
+            slug=p.slug,
+            side=p.side,
+            entry_price=p.entry_price,
+            seconds_left_at_entry=p.seconds_left_at_entry,
+            stake=p.stake,
+            won=won,
+            pnl=pnl,
+            closed_at=now.isoformat(),
+            confirm_size=p.confirm_size,
+        )
+        state.trades.append(trade)
+        append_trade_log(trade)
+        closed_any = True
+        print(
+            f"[{now:%H:%M:%S}] CHIUSA {trade.slug} {trade.side} "
+            f"-> {'VINTA' if won else 'PERSA'} pnl={pnl:+.2f} "
+            f"(cumulato {state.cumulative_pnl:+.2f})",
+            flush=True,
+        )
+    state.open_positions = still_open
+    if closed_any:
+        save_state(state)
 
 
 MAX_PRE_ENTRY_ACTIVITY = 80
@@ -564,9 +573,14 @@ async def confirm_recent_trade(
 async def _check_entry(
     state: PaperState, tracked: dict[str, TrackedToken], entered_conditions: set[str]
 ) -> bool:
-    """Returns True if a new position was opened."""
-    if state.open_position:
-        return False
+    """Returns True if a new position was opened. Multiple positions can be
+    open at once now — markets are independent 5-min windows, and gating
+    entry on "no position open" meant a slow-to-resolve position (resolution
+    detection has been observed to lag several minutes) silently blocked
+    every market that opened AND closed its own entry window in the
+    meantime. Measured directly: median 18.4 min between trades vs a new
+    market every 5 min — about 4.7x fewer entries than the signal actually
+    offers (2026-08-10 analysis, 2050-market backtest vs 154 live trades)."""
     now = datetime.now(UTC)
     now_ts = int(now.timestamp())
 
@@ -603,14 +617,16 @@ async def _check_entry(
         entry_price = float(confirming_trade["price"])
         confirm_size = float(confirming_trade.get("size", 0.0))
 
-        state.open_position = OpenPosition(
-            slug=t.slug,
-            condition_id=t.condition_id,
-            side=t.outcome,
-            entry_price=entry_price,
-            entry_ts=now_ts,
-            seconds_left_at_entry=seconds_left,
-            confirm_size=confirm_size,
+        state.open_positions.append(
+            OpenPosition(
+                slug=t.slug,
+                condition_id=t.condition_id,
+                side=t.outcome,
+                entry_price=entry_price,
+                entry_ts=now_ts,
+                seconds_left_at_entry=seconds_left,
+                confirm_size=confirm_size,
+            )
         )
         entered_conditions.add(t.condition_id)
         print(
@@ -649,7 +665,7 @@ async def main() -> None:
                     await _discover(client, feed, tracked)
                     last_discovery = now
 
-                if state.open_position and now - last_resolution >= RESOLUTION_INTERVAL_S:
+                if state.open_positions and now - last_resolution >= RESOLUTION_INTERVAL_S:
                     await _check_resolution(client, state)
                     last_resolution = now
 
