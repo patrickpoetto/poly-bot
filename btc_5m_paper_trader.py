@@ -85,7 +85,9 @@ DASHBOARD_FILE = Path(__file__).resolve().parent / "btc_5m_dashboard.html"
 
 
 def _net_yield(price: float) -> float:
-    fee = FEE_RATE * min(price, 1.0 - price)
+    # fee = shares * feeRate * p * (1-p), confermato da help.polymarket.com/en/articles/13364478
+    # (non feeRate * min(p,1-p) come usato erroneamente per tutta la sessione precedente)
+    fee = FEE_RATE * price * (1.0 - price)
     cost = price + fee
     return (1.0 - cost) / cost
 
@@ -331,7 +333,7 @@ class PriceFeed:
 
 def render_dashboard(state: PaperState, ws_connected: bool) -> None:
     row_parts = []
-    for t in reversed(state.trades[-50:]):
+    for t in reversed(state.trades):
         css_class = "win" if t.won else "loss"
         esito = "VINTA" if t.won else "PERSA"
         row_parts.append(
@@ -488,7 +490,22 @@ async def _check_resolution(
     save_state(state)
 
 
-async def confirm_recent_trade(condition_id: str, side: str, window_start_ts: float) -> dict[str, Any] | None:
+MAX_PRE_ENTRY_ACTIVITY = 80
+# Trade totali (entrambi i lati) tra apertura finestra e trade di conferma.
+# Validato due volte, indipendentemente: backtest 2050 mercati storici
+# (EV/trade migliore proprio a soglia 80, tra le poche configurazioni
+# nettamente positive) e 153 trade paper live reali (perse concentrate
+# in modo nettamente bimodale: 8/19 con attivita 2-22, 11/19 con
+# attivita 91-411 — filtrando a <=80 il cumulato passa da -$174.53 a
+# +$80.47 scartando solo 24 trade). Troppa attivita prima del nostro
+# ingresso correla con differenziale BTC reale piu piccolo (mercato
+# genuinamente conteso, non deciso) anche quando il prezzo del token
+# dice gia >=0.80 — vedi analisi 2026-08-10.
+
+
+async def confirm_recent_trade(
+    condition_id: str, side: str, window_start_ts: float
+) -> tuple[dict[str, Any], int] | None:
     """The backtest's signal is the FIRST trade crossing the threshold
     within the 30-120s-before-close window — not "any recent trade", not
     "the most recent trade". Earlier versions used a rolling N-second
@@ -535,7 +552,13 @@ async def confirm_recent_trade(condition_id: str, side: str, window_start_ts: fl
     ]
     if not candidates:
         return None
-    return min(candidates, key=lambda t: t["timestamp"])
+    confirming_trade = min(candidates, key=lambda t: t["timestamp"])
+    n_trades_pre_entry = sum(
+        1
+        for t in trades
+        if window_start_ts <= float(t.get("timestamp", 0)) <= confirming_trade["timestamp"]
+    )
+    return confirming_trade, n_trades_pre_entry
 
 
 async def _check_entry(
@@ -565,8 +588,17 @@ async def _check_entry(
         # expected from the backtest rate. This matches the backtest's
         # actual signal (a real trade in the window) directly instead.
         window_start_ts = t.end_ts - MAX_SECONDS_LEFT
-        confirming_trade = await confirm_recent_trade(t.condition_id, t.outcome, window_start_ts)
-        if confirming_trade is None:
+        result = await confirm_recent_trade(t.condition_id, t.outcome, window_start_ts)
+        if result is None:
+            continue
+        confirming_trade, n_trades_pre_entry = result
+        if n_trades_pre_entry > MAX_PRE_ENTRY_ACTIVITY:
+            print(
+                f"[{now:%H:%M:%S}] SCARTATO {t.slug} {t.outcome} — troppa attivita pre-ingresso "
+                f"({n_trades_pre_entry} > {MAX_PRE_ENTRY_ACTIVITY})",
+                flush=True,
+            )
+            entered_conditions.add(t.condition_id)
             continue
         entry_price = float(confirming_trade["price"])
         confirm_size = float(confirming_trade.get("size", 0.0))
