@@ -169,33 +169,42 @@ def append_trade_log(trade: ClosedTrade) -> None:
 # ── Market discovery (REST, gamma-api — no caching issues observed) ─────────
 
 
-async def fetch_active_btc5m(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+async def fetch_active_btc5m() -> list[dict[str, Any]]:
     """limit=100, not 20: Polymarket has since added the same updown-5m/15m
     format for 7 more assets alongside BTC (bnb, doge, eth, hype, sol, xrp,
     zec) — 16 market families now compete for the same end_date_min/max
     window. Found live (2026-08-11, zero trades overnight): with limit=20,
     btc-updown-5m can land past position 20 in the endDate-ascending
     ordering (observed directly at position 23) and silently vanish from
-    the discovered list — no error, just an empty result for that poll."""
-    now = datetime.now(UTC)
-    horizon = now.timestamp() + MAX_SECONDS_LEFT + 60
-    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    horizon_iso = datetime.fromtimestamp(horizon, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    resp = await client.get(
-        f"{GAMMA_HOST}/markets",
-        params={
-            "active": "true",
-            "closed": "false",
-            "order": "endDate",
-            "ascending": "true",
-            "limit": 100,
-            "end_date_min": now_iso,
-            "end_date_max": horizon_iso,
-        },
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    the discovered list — no error, just an empty result for that poll.
+
+    Fresh one-off client, not the loop's shared/pooled one: found live
+    (2026-08-11, second zero-trade stretch same day) that a standalone
+    script with a fresh client found valid signals on every one of the
+    last 6 closed markets, while the live process — running for over an
+    hour on the same shared client — discovered nothing that whole time.
+    Same connection-staleness bug class already fixed once for
+    confirm_recent_trade's data-api calls; had never been applied here."""
+    async with httpx.AsyncClient() as client:
+        now = datetime.now(UTC)
+        horizon = now.timestamp() + MAX_SECONDS_LEFT + 60
+        now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        horizon_iso = datetime.fromtimestamp(horizon, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp = await client.get(
+            f"{GAMMA_HOST}/markets",
+            params={
+                "active": "true",
+                "closed": "false",
+                "order": "endDate",
+                "ascending": "true",
+                "limit": 100,
+                "end_date_min": now_iso,
+                "end_date_max": horizon_iso,
+            },
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
     items = data if isinstance(data, list) else data.get("data", [])
     return [m for m in items if str(m.get("slug", "")).startswith("btc-updown-5m-")]
 
@@ -203,11 +212,16 @@ async def fetch_active_btc5m(client: httpx.AsyncClient) -> list[dict[str, Any]]:
 # ── Resolution check (REST, clob — confirmed cf-cache-status: DYNAMIC) ──────
 
 
-async def check_resolution(client: httpx.AsyncClient, condition_id: str) -> dict[str, bool] | None:
+async def check_resolution(condition_id: str) -> dict[str, bool] | None:
+    """Fresh one-off client, not the loop's shared/pooled one — same
+    connection-staleness bug class as fetch_active_btc5m/confirm_recent_trade
+    (2026-08-11); applied here precautionarily for consistency, not from a
+    directly observed failure on this specific call."""
     try:
-        r = await client.get(f"{CLOB_HOST}/markets/{condition_id}", timeout=8.0)
-        r.raise_for_status()
-        data = r.json()
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{CLOB_HOST}/markets/{condition_id}", timeout=8.0)
+            r.raise_for_status()
+            data = r.json()
     except httpx.HTTPError:
         return None
     if not data.get("closed"):
@@ -414,10 +428,10 @@ class TrackedToken:
     end_ts: int
 
 
-async def _discover(client: httpx.AsyncClient, feed: PriceFeed, tracked: dict[str, TrackedToken]) -> None:
+async def _discover(feed: PriceFeed, tracked: dict[str, TrackedToken]) -> None:
     now_ts = int(datetime.now(UTC).timestamp())
     try:
-        markets = await fetch_active_btc5m(client)
+        markets = await fetch_active_btc5m()
     except httpx.HTTPError as exc:
         print(f"[{datetime.now(UTC):%H:%M:%S}] discovery error: {exc}", flush=True)
         return
@@ -465,9 +479,7 @@ async def _discover(client: httpx.AsyncClient, feed: PriceFeed, tracked: dict[st
             del tracked[tid]
 
 
-async def _check_resolution(
-    client: httpx.AsyncClient, state: PaperState
-) -> None:
+async def _check_resolution(state: PaperState) -> None:
     """Checks every open position, not just one — positions are independent
     5-min markets, no reason a slow-to-resolve one should block checking the
     rest (see _check_entry docstring: this used to be exactly the reason
@@ -477,7 +489,7 @@ async def _check_resolution(
     still_open: list[OpenPosition] = []
     closed_any = False
     for p in state.open_positions:
-        res = await check_resolution(client, p.condition_id)
+        res = await check_resolution(p.condition_id)
         if res is None or p.side not in res:
             still_open.append(p)
             continue
@@ -677,31 +689,30 @@ async def main() -> None:
     tracked: dict[str, TrackedToken] = {}
     entered_conditions: set[str] = set()
 
-    async with httpx.AsyncClient() as client:
-        last_discovery = 0.0
-        last_resolution = 0.0
-        last_dashboard = 0.0
-        try:
-            while True:
-                now = time.monotonic()
+    last_discovery = 0.0
+    last_resolution = 0.0
+    last_dashboard = 0.0
+    try:
+        while True:
+            now = time.monotonic()
 
-                if now - last_discovery >= DISCOVERY_INTERVAL_S:
-                    await _discover(client, feed, tracked)
-                    last_discovery = now
+            if now - last_discovery >= DISCOVERY_INTERVAL_S:
+                await _discover(feed, tracked)
+                last_discovery = now
 
-                if state.open_positions and now - last_resolution >= RESOLUTION_INTERVAL_S:
-                    await _check_resolution(client, state)
-                    last_resolution = now
+            if state.open_positions and now - last_resolution >= RESOLUTION_INTERVAL_S:
+                await _check_resolution(state)
+                last_resolution = now
 
-                entered = await _check_entry(state, tracked, entered_conditions)
+            entered = await _check_entry(state, tracked, entered_conditions)
 
-                if entered or now - last_dashboard >= 5.0:
-                    render_dashboard(state, feed.connected)
-                    last_dashboard = now
+            if entered or now - last_dashboard >= 5.0:
+                render_dashboard(state, feed.connected)
+                last_dashboard = now
 
-                await asyncio.sleep(ENTRY_CHECK_INTERVAL_S)
-        finally:
-            ws_task.cancel()
+            await asyncio.sleep(ENTRY_CHECK_INTERVAL_S)
+    finally:
+        ws_task.cancel()
 
 
 if __name__ == "__main__":
