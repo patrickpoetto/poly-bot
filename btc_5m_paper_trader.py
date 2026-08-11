@@ -170,6 +170,13 @@ def append_trade_log(trade: ClosedTrade) -> None:
 
 
 async def fetch_active_btc5m(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """limit=100, not 20: Polymarket has since added the same updown-5m/15m
+    format for 7 more assets alongside BTC (bnb, doge, eth, hype, sol, xrp,
+    zec) — 16 market families now compete for the same end_date_min/max
+    window. Found live (2026-08-11, zero trades overnight): with limit=20,
+    btc-updown-5m can land past position 20 in the endDate-ascending
+    ordering (observed directly at position 23) and silently vanish from
+    the discovered list — no error, just an empty result for that poll."""
     now = datetime.now(UTC)
     horizon = now.timestamp() + MAX_SECONDS_LEFT + 60
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -181,7 +188,7 @@ async def fetch_active_btc5m(client: httpx.AsyncClient) -> list[dict[str, Any]]:
             "closed": "false",
             "order": "endDate",
             "ascending": "true",
-            "limit": 20,
+            "limit": 100,
             "end_date_min": now_iso,
             "end_date_max": horizon_iso,
         },
