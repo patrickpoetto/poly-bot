@@ -573,7 +573,13 @@ async def confirm_recent_trade(
     n_trades_pre_entry for the activity filter below (it can only count
     what's in this same response). Backtest scripts already used
     limit=2000 for exactly this reason; this call had drifted out of sync
-    with them."""
+    with them.
+
+    Catches Exception broadly, not just httpx.HTTPError: a non-JSON 200
+    response (e.g. a transient WAF/rate-limit page) would raise
+    json.JSONDecodeError from r.json(), which does NOT subclass
+    httpx.HTTPError and would otherwise escape uncaught and kill the
+    whole main loop silently for a single bad poll."""
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
@@ -583,7 +589,12 @@ async def confirm_recent_trade(
             )
             r.raise_for_status()
             trades = r.json()
-    except httpx.HTTPError:
+    except Exception as exc:
+        print(
+            f"[{datetime.now(UTC):%H:%M:%S}] confirm_recent_trade ECCEZIONE ({type(exc).__name__}) "
+            f"({condition_id[:12]}.. {side}): {exc}",
+            flush=True,
+        )
         return None
 
     candidates = [
