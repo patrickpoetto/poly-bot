@@ -1,33 +1,46 @@
 """PAPER trading only — no real orders, no real money. Ever.
 
 Live-replicates the validated BTC 5m entry rule: watch btc-up-or-down-5m
-markets via Polymarket's CLOB WebSocket for fast, free book monitoring,
-and when a side's ask reaches >=0.80 with between 30 and 120 seconds left
-before close, confirm with a REAL recent trade (REST, gated — see below)
-before logging a SIMULATED $50 position. Track it to resolution and
+markets via Polymarket's CLOB WebSocket, and when a side's price is
+confirmed by a REAL executed trade (WS last_trade_price event, not a
+resting book/ask level) at >=0.80 with between 30 and 120 seconds left
+before close, log a SIMULATED $50 position. Track it to resolution and
 update a local HTML dashboard.
 
-Architecture (why WS + gated REST confirmation, not either alone):
-- Pure REST polling (original version) hit two real bugs: a 300s
-  Cloudflare edge cache on data-api.polymarket.com/trades (served the
-  same snapshot for a whole candle), then after busting that, a
-  long-lived httpx connection that kept serving stale bodies despite
-  cf-cache-status: MISS.
-- Pure WS book data (first WS version) is FASTER but not the same
-  signal as the backtest: Polymarket's WS "market" channel only emits
-  "book" and "price_change" events — no trade event exists on it. A
-  live loss showed the book ask hit 0.84 with NO real trade anywhere
-  near that price — the confirming trade only appeared 117s later, at
-  0.01-0.06. A resting ask is not a transaction.
-- Fix: WS book crossing the threshold is just a cheap trigger. Before
-  actually entering, confirm_recent_trade() does ONE gated REST check
-  (fresh one-off client, not pooled — sidesteps the same
-  stale-connection bug class) for a genuine trade print at/above
-  threshold within the last 20s. This matches the backtest's actual
-  signal while keeping REST usage rare (gated by WS, not continuous).
+Architecture (why WS-only now, and why not simpler):
+- Book/ask alone is not the backtest's signal: Polymarket's WS "market"
+  channel's "book"/"price_change" events reflect resting quotes, which
+  cost nothing to leave stale — a real loss showed the book ask hit 0.84
+  with no real trade anywhere near that price, the confirming trade only
+  appeared 117s later at 0.01-0.06. A resting ask is not a transaction;
+  the entry signal has to be a genuine trade print.
+- REST polling (data-api.polymarket.com/trades) was the first fix for
+  that, and worked for a while, but accumulated a long bug history (see
+  git log): a 300s Cloudflare edge cache, a long-lived httpx connection
+  serving stale bodies despite cf-cache-status: MISS, a limit=30/limit=300
+  response-size truncation that silently excluded real qualifying trades
+  from busy candles. Each was fixed in turn — then, 2026-08-12, the
+  signal became reliably ABSENT from REST during the live 30-120s window
+  on 3+ independently-observed markets (full 90s active polling, no
+  candidate found) while always present when re-checked minutes later.
+  Response latency (~150ms) and Cloudflare caching (MISS throughout) were
+  directly ruled out as causes; the exact mechanism (probably some
+  REST-side indexing delay) was never isolated.
+- Fix: turns out the earlier claim that "no trade event exists on the WS
+  channel" was wrong — it does: last_trade_price, a genuine executed
+  trade (has size + transaction_hash, real capital risked), pushed by
+  the matching engine as it happens. A direct capture showed 138 such
+  events in 20s for one market, far more real-time activity than REST
+  ever surfaced for the same window. PriceFeed now buffers these
+  per-market (see PriceFeed.trades) and confirm_recent_trade_ws reads
+  that local buffer directly — no REST call, no polling, no possible
+  indexing-delay gap, and the WS connection was already open for book
+  data anyway.
 - Market discovery (gamma-api /markets) and resolution checks
-  (clob.polymarket.com /markets/{id}, cf-cache-status: DYNAMIC) never
-  showed caching issues and are unchanged.
+  (clob.polymarket.com /markets/{id}, cf-cache-status: DYNAMIC) still use
+  REST — no caching issues ever observed there, and both are naturally
+  low-frequency (discovery every few seconds, resolution only while a
+  position is open).
 - WS pattern modeled on /Users/pat/Desktop/python_proj/polymarket_bot's
   bot1_btc.py / bot2_btc/price_feed.py.
 
@@ -71,8 +84,9 @@ FEE_RATE = 0.07  # crypto taker fee rate, exponent 1
 
 DISCOVERY_INTERVAL_S = 3.0  # how often to poll Gamma for newly-entering markets
 RESOLUTION_INTERVAL_S = 3.0  # how often to poll CLOB for resolution of an open position
-ENTRY_CHECK_INTERVAL_S = 1.0  # how often to check for a confirming trade — a REST call
-# per in-window token (see _check_entry), not a free in-memory read.
+ENTRY_CHECK_INTERVAL_S = 1.0  # how often _check_entry scans tracked tokens
+# against PriceFeed's local WS trade buffer — an in-memory read now, not a
+# network call, but kept at 1s to match the loop's other cadences.
 WS_STALE_SECONDS = 5.0  # ignore WS prices older than this — fall back to "no signal"
 TRACK_TTL_S = 60  # unsubscribe/stop tracking this long after a market's end_ts.
 # WS is only needed for the entry signal (30-120s pre-close); resolution
@@ -249,6 +263,23 @@ class PriceFeed:
         self._resub = asyncio.Event()
         self._force_reconnect = asyncio.Event()
         self.connected = False
+        # asset_id -> (condition_id, outcome), popolato da register_token.
+        # Serve per indicizzare i trade ricevuti via WS per mercato (entrambi
+        # i lati insieme), non per singolo token — vedi self.trades sotto.
+        self.token_meta: dict[str, tuple[str, str]] = {}
+        # condition_id -> lista di trade REALI ricevuti via WS (event_type
+        # "last_trade_price"), entrambi i lati mescolati e ordinati per
+        # arrivo. Sostituisce il polling REST su data-api/trades — vedi
+        # confirm_recent_trade_ws più sotto per il motivo (2026-08-12: il
+        # REST mostrava un segnale quasi sempre assente in tempo reale ma
+        # sempre presente a posteriori, per motivi mai isolati con
+        # certezza nonostante ore di test; il canale WS last_trade_price è
+        # uno stream diretto, non polling, e nei test manuali mostrava
+        # centinaia di eventi/minuto con latenza sub-secondo).
+        self.trades: dict[str, list[dict[str, Any]]] = {}
+
+    def register_token(self, token_id: str, condition_id: str, outcome: str) -> None:
+        self.token_meta[token_id] = (condition_id, outcome)
 
     def subscribe(self, token_ids: list[str]) -> None:
         new = set(token_ids) - self.subscribed
@@ -269,6 +300,9 @@ class PriceFeed:
             self.subscribed -= drop
             for tid in drop:
                 self.prices.pop(tid, None)
+                meta = self.token_meta.pop(tid, None)
+                if meta:
+                    self.trades.pop(meta[0], None)
             self._force_reconnect.set()
 
     def best_ask(self, token_id: str) -> tuple[float | None, bool]:
@@ -332,6 +366,10 @@ class PriceFeed:
         if not asset_id:
             return
 
+        if item.get("event_type") == "last_trade_price":
+            self._process_trade(asset_id, item)
+            return
+
         ask: float | None = None
         if "best_ask" in item:
             with contextlib.suppress(TypeError, ValueError):
@@ -351,6 +389,27 @@ class PriceFeed:
             entry["ask"] = ask
             entry["ts"] = time.time()
             self.prices[asset_id] = entry
+
+    def _process_trade(self, asset_id: str, item: dict[str, Any]) -> None:
+        """last_trade_price: a genuine executed trade pushed by the
+        matching engine, not a resting quote — has size and
+        transaction_hash, real capital risked. WS timestamp is
+        milliseconds (13-digit string), unlike the REST /trades
+        endpoint's seconds — divide by 1000 to stay consistent with
+        end_ts/window_start_ts used everywhere else."""
+        meta = self.token_meta.get(asset_id)
+        if meta is None:
+            return
+        condition_id, outcome = meta
+        try:
+            price = float(item["price"])
+            size = float(item.get("size", 0.0))
+            ts_ms = float(item["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            return
+        self.trades.setdefault(condition_id, []).append(
+            {"outcome": outcome, "price": price, "size": size, "timestamp": ts_ms / 1000.0}
+        )
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────
@@ -465,6 +524,7 @@ async def _discover(feed: PriceFeed, tracked: dict[str, TrackedToken]) -> None:
                     outcome=str(outcome),
                     end_ts=end_ts,
                 )
+                feed.register_token(tid, condition_id, str(outcome))
                 new_token_ids.append(tid)
 
     if new_token_ids:
@@ -535,88 +595,48 @@ MAX_PRE_ENTRY_ACTIVITY = 80
 # dice gia >=0.80 — vedi analisi 2026-08-10.
 
 
-async def confirm_recent_trade(
-    condition_id: str, side: str, window_start_ts: float
+def confirm_recent_trade_ws(
+    feed: PriceFeed, condition_id: str, side: str, window_start_ts: float
 ) -> tuple[dict[str, Any], int] | None:
-    """The backtest's signal is the FIRST trade crossing the threshold
-    within the 30-120s-before-close window — not "any recent trade", not
-    "the most recent trade". Earlier versions used a rolling N-second
-    lookback and took the most-recent qualifying trade; verified against
-    two live losses (2026-08-07) that this does NOT reproduce a stale/lagged
-    signal — in both cases the first in-window trade was already >=0.80 the
-    instant the window opened, so a rolling lookback and a from-window-start
-    scan pick the same trade. The real reason to fix it: a rolling lookback
-    can pick a LATER trade than the true first crossing (e.g. one still in
-    flight mid-crash), which is a different price than the backtest ever
-    measured. Taking the earliest in-window trade matches the backtest
-    exactly and bounds latency to the poll interval instead of the lookback
-    window.
+    """Same signal the backtest measures — the FIRST real trade crossing
+    the threshold within the 30-120s window — but read from PriceFeed's
+    local buffer of WS last_trade_price events instead of polling REST.
 
-    limit=300, not a small number: a market near resolution can print
-    30+ trades in a couple of seconds (repeatedly observed all
-    session). With a small limit, a real qualifying trade from even 10s
-    earlier gets pushed out of the "recent" window by that burst before
-    we ever see it — confirmed directly (limit=30 missed a known-good
-    trade that limit=300 caught, same market, same query).
+    Replaces the original REST-based confirm_recent_trade (data-api.polymarket.com
+    /trades) on 2026-08-12: found live, repeatedly, that a signal present
+    in >=0.80 trades was reliably absent from REST during the live 30-120s
+    window (confirmed via a standalone script hitting the exact same
+    endpoint) yet always present when re-checked minutes later, on 3+
+    independent markets with full 90s-window observation. Timing tests
+    ruled out response latency (REST answered in ~150ms either way,
+    limit=300 vs 2000) and Cloudflare caching (cf-cache-status was MISS
+    throughout) as causes — the exact mechanism was never isolated, but a
+    direct WS capture showed 138 last_trade_price events in 20s for one
+    market, an order of magnitude more real-time activity than REST ever
+    showed for the same window. last_trade_price is a genuine executed
+    trade (has size + transaction_hash), not a resting quote — same kind
+    of signal as before, delivered by push instead of poll.
 
-    Deliberately uses a fresh one-off client, not a shared/pooled one:
-    the same class of stale-connection bug hit both the old REST-polling
-    version (long-lived httpx client) and the WS feed (long-lived
-    subscription) — a fresh connection per call sidesteps it.
-
-    limit=2000, not 300: found live (2026-08-11) that limit=300 truncates
-    exactly like the old limit=30 bug it replaced — a market with 350+
-    trades before the confirming one returns only the 300 MOST RECENT,
-    which can exclude the true earliest qualifying trade entirely (direct
-    repro: limit=300 found no candidate at all for a market where
-    limit=2000 found one 55s earlier) and silently undercounts
-    n_trades_pre_entry for the activity filter below (it can only count
-    what's in this same response). Backtest scripts already used
-    limit=2000 for exactly this reason; this call had drifted out of sync
-    with them.
-
-    Catches Exception broadly, not just httpx.HTTPError: a non-JSON 200
-    response (e.g. a transient WAF/rate-limit page) would raise
-    json.JSONDecodeError from r.json(), which does NOT subclass
-    httpx.HTTPError and would otherwise escape uncaught and kill the
-    whole main loop silently for a single bad poll."""
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{DATA_API}/trades",
-                params={"market": condition_id, "limit": 2000, "_": int(time.time() * 1000)},
-                timeout=10.0,
-            )
-            r.raise_for_status()
-            trades = r.json()
-    except Exception as exc:
-        print(
-            f"[{datetime.now(UTC):%H:%M:%S}] confirm_recent_trade ECCEZIONE ({type(exc).__name__}) "
-            f"({condition_id[:12]}.. {side}): {exc}",
-            flush=True,
-        )
-        return None
-
+    No longer async / no network call here: PriceFeed.run() already
+    appends every last_trade_price event to self.trades as it arrives on
+    the open WS connection; this just reads that local list."""
+    trades = feed.trades.get(condition_id, [])
     candidates = [
         t
         for t in trades
-        if t.get("outcome") == side
-        and float(t.get("price", 0)) >= ENTRY_THRESHOLD
-        and float(t.get("timestamp", 0)) >= window_start_ts
+        if t["outcome"] == side and t["price"] >= ENTRY_THRESHOLD and t["timestamp"] >= window_start_ts
     ]
     if not candidates:
         return None
     confirming_trade = min(candidates, key=lambda t: t["timestamp"])
     n_trades_pre_entry = sum(
-        1
-        for t in trades
-        if window_start_ts <= float(t.get("timestamp", 0)) <= confirming_trade["timestamp"]
+        1 for t in trades if window_start_ts <= t["timestamp"] <= confirming_trade["timestamp"]
     )
     return confirming_trade, n_trades_pre_entry
 
 
 async def _check_entry(
-    state: PaperState, tracked: dict[str, TrackedToken], entered_conditions: set[str]
+    state: PaperState, tracked: dict[str, TrackedToken], entered_conditions: set[str], feed: PriceFeed
 ) -> bool:
     """Returns True if a new position was opened. Multiple positions can be
     open at once now — markets are independent 5-min windows, and gating
@@ -636,18 +656,15 @@ async def _check_entry(
         if not (MIN_SECONDS_LEFT <= seconds_left <= MAX_SECONDS_LEFT):
             continue
 
-        # Check the real trade tape directly for every in-window token —
-        # NOT gated on the WS book first. Gating on "WS ask >= threshold"
-        # before checking for a confirming trade sounds reasonable but
-        # isn't: a real qualifying trade and the CURRENT best ask are not
-        # the same thing (the book can revert/differ moments after a
-        # print), so requiring both simultaneously silently drops valid
-        # backtest-matching signals. Confirmed live: 5398 WS-side
-        # crossings, 0 confirmations, over 5.5h — far below the ~22
-        # expected from the backtest rate. This matches the backtest's
-        # actual signal (a real trade in the window) directly instead.
+        # Real trade confirmation via WS last_trade_price (see
+        # confirm_recent_trade_ws docstring — replaced REST polling on
+        # 2026-08-12) — NOT gated on the WS book/ask first. A real
+        # qualifying trade and the CURRENT best ask are not the same
+        # thing (the book can revert/differ moments after a print), so
+        # requiring both simultaneously would silently drop valid
+        # backtest-matching signals.
         window_start_ts = t.end_ts - MAX_SECONDS_LEFT
-        result = await confirm_recent_trade(t.condition_id, t.outcome, window_start_ts)
+        result = confirm_recent_trade_ws(feed, t.condition_id, t.outcome, window_start_ts)
         if result is None:
             continue
         confirming_trade, n_trades_pre_entry = result
@@ -715,7 +732,7 @@ async def main() -> None:
                 await _check_resolution(state)
                 last_resolution = now
 
-            entered = await _check_entry(state, tracked, entered_conditions)
+            entered = await _check_entry(state, tracked, entered_conditions, feed)
 
             if entered or now - last_dashboard >= 5.0:
                 render_dashboard(state, feed.connected)
