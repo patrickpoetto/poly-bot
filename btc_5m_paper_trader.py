@@ -117,6 +117,7 @@ class OpenPosition:
     stake: float = STAKE_USD
     confirm_size: float = 0.0
     n_trades_pre_entry: int = 0
+    balance: float = 1.0
 
 
 @dataclass
@@ -131,6 +132,7 @@ class ClosedTrade:
     closed_at: str
     confirm_size: float = 0.0
     n_trades_pre_entry: int = 0
+    balance: float = 1.0
 
 
 @dataclass
@@ -424,7 +426,7 @@ def render_dashboard(state: PaperState, ws_connected: bool) -> None:
             f"<tr class='{css_class}'>"
             f"<td>{t.closed_at[11:19]}</td><td>{t.slug}</td><td>{t.side}</td>"
             f"<td>{t.entry_price:.3f}</td><td>{t.seconds_left_at_entry}s</td>"
-            f"<td>{t.n_trades_pre_entry}</td>"
+            f"<td>{t.n_trades_pre_entry}</td><td>{t.balance:.2f}</td>"
             f"<td>{esito}</td><td>{t.pnl:+.2f}</td></tr>"
         )
     rows = "".join(row_parts)
@@ -468,7 +470,7 @@ tr.loss td:last-child {{ color: #c0392b; font-weight: 600; }}
 </div>
 {open_html}
 <table>
-<tr><th>Ora</th><th>Mercato</th><th>Lato</th><th>Prezzo</th><th>Secondi rimasti</th><th>N pre-entry</th><th>Esito</th><th>P&amp;L</th></tr>
+<tr><th>Ora</th><th>Mercato</th><th>Lato</th><th>Prezzo</th><th>Secondi rimasti</th><th>N pre-entry</th><th>Balance</th><th>Esito</th><th>P&amp;L</th></tr>
 {rows}
 </table>
 </body></html>"""
@@ -567,6 +569,7 @@ async def _check_resolution(state: PaperState) -> None:
             closed_at=now.isoformat(),
             confirm_size=p.confirm_size,
             n_trades_pre_entry=p.n_trades_pre_entry,
+            balance=p.balance,
         )
         state.trades.append(trade)
         append_trade_log(trade)
@@ -594,10 +597,26 @@ MAX_PRE_ENTRY_ACTIVITY = 80
 # genuinamente conteso, non deciso) anche quando il prezzo del token
 # dice gia >=0.80 — vedi analisi 2026-08-10.
 
+MIN_BALANCE = 0.90
+# Quota di volume (size, non conteggio trade) sul lato che stiamo per
+# comprare, rispetto al volume totale di ENTRAMBI i lati nella finestra
+# pre-ingresso. Idea di Pat (2026-08-13): il rapporto semplice (balance)
+# distingue persi/vinti molto piu' debolmente del VOLUME ASSOLUTO
+# sull'altro lato (persi: mediana 740.7, vinti: mediana 191.1 — quasi 4x),
+# ma bucketizzato per balance il segnale e' comunque forte e piu' semplice
+# da usare come singola soglia. Validato su backtest 2050 mercati storici:
+# EV/trade -$0.377 (nessun filtro) -> +$0.933 (balance>=0.90, 418 casi,
+# 7.2% perse vs 13.5% base, Wilson 95% CI [5.1%,10.1%] esclude nettamente
+# il tasso base). Correlazione con MAX_PRE_ENTRY_ACTIVITY quasi nulla
+# (-0.09) — non ridondante, ma il filtro balance da solo domina quasi
+# completamente quello attivita (416 vs 418 casi in overlap), quindi
+# applicato PRIMA: se balance troppo basso, scarta senza nemmeno
+# calcolare n_trades_pre_entry.
+
 
 def confirm_recent_trade_ws(
     feed: PriceFeed, condition_id: str, side: str, window_start_ts: float
-) -> tuple[dict[str, Any], int] | None:
+) -> tuple[dict[str, Any], int, float] | None:
     """Same signal the backtest measures — the FIRST real trade crossing
     the threshold within the 30-120s window — but read from PriceFeed's
     local buffer of WS last_trade_price events instead of polling REST.
@@ -629,10 +648,14 @@ def confirm_recent_trade_ws(
     if not candidates:
         return None
     confirming_trade = min(candidates, key=lambda t: t["timestamp"])
-    n_trades_pre_entry = sum(
-        1 for t in trades if window_start_ts <= t["timestamp"] <= confirming_trade["timestamp"]
-    )
-    return confirming_trade, n_trades_pre_entry
+    pre_entry_trades = [
+        t for t in trades if window_start_ts <= t["timestamp"] <= confirming_trade["timestamp"]
+    ]
+    n_trades_pre_entry = len(pre_entry_trades)
+    vol_side = sum(t["size"] for t in pre_entry_trades if t["outcome"] == side)
+    vol_total = sum(t["size"] for t in pre_entry_trades)
+    balance = vol_side / vol_total if vol_total > 0 else 1.0
+    return confirming_trade, n_trades_pre_entry, balance
 
 
 async def _check_entry(
@@ -667,7 +690,15 @@ async def _check_entry(
         result = confirm_recent_trade_ws(feed, t.condition_id, t.outcome, window_start_ts)
         if result is None:
             continue
-        confirming_trade, n_trades_pre_entry = result
+        confirming_trade, n_trades_pre_entry, balance = result
+        if balance < MIN_BALANCE:
+            print(
+                f"[{now:%H:%M:%S}] SCARTATO {t.slug} {t.outcome} — balance troppo basso "
+                f"({balance:.3f} < {MIN_BALANCE})",
+                flush=True,
+            )
+            entered_conditions.add(t.condition_id)
+            continue
         if n_trades_pre_entry > MAX_PRE_ENTRY_ACTIVITY:
             print(
                 f"[{now:%H:%M:%S}] SCARTATO {t.slug} {t.outcome} — troppa attivita pre-ingresso "
@@ -689,13 +720,14 @@ async def _check_entry(
                 seconds_left_at_entry=seconds_left,
                 confirm_size=confirm_size,
                 n_trades_pre_entry=n_trades_pre_entry,
+                balance=balance,
             )
         )
         entered_conditions.add(t.condition_id)
         print(
             f"[{now:%H:%M:%S}] ENTRATA {t.slug} {t.outcome} @ {entry_price:.3f} "
             f"(confermata da trade reale size={confirm_size:.1f}, n_pre_entry={n_trades_pre_entry}, "
-            f"{seconds_left}s dalla chiusura) — ${STAKE_USD} paper",
+            f"balance={balance:.3f}, {seconds_left}s dalla chiusura) — ${STAKE_USD} paper",
             flush=True,
         )
         save_state(state)
