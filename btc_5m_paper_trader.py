@@ -80,6 +80,7 @@ STAKE_USD = 50.0
 ENTRY_THRESHOLD = 0.80
 MIN_SECONDS_LEFT = 30
 MAX_SECONDS_LEFT = 120
+MARKET_DURATION_S = 300  # btc-updown-5m: durata fissa di ogni mercato
 FEE_RATE = 0.07  # crypto taker fee rate, exponent 1
 
 DISCOVERY_INTERVAL_S = 3.0  # how often to poll Gamma for newly-entering markets
@@ -200,10 +201,22 @@ async def fetch_active_btc5m() -> list[dict[str, Any]]:
     last 6 closed markets, while the live process — running for over an
     hour on the same shared client — discovered nothing that whole time.
     Same connection-staleness bug class already fixed once for
-    confirm_recent_trade's data-api calls; had never been applied here."""
+    confirm_recent_trade's data-api calls; had never been applied here.
+
+    horizon = now + MARKET_DURATION_S, not now + MAX_SECONDS_LEFT + 60:
+    widens registration lead time (tokens get registered for WS trade
+    tracking, via _discover -> feed.register_token, at/near market open
+    instead of ~120s in). Originally made 2026-08-13 on the theory that
+    this alone explained a 92.1%-degenerate n_trades_pre_entry (see
+    MIN_BALANCE below) — re-derived the timing on 2026-08-15 and that
+    theory doesn't hold up (registration at ~120s old was already ~60s
+    ahead of window_start_ts=180s old, comfortable margin). The real
+    cause turned out to be WS message loss under current trade volume
+    (see refine_pre_entry_via_rest). Left in anyway since it's a strict
+    improvement with no downside, not because it's confirmed to matter."""
     async with httpx.AsyncClient() as client:
         now = datetime.now(UTC)
-        horizon = now.timestamp() + MAX_SECONDS_LEFT + 60
+        horizon = now.timestamp() + MARKET_DURATION_S + 60
         now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         horizon_iso = datetime.fromtimestamp(horizon, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         resp = await client.get(
@@ -658,6 +671,49 @@ def confirm_recent_trade_ws(
     return confirming_trade, n_trades_pre_entry, balance
 
 
+async def refine_pre_entry_via_rest(
+    condition_id: str, side: str, window_start_ts: float, confirming_ts: float
+) -> tuple[int, float] | None:
+    """WS last_trade_price only captures a fraction of real trades under
+    current volume — confirmed live 2026-08-16: listened directly on one
+    market for 187s, WS caught 232 real trades vs 741 shown by REST for the
+    exact same window (matched by size, a near-unique fingerprint per trade,
+    since WS also truncates price to 2 decimals while REST keeps full
+    precision — 40.8% true capture rate). n_trades_pre_entry/balance
+    computed from the WS buffer were reading mostly-degenerate as a result
+    (92.1% of live entries had n_trades_pre_entry==1, vs 15.3% in the
+    historical population MIN_BALANCE was validated on) — not because
+    markets are quiet (a fresh REST sample the same day showed a *median*
+    of 66 pre-entry trades, far busier than the historical baseline), but
+    because the buffer was missing most of the tape.
+
+    WS still does the fast, cheap job of detecting THAT a trade crossed
+    ENTRY_THRESHOLD (only needs to see one — confirm_recent_trade_ws stays
+    the trigger). This makes ONE targeted REST call, only after a WS
+    signal fires, to recompute n_trades_pre_entry/balance from the
+    complete tape before the filters run — not the continuous low-latency
+    polling that caused the original REST-invisibility issue on
+    2026-08-12 (a single call per rare signal, not a tight real-time
+    detection loop)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{DATA_API}/trades", params={"market": condition_id, "limit": 2000}, timeout=8.0
+            )
+            r.raise_for_status()
+            trades = r.json()
+    except httpx.HTTPError:
+        return None
+    if not isinstance(trades, list):
+        return None
+    pre_entry_trades = [t for t in trades if window_start_ts <= float(t["timestamp"]) <= confirming_ts]
+    n_trades_pre_entry = len(pre_entry_trades)
+    vol_side = sum(float(t["size"]) for t in pre_entry_trades if t.get("outcome") == side)
+    vol_total = sum(float(t["size"]) for t in pre_entry_trades)
+    balance = vol_side / vol_total if vol_total > 0 else 1.0
+    return n_trades_pre_entry, balance
+
+
 async def _check_entry(
     state: PaperState, tracked: dict[str, TrackedToken], entered_conditions: set[str], feed: PriceFeed
 ) -> bool:
@@ -690,7 +746,22 @@ async def _check_entry(
         result = confirm_recent_trade_ws(feed, t.condition_id, t.outcome, window_start_ts)
         if result is None:
             continue
-        confirming_trade, n_trades_pre_entry, balance = result
+        confirming_trade, _ws_n_trades_pre_entry, _ws_balance = result
+
+        # Rifinisci balance/n_trades_pre_entry via REST (vedi
+        # refine_pre_entry_via_rest — il buffer WS perde la maggioranza dei
+        # trade reali sotto il volume attuale, 2026-08-16). Una sola
+        # chiamata mirata, non polling continuo.
+        refined = await refine_pre_entry_via_rest(
+            t.condition_id, t.outcome, window_start_ts, confirming_trade["timestamp"]
+        )
+        if refined is None:
+            print(
+                f"[{now:%H:%M:%S}] SALTATO {t.slug} {t.outcome} — REST non disponibile per rifinire balance, ritento",
+                flush=True,
+            )
+            continue
+        n_trades_pre_entry, balance = refined
         if balance < MIN_BALANCE:
             print(
                 f"[{now:%H:%M:%S}] SCARTATO {t.slug} {t.outcome} — balance troppo basso "
