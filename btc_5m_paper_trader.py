@@ -43,16 +43,6 @@ Architecture (why WS-only now, and why not simpler):
   position is open).
 - WS pattern modeled on /Users/pat/Desktop/python_proj/polymarket_bot's
   bot1_btc.py / bot2_btc/price_feed.py.
-- 2026-08-21: WS is no longer trusted for n_trades_pre_entry/balance
-  either. It only captures a fraction of real trades under current
-  volume (confirmed live: 232 WS-seen vs 741 REST-shown for the same
-  187s window on one market, 40.8% true capture). WS still triggers
-  entry detection (confirm_recent_trade_ws — only needs to see ONE
-  qualifying trade), but once it fires, refine_pre_entry_via_rest makes
-  a single targeted REST call to recompute n_trades_pre_entry/balance
-  from the complete tape before MIN_PRE_ENTRY_ACTIVITY/MIN_BALANCE run.
-  One call per rare signal, not the continuous polling that caused the
-  original REST-invisibility issue on 2026-08-12.
 
 Strategy provenance: btc_5m_multithreshold_scrape.py backtest, 166 days,
 17600 entries at threshold 0.80 in the 30-120s window, 24 losses (99.86%
@@ -90,7 +80,6 @@ STAKE_USD = 50.0
 ENTRY_THRESHOLD = 0.80
 MIN_SECONDS_LEFT = 30
 MAX_SECONDS_LEFT = 120
-MARKET_DURATION_S = 300  # btc-updown-5m: durata fissa di ogni mercato
 FEE_RATE = 0.07  # crypto taker fee rate, exponent 1
 
 DISCOVERY_INTERVAL_S = 3.0  # how often to poll Gamma for newly-entering markets
@@ -211,22 +200,10 @@ async def fetch_active_btc5m() -> list[dict[str, Any]]:
     last 6 closed markets, while the live process — running for over an
     hour on the same shared client — discovered nothing that whole time.
     Same connection-staleness bug class already fixed once for
-    confirm_recent_trade's data-api calls; had never been applied here.
-
-    horizon = now + MARKET_DURATION_S, not now + MAX_SECONDS_LEFT + 60:
-    widens registration lead time (tokens get registered for WS trade
-    tracking, via _discover -> feed.register_token, at/near market open
-    instead of ~120s in). Originally made 2026-08-13 on the theory that
-    this alone explained a 92.1%-degenerate n_trades_pre_entry (see
-    MIN_BALANCE below) — re-derived the timing on 2026-08-15 and that
-    theory doesn't hold up (registration at ~120s old was already ~60s
-    ahead of window_start_ts=180s old, comfortable margin). The real
-    cause turned out to be WS message loss under current trade volume
-    (see refine_pre_entry_via_rest). Left in anyway since it's a strict
-    improvement with no downside, not because it's confirmed to matter."""
+    confirm_recent_trade's data-api calls; had never been applied here."""
     async with httpx.AsyncClient() as client:
         now = datetime.now(UTC)
-        horizon = now.timestamp() + MARKET_DURATION_S + 60
+        horizon = now.timestamp() + MAX_SECONDS_LEFT + 60
         now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         horizon_iso = datetime.fromtimestamp(horizon, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         resp = await client.get(
@@ -608,48 +585,38 @@ async def _check_resolution(state: PaperState) -> None:
         save_state(state)
 
 
-MIN_PRE_ENTRY_ACTIVITY = 3
-# Trade totali REALI (via REST, non WS — vedi refine_pre_entry_via_rest)
-# tra apertura finestra e trade di conferma. Aggiunto 2026-08-21 dopo aver
-# scoperto che n_trades_pre_entry==0/1 (nessuna vera attivita a supporto
-# del segnale, un print isolato) era il vero problema, non il balance:
-# ricalcolando retroattivamente TUTTI i 1209 trade paper live reali
-# (8.3 giorni) coi dati REST veri, il gruppo n_pre_real in {0,1} aveva
-# EV/trade -$6.86 / -$3.08 (disastroso) anche quando balance leggeva 1.0
-# (banale con cosi' pochi trade visti). Filtrando n_pre_real>=3 E
-# balance_real>=0.20 (vedi MIN_BALANCE) il PnL totale sullo stesso
-# campione passa da -$196.15 a +$718.74, tenendo il 67% del volume.
-
 MAX_PRE_ENTRY_ACTIVITY = 80
-# Tetto MASSIMO, non piu' il filtro principale da quando n_trades_pre_entry
-# e' ricalcolato via REST invece che dal buffer WS (2026-08-21): sui 1209
-# trade live ricalcolati, solo 14 superavano 80, e sempre in combinazione
-# con balance gia' basso (quel sottogruppo: EV/trade -$9.11). Resta come
-# rete di sicurezza contro casi patologici, non vincola quasi mai da solo.
-# Prima di questa data era il filtro primario, validato su backtest 2050
-# mercati storici e 153 trade paper (allora n_trades_pre_entry veniva dal
-# buffer WS, non ancora noto per essere inaffidabile) — vedi git log per
-# quella storia se serve.
+# Trade totali (entrambi i lati) tra apertura finestra e trade di conferma.
+# Validato due volte, indipendentemente: backtest 2050 mercati storici
+# (EV/trade migliore proprio a soglia 80, tra le poche configurazioni
+# nettamente positive) e 153 trade paper live reali (perse concentrate
+# in modo nettamente bimodale: 8/19 con attivita 2-22, 11/19 con
+# attivita 91-411 — filtrando a <=80 il cumulato passa da -$174.53 a
+# +$80.47 scartando solo 24 trade). Troppa attivita prima del nostro
+# ingresso correla con differenziale BTC reale piu piccolo (mercato
+# genuinamente conteso, non deciso) anche quando il prezzo del token
+# dice gia >=0.80 — vedi analisi 2026-08-10.
 
-MIN_BALANCE = 0.20
+MIN_BALANCE = 0.90
 # Quota di volume (size, non conteggio trade) sul lato che stiamo per
 # comprare, rispetto al volume totale di ENTRAMBI i lati nella finestra
-# pre-ingresso — ora calcolata via REST (refine_pre_entry_via_rest), non
-# dal buffer WS. Abbassata da 0.90 a 0.20 il 2026-08-21: il backtest
-# storico del 2026-08-13 (balance>=0.90, +$0.933/trade) era calibrato su
-# dati puliti d'epoca; ricalcolando lo stesso filtro sugli stessi 1209
-# trade live reali di oggi, balance>=0.90 (combinato con n_pre_real>=3)
-# dava un EV/trade peggiore (+$0.218, 25% del campione) di soglie piu'
-# larghe — il vero discriminante ora e' MIN_PRE_ENTRY_ACTIVITY (avere
-# vera attivita' a supporto), non un rapporto di bilanciamento stretto.
-# balance<0.20 resta escluso perche' quella fascia specifica (mercato
-# quasi equamente conteso) era l'unica col EV vicino a zero (+$0.079)
-# nello sweep per bucket.
+# pre-ingresso. Idea di Pat (2026-08-13): il rapporto semplice (balance)
+# distingue persi/vinti molto piu' debolmente del VOLUME ASSOLUTO
+# sull'altro lato (persi: mediana 740.7, vinti: mediana 191.1 — quasi 4x),
+# ma bucketizzato per balance il segnale e' comunque forte e piu' semplice
+# da usare come singola soglia. Validato su backtest 2050 mercati storici:
+# EV/trade -$0.377 (nessun filtro) -> +$0.933 (balance>=0.90, 418 casi,
+# 7.2% perse vs 13.5% base, Wilson 95% CI [5.1%,10.1%] esclude nettamente
+# il tasso base). Correlazione con MAX_PRE_ENTRY_ACTIVITY quasi nulla
+# (-0.09) — non ridondante, ma il filtro balance da solo domina quasi
+# completamente quello attivita (416 vs 418 casi in overlap), quindi
+# applicato PRIMA: se balance troppo basso, scarta senza nemmeno
+# calcolare n_trades_pre_entry.
 
 
 def confirm_recent_trade_ws(
     feed: PriceFeed, condition_id: str, side: str, window_start_ts: float
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], int, float] | None:
     """Same signal the backtest measures — the FIRST real trade crossing
     the threshold within the 30-120s window — but read from PriceFeed's
     local buffer of WS last_trade_price events instead of polling REST.
@@ -671,13 +638,7 @@ def confirm_recent_trade_ws(
 
     No longer async / no network call here: PriceFeed.run() already
     appends every last_trade_price event to self.trades as it arrives on
-    the open WS connection; this just reads that local list.
-
-    Only returns the confirming trade now (2026-08-21) — used to also
-    compute n_trades_pre_entry/balance from this same WS buffer, but that
-    buffer only captures a fraction of real trades under current volume
-    (see refine_pre_entry_via_rest), so those numbers were unreliable and
-    are now recomputed from REST instead, right after this fires."""
+    the open WS connection; this just reads that local list."""
     trades = feed.trades.get(condition_id, [])
     candidates = [
         t
@@ -686,50 +647,15 @@ def confirm_recent_trade_ws(
     ]
     if not candidates:
         return None
-    return min(candidates, key=lambda t: t["timestamp"])
-
-
-async def refine_pre_entry_via_rest(
-    condition_id: str, side: str, window_start_ts: float, confirming_ts: float
-) -> tuple[int, float] | None:
-    """WS last_trade_price only captures a fraction of real trades under
-    current volume — confirmed live 2026-08-16: listened directly on one
-    market for 187s, WS caught 232 real trades vs 741 shown by REST for the
-    exact same window (matched by size, a near-unique fingerprint per trade,
-    since WS also truncates price to 2 decimals while REST keeps full
-    precision — 40.8% true capture rate). n_trades_pre_entry/balance
-    computed from the WS buffer were reading mostly-degenerate as a result
-    (92.1% of live entries had n_trades_pre_entry==1, vs 15.3% in the
-    historical population MIN_BALANCE was validated on) — not because
-    markets are quiet (a fresh REST sample the same day showed a *median*
-    of 66 pre-entry trades, far busier than the historical baseline), but
-    because the buffer was missing most of the tape.
-
-    WS still does the fast, cheap job of detecting THAT a trade crossed
-    ENTRY_THRESHOLD (only needs to see one — confirm_recent_trade_ws stays
-    the trigger). This makes ONE targeted REST call, only after a WS
-    signal fires, to recompute n_trades_pre_entry/balance from the
-    complete tape before the filters run — not the continuous low-latency
-    polling that caused the original REST-invisibility issue on
-    2026-08-12 (a single call per rare signal, not a tight real-time
-    detection loop)."""
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{DATA_API}/trades", params={"market": condition_id, "limit": 2000}, timeout=8.0
-            )
-            r.raise_for_status()
-            trades = r.json()
-    except httpx.HTTPError:
-        return None
-    if not isinstance(trades, list):
-        return None
-    pre_entry_trades = [t for t in trades if window_start_ts <= float(t["timestamp"]) <= confirming_ts]
+    confirming_trade = min(candidates, key=lambda t: t["timestamp"])
+    pre_entry_trades = [
+        t for t in trades if window_start_ts <= t["timestamp"] <= confirming_trade["timestamp"]
+    ]
     n_trades_pre_entry = len(pre_entry_trades)
-    vol_side = sum(float(t["size"]) for t in pre_entry_trades if t.get("outcome") == side)
-    vol_total = sum(float(t["size"]) for t in pre_entry_trades)
+    vol_side = sum(t["size"] for t in pre_entry_trades if t["outcome"] == side)
+    vol_total = sum(t["size"] for t in pre_entry_trades)
     balance = vol_side / vol_total if vol_total > 0 else 1.0
-    return n_trades_pre_entry, balance
+    return confirming_trade, n_trades_pre_entry, balance
 
 
 async def _check_entry(
@@ -761,32 +687,10 @@ async def _check_entry(
         # requiring both simultaneously would silently drop valid
         # backtest-matching signals.
         window_start_ts = t.end_ts - MAX_SECONDS_LEFT
-        confirming_trade = confirm_recent_trade_ws(feed, t.condition_id, t.outcome, window_start_ts)
-        if confirming_trade is None:
+        result = confirm_recent_trade_ws(feed, t.condition_id, t.outcome, window_start_ts)
+        if result is None:
             continue
-
-        # Rifinisci balance/n_trades_pre_entry via REST (vedi
-        # refine_pre_entry_via_rest — il buffer WS perde la maggioranza dei
-        # trade reali sotto il volume attuale, 2026-08-16). Una sola
-        # chiamata mirata, non polling continuo.
-        refined = await refine_pre_entry_via_rest(
-            t.condition_id, t.outcome, window_start_ts, confirming_trade["timestamp"]
-        )
-        if refined is None:
-            print(
-                f"[{now:%H:%M:%S}] SALTATO {t.slug} {t.outcome} — REST non disponibile per rifinire balance, ritento",
-                flush=True,
-            )
-            continue
-        n_trades_pre_entry, balance = refined
-        if n_trades_pre_entry < MIN_PRE_ENTRY_ACTIVITY:
-            print(
-                f"[{now:%H:%M:%S}] SCARTATO {t.slug} {t.outcome} — troppo poca attivita pre-ingresso "
-                f"({n_trades_pre_entry} < {MIN_PRE_ENTRY_ACTIVITY}, segnale isolato non confermato)",
-                flush=True,
-            )
-            entered_conditions.add(t.condition_id)
-            continue
+        confirming_trade, n_trades_pre_entry, balance = result
         if balance < MIN_BALANCE:
             print(
                 f"[{now:%H:%M:%S}] SCARTATO {t.slug} {t.outcome} — balance troppo basso "
