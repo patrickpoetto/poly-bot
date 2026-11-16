@@ -44,6 +44,7 @@ from typing import Any
 import httpx
 import pandas as pd
 import websockets
+from websockets.asyncio.client import ClientConnection
 
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -147,12 +148,12 @@ class Recorder:
                 except TimeoutError:
                     continue
 
-    async def _send_sub(self, ws) -> None:
+    async def _send_sub(self, ws: ClientConnection) -> None:
         if self.subscribed:
             await ws.send(json.dumps({"assets_ids": list(self.subscribed), "type": "market"}))
             print(f"[WS] iscritto a {len(self.subscribed)} token", flush=True)
 
-    def _handle_raw(self, raw: str) -> None:
+    def _handle_raw(self, raw: str | bytes) -> None:
         recv_ts = time.time()
         try:
             data = json.loads(raw)
@@ -186,13 +187,16 @@ def flush(buffer: list[dict[str, Any]]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     part_path = out_dir / f"part-{int(time.time() * 1000)}.parquet"
     df.to_parquet(part_path, index=False, compression="zstd")
+    rel_path = part_path.relative_to(OUT_DIR.parent)
     print(
-        f"[{datetime.now(UTC):%H:%M:%S}] flush: {len(buffer)} righe -> {part_path.relative_to(OUT_DIR.parent)}",
+        f"[{datetime.now(UTC):%H:%M:%S}] flush: {len(buffer)} righe -> {rel_path}",
         flush=True,
     )
 
 
-async def discover(client: httpx.AsyncClient, recorder: Recorder, tracked: dict[str, TrackedToken]) -> None:
+async def discover(
+    client: httpx.AsyncClient, recorder: Recorder, tracked: dict[str, TrackedToken]
+) -> None:
     now_ts = int(datetime.now(UTC).timestamp())
     try:
         markets = await fetch_active_btc5m(client)
@@ -203,7 +207,8 @@ async def discover(client: httpx.AsyncClient, recorder: Recorder, tracked: dict[
     new_token_ids: list[str] = []
     for m in markets:
         try:
-            end_ts = int(datetime.fromisoformat(str(m["endDate"]).replace("Z", "+00:00")).timestamp())
+            end_dt = datetime.fromisoformat(str(m["endDate"]).replace("Z", "+00:00"))
+            end_ts = int(end_dt.timestamp())
         except (ValueError, TypeError, KeyError):
             continue
         condition_id = m.get("conditionId")
@@ -221,14 +226,21 @@ async def discover(client: httpx.AsyncClient, recorder: Recorder, tracked: dict[
             tid = str(tid)
             if tid not in tracked:
                 tracked[tid] = TrackedToken(
-                    token_id=tid, slug=m["slug"], condition_id=condition_id,
-                    outcome=str(outcome), end_ts=end_ts,
+                    token_id=tid,
+                    slug=m["slug"],
+                    condition_id=condition_id,
+                    outcome=str(outcome),
+                    end_ts=end_ts,
                 )
                 new_token_ids.append(tid)
 
     if new_token_ids:
         recorder.subscribe(new_token_ids)
-        print(f"[{datetime.now(UTC):%H:%M:%S}] +{len(new_token_ids)} nuovi token (totale tracciati: {len(tracked)})", flush=True)
+        print(
+            f"[{datetime.now(UTC):%H:%M:%S}] +{len(new_token_ids)} nuovi token "
+            f"(totale tracciati: {len(tracked)})",
+            flush=True,
+        )
 
     stale = [tid for tid, t in tracked.items() if now_ts - t.end_ts > TRACK_TTL_S]
     if stale:

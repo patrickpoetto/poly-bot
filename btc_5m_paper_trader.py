@@ -70,6 +70,7 @@ from typing import Any
 
 import httpx
 import websockets
+from websockets.asyncio.client import ClientConnection
 
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -348,12 +349,12 @@ class PriceFeed:
                 except TimeoutError:
                     continue
 
-    async def _send_sub(self, ws) -> None:
+    async def _send_sub(self, ws: ClientConnection) -> None:
         if self.subscribed:
             await ws.send(json.dumps({"assets_ids": list(self.subscribed), "type": "market"}))
             print(f"[WS] iscritto a {len(self.subscribed)} token", flush=True)
 
-    def _handle_raw(self, raw: str) -> None:
+    def _handle_raw(self, raw: str | bytes) -> None:
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -437,6 +438,7 @@ def render_dashboard(state: PaperState, ws_connected: bool) -> None:
     )
     pnl = state.cumulative_pnl
     pnl_color = "#2f8c77" if pnl >= 0 else "#c0392b"
+    win_rate = (state.wins / len(state.trades) * 100) if state.trades else 0.0
     ws_html = (
         "<span style='color:#2f8c77'>&#9679; WS connesso</span>"
         if ws_connected
@@ -452,7 +454,10 @@ h1 {{ font-size: 18px; color: #9AA0A6; }}
 .stat {{ background: #1c1c1c; padding: 12px 20px; border-radius: 8px; }}
 .stat .label {{ font-size: 12px; color: #9AA0A6; }}
 .stat .value {{ font-size: 24px; font-weight: 600; }}
-.open {{ background: #2a2a1c; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; color: #e0c860;}}
+.open {{
+  background: #2a2a1c; padding: 10px 16px; border-radius: 8px;
+  margin-bottom: 16px; color: #e0c860;
+}}
 table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
 th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid #333; }}
 tr.win td:last-child {{ color: #2f8c77; }}
@@ -461,16 +466,34 @@ tr.loss td:last-child {{ color: #c0392b; font-weight: 600; }}
 .warn {{ color: #e0c860; font-size: 12px; margin-bottom: 16px; }}
 </style></head><body>
 <h1>BTC 5m — PAPER TRADER (nessun ordine reale, nessun soldo vero)</h1>
-<div class="warn">Avviato: {state.started_at[:19]} UTC · aggiornamento auto ogni 5s · {ws_html}</div>
+<div class="warn">
+  Avviato: {state.started_at[:19]} UTC · aggiornamento auto ogni 5s · {ws_html}
+</div>
 <div class="stats">
-  <div class="stat"><div class="label">P&amp;L cumulato</div><div class="value" style="color:{pnl_color}">${pnl:+.2f}</div></div>
-  <div class="stat"><div class="label">Trade chiusi</div><div class="value">{len(state.trades)}</div></div>
-  <div class="stat"><div class="label">Vinti / Persi</div><div class="value">{state.wins} / {state.losses}</div></div>
-  <div class="stat"><div class="label">Win rate</div><div class="value">{(state.wins/len(state.trades)*100) if state.trades else 0:.2f}%</div></div>
+  <div class="stat">
+    <div class="label">P&amp;L cumulato</div>
+    <div class="value" style="color:{pnl_color}">${pnl:+.2f}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Trade chiusi</div>
+    <div class="value">{len(state.trades)}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Vinti / Persi</div>
+    <div class="value">{state.wins} / {state.losses}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Win rate</div>
+    <div class="value">{win_rate:.2f}%</div>
+  </div>
 </div>
 {open_html}
 <table>
-<tr><th>Ora</th><th>Mercato</th><th>Lato</th><th>Prezzo</th><th>Secondi rimasti</th><th>N pre-entry</th><th>Balance</th><th>Esito</th><th>P&amp;L</th></tr>
+<tr>
+  <th>Ora</th><th>Mercato</th><th>Lato</th><th>Prezzo</th>
+  <th>Secondi rimasti</th><th>N pre-entry</th><th>Balance</th>
+  <th>Esito</th><th>P&amp;L</th>
+</tr>
 {rows}
 </table>
 </body></html>"""
@@ -500,7 +523,8 @@ async def _discover(feed: PriceFeed, tracked: dict[str, TrackedToken]) -> None:
     new_token_ids: list[str] = []
     for m in markets:
         try:
-            end_ts = int(datetime.fromisoformat(str(m["endDate"]).replace("Z", "+00:00")).timestamp())
+            end_dt = datetime.fromisoformat(str(m["endDate"]).replace("Z", "+00:00"))
+            end_ts = int(end_dt.timestamp())
         except (ValueError, TypeError, KeyError):
             continue
         condition_id = m.get("conditionId")
@@ -643,7 +667,9 @@ def confirm_recent_trade_ws(
     candidates = [
         t
         for t in trades
-        if t["outcome"] == side and t["price"] >= ENTRY_THRESHOLD and t["timestamp"] >= window_start_ts
+        if t["outcome"] == side
+        and t["price"] >= ENTRY_THRESHOLD
+        and t["timestamp"] >= window_start_ts
     ]
     if not candidates:
         return None
@@ -659,7 +685,10 @@ def confirm_recent_trade_ws(
 
 
 async def _check_entry(
-    state: PaperState, tracked: dict[str, TrackedToken], entered_conditions: set[str], feed: PriceFeed
+    state: PaperState,
+    tracked: dict[str, TrackedToken],
+    entered_conditions: set[str],
+    feed: PriceFeed,
 ) -> bool:
     """Returns True if a new position was opened. Multiple positions can be
     open at once now — markets are independent 5-min windows, and gating
@@ -726,8 +755,9 @@ async def _check_entry(
         entered_conditions.add(t.condition_id)
         print(
             f"[{now:%H:%M:%S}] ENTRATA {t.slug} {t.outcome} @ {entry_price:.3f} "
-            f"(confermata da trade reale size={confirm_size:.1f}, n_pre_entry={n_trades_pre_entry}, "
-            f"balance={balance:.3f}, {seconds_left}s dalla chiusura) — ${STAKE_USD} paper",
+            f"(confermata da trade reale size={confirm_size:.1f}, "
+            f"n_pre_entry={n_trades_pre_entry}, balance={balance:.3f}, "
+            f"{seconds_left}s dalla chiusura) — ${STAKE_USD} paper",
             flush=True,
         )
         save_state(state)
@@ -738,7 +768,8 @@ async def _check_entry(
 async def main() -> None:
     state = load_state()
     print(
-        f"Paper trader avviato (WebSocket). Stake fisso ${STAKE_USD}/trade. Dashboard: {DASHBOARD_FILE}",
+        f"Paper trader avviato (WebSocket). Stake fisso ${STAKE_USD}/trade. "
+        f"Dashboard: {DASHBOARD_FILE}",
         flush=True,
     )
 

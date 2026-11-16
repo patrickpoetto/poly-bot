@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Hashable
 from pathlib import Path
 from typing import Any
 
@@ -60,9 +61,7 @@ async def crossings_all_thresholds(
     for label in labels:
         side_trades = [t for t in trades if t.get("outcome") == label]
         for threshold in THRESHOLDS:
-            crossing = next(
-                (t for t in side_trades if float(t["price"]) >= threshold), None
-            )
+            crossing = next((t for t in side_trades if float(t["price"]) >= threshold), None)
             if crossing is None:
                 continue
             seconds_left = end_ts - crossing["timestamp"]
@@ -91,7 +90,7 @@ async def main() -> None:
 
     async with httpx.AsyncClient(headers={"User-Agent": "poly-bot-research/0.1"}) as client:
 
-        async def one(row: dict[str, Any]) -> None:
+        async def one(row: dict[Hashable, Any]) -> None:
             end_ts = int(row["candle_ts"]) + 300
             crossings = await crossings_all_thresholds(
                 client, sem, row["condition_id"], row["outcome"], end_ts

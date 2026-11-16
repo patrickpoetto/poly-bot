@@ -34,6 +34,9 @@ ruff check *.py
 ruff format *.py
 mypy *.py
 
+# Unit tests (pure logic only: _net_yield, confirm_recent_trade_ws)
+pytest -v
+
 # Live paper trader (PAPER ONLY — no real orders, no real money)
 python btc_5m_paper_trader.py
 # then open btc_5m_dashboard.html in a browser (auto-refreshes every 5s)

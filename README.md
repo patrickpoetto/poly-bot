@@ -119,6 +119,9 @@ ruff check *.py
 ruff format *.py
 mypy *.py
 
+# Unit tests (core signal/fee logic — see test_paper_trader.py)
+pytest -v
+
 # Live paper trader — PAPER ONLY, no real orders, no real money
 python btc_5m_paper_trader.py
 # then open btc_5m_dashboard.html in a browser (auto-refreshes every 5s)
@@ -133,8 +136,8 @@ python btc_5m_ws_recorder.py
 
 No API keys, wallet, or `.env` file are required for any of the above —
 every script here only reads public Polymarket market data. `.env.example`
-is a template left over from an earlier, broader version of this project
-and is unused by the current scripts.
+documents that explicitly (and is kept only as a placeholder for possible
+future configuration).
 
 ## Status
 

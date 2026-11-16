@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Hashable
 from pathlib import Path
 from typing import Any
 
@@ -158,7 +159,7 @@ async def main() -> None:
         all_rows: list[dict[str, Any]] = []
         start = time.time()
 
-        async def one(row: dict[str, Any]) -> None:
+        async def one(row: dict[Hashable, Any]) -> None:
             end_ts = int(row["candle_ts"]) + 300
             trades = await fetch_trades(client, sem, row["condition_id"], end_ts)
             for t in trades:

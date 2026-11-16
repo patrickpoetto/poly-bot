@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "poly-bot"
 version = "0.3.0"
@@ -10,14 +14,21 @@ dependencies = [
     "websockets>=14.0",
     "pandas>=2.2.0",
     "pyarrow>=18.0.0",
-    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "ruff>=0.9.0",
     "mypy>=1.14.0",
+    "pandas-stubs>=2.2.0",
+    "pytest>=8.0.0",
 ]
+
+# No src/ package layout — every script in the repo root is self-contained
+# and run directly (see README "Running it" / CLAUDE.md). `pip install -e
+# ".[dev]"` only needs to resolve dependencies, not package anything.
+[tool.setuptools]
+py-modules = []
 
 [tool.ruff]
 target-version = "py313"

@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Hashable
 from pathlib import Path
 from typing import Any
 
@@ -166,8 +167,9 @@ async def first_crossings(
 
 
 async def main() -> None:
+    events_cached = await asyncio.to_thread(EVENTS_OUT.exists)
     async with httpx.AsyncClient(headers={"User-Agent": "poly-bot-research/0.1"}) as client:
-        if EVENTS_OUT.exists():
+        if events_cached:
             print(f"Loading cached events from {EVENTS_OUT}")
             events_df = pd.read_parquet(EVENTS_OUT)
         else:
@@ -183,7 +185,7 @@ async def main() -> None:
         results: list[dict[str, Any]] = []
         start = time.time()
 
-        async def one(row: dict[str, Any]) -> None:
+        async def one(row: dict[Hashable, Any]) -> None:
             end_ts = int(row["candle_ts"]) + 300
             crossings = await first_crossings(
                 client, sem, row["condition_id"], row["outcome"], end_ts
