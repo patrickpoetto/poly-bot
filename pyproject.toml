@@ -3,8 +3,8 @@ name = "poly-bot"
 version = "0.3.0"
 description = "BTC 5m trade-confirmed paper trading strategy — research scripts + live paper trader"
 requires-python = ">=3.13"
-license = { text = "Proprietary" }
-authors = [{ name = "Pat" }]
+license = { text = "MIT" }
+authors = [{ name = "Patrick Poetto" }]
 dependencies = [
     "httpx[http2]>=0.28.0",
     "websockets>=14.0",
